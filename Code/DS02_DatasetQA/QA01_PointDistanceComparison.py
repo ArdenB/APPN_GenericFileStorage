@@ -4,7 +4,10 @@ Crawls the dataset directory tree for pairs of point files following
 the APPN naming convention:
 
 * a groundtruth file under ``.../<run>/T1_proc/QC_data/QC_GCP_groundtruth_points.geojson``
-* the matching QC file at ``.../<run>/T1_proc/QC_data/QC_GCP_points.shp``
+* the matching QC file at ``.../<run>/T1_proc/QC_data/QC_GCP_points.geojson``
+
+GeoJSON is the preferred format throughout; ``.shp`` files are only
+accepted as a legacy fallback when no geojson sibling exists.
 
 For each pair found, features are matched by an ID column and the
 planar (and, where available, 3D) distance between matched points is
@@ -188,7 +191,8 @@ def main(args: argparse.Namespace, path: pathlib.Path) -> pd.DataFrame:
     pairs = locate_point_pairs(path, args.exclude_dir, args.verbose)
     if not pairs:
         raise ValueError(
-            f"No QC_GCP_groundtruth_points.geojson / QC_GCP_points.shp pairs found under {path}."
+            f"No QC_GCP_groundtruth_points / QC_GCP_points pairs "
+            f"(.geojson, or legacy .shp) found under {path}."
         )
 
     print(f"Found {len(pairs)} groundtruth/QC pair(s).")
@@ -491,7 +495,8 @@ def locate_point_pairs(
     ``.../<run>/T1_proc/QC_data/QC_GCP_groundtruth_points.geojson`` the
     sibling ``QC_data`` directory is inspected for related
     inputs. The required pair is the groundtruth geojson and the QC GCP
-    shapefile (``QC_GCP_points.shp``); additional optional inputs
+    file (``QC_GCP_points.geojson``, legacy ``.shp`` accepted as a
+    fallback); additional optional inputs
     (e.g. flight-line info, a Z-augmented QC layer) are looked up by
     role and included only when present, so callers can opt in as
     those datasets become available without changing this signature.
@@ -511,7 +516,7 @@ def locate_point_pairs(
         One dict per matched run. Always contains:
 
         * ``"vali"``  -- groundtruth geojson (validation points).
-        * ``"qc"``    -- ``QC_GCP_points.shp``.
+        * ``"qc"``    -- ``QC_GCP_points.geojson`` (or legacy ``.shp``).
 
         May additionally contain (when the file is found on disk):
 
@@ -534,20 +539,32 @@ def locate_point_pairs(
     def _excluded(p: pathlib.Path) -> bool:
         return bool(exclude and (set(part.name for part in p.parents) & exclude))
 
-    # +++++ Find groundtruth files; prefer .geojson over .shp when both exist +++++
-    gt_geojson = [p for p in path.rglob("QC_GCP_groundtruth_points.geojson") if not _excluded(p)]
-    gt_shp     = [p for p in path.rglob("QC_GCP_groundtruth_points.shp")     if not _excluded(p)]
-    _gt_geojson_keys = {(p.parent, p.stem) for p in gt_geojson}
-    gt_shp = [p for p in gt_shp if (p.parent, p.stem) not in _gt_geojson_keys]
-    vali_files = sorted(gt_geojson + gt_shp)
-    qc_files = sorted(p for p in path.rglob("QC_GCP_points.shp") if not _excluded(p))
+    def _find_points(stem: str) -> List[pathlib.Path]:
+        # +++++ Prefer .geojson; legacy .shp only where no geojson sibling exists +++++
+        geo = [p for p in path.rglob(f"{stem}.geojson") if not _excluded(p)]
+        geo_dirs = {p.parent for p in geo}
+        shp: List[pathlib.Path] = []
+        for p in path.rglob(f"{stem}.shp"):
+            if _excluded(p):
+                continue
+            if p.parent in geo_dirs:
+                if verbose:
+                    print(f"  ignoring legacy {p}: geojson sibling preferred")
+                continue
+            shp.append(p)
+        return sorted(geo + shp)
+
+    vali_files = _find_points("QC_GCP_groundtruth_points")
+    qc_files = _find_points("QC_GCP_points")
 
     # +++++ Optional inputs: role -> candidate filenames in QC_data +++++
     # Add new role/filename(s) here as additional layers become
     # available. The first existing candidate wins.
     optional_qc_files: Dict[str, Tuple[str, ...]] = {
-        "qc_z": ("QC_GCP_points_z.shp", "QC_GCP_points_3d.shp"),
-        "flightlines": ("flight_lines.shp", "flightlines.geojson"),
+        "qc_z": ("QC_GCP_points_z.geojson", "QC_GCP_points_3d.geojson",
+                 "QC_GCP_points_z.shp", "QC_GCP_points_3d.shp"),
+        "flightlines": ("flightlines.geojson", "flight_lines.geojson",
+                        "flight_lines.shp"),
     }
 
     # +++++ Index QC files by their parent run_dir for fast cross-lookup +++++
@@ -571,7 +588,7 @@ def locate_point_pairs(
         run_dir = vali.parents[2]
         seen_runs.add(run_dir)
         qc_dir = run_dir / "T1_proc" / "QC_data"
-        qc_file = qc_by_run.get(run_dir, qc_dir / "QC_GCP_points.shp")
+        qc_file = qc_by_run.get(run_dir, qc_dir / "QC_GCP_points.geojson")
         if not qc_file.is_file():
             # +++++ Surface groundtruth-without-QC in the skipped summary +++++
             pairs.append({
@@ -579,7 +596,8 @@ def locate_point_pairs(
                 "qc": qc_file,
                 "run_dir": run_dir,
                 "missing_input": (
-                    f"no QC_GCP_points.shp for groundtruth (expected {qc_file})"
+                    f"no QC_GCP_points.geojson (or legacy .shp) for "
+                    f"groundtruth (expected {qc_file})"
                 ),
             })
             continue
