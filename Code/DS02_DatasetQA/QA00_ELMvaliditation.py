@@ -1,8 +1,14 @@
 """ELM Validation Panel Extraction.
 
 This script automatically crawls the dataset file structure and looks for the
-ELM and validation panel shapefiles. It then extracts the relevant pixels
+ELM and validation panel vector files. It then extracts the relevant pixels
 from the raster datasets, saving them as a DataFrame.
+
+Panel files must follow the official AerialDataQC naming convention
+``QC_{ELM|VAL}[_{TargetIdentifier}]_Panels[_{Extra}].geojson`` (GeoJSON
+preferred, shapefile accepted) and live in ``<run>/T1_proc/QC_data/``.
+See Protocols/QA/QAprocess/AerialDataQC.md in the
+APPN-Field-Protocols-and-Pipelines repo.
 
 Notes
 -----
@@ -31,13 +37,14 @@ Command-line Arguments
 
 __title__ = "ELM validation"
 __author__ = "Arden Burrell"
-__version__ = "v1.0(03.03.2026)"
+__version__ = "v1.1(11.08.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 
 # ==============================================================================
 
 import os
+import re
 import sys
 import git
 from git import exc as git_exc
@@ -72,11 +79,17 @@ from shapely.geometry import mapping
 from collections import OrderedDict
 from tqdm import tqdm
 import warnings as warn
-from tqdm import tqdm
 
-# Fix for X11/GUI issues - use non-interactive backend
-# import matplotlib
-# matplotlib.use('Agg')  # Set backend before importing pyplot
+# Suppress noisy "invalid value encountered in cast" RuntimeWarning emitted by
+# xarray/numpy when rasters contain NaN values that get cast to an integer
+# dtype during clipping/extraction. These NaNs are expected (nodata) and the
+# warning clutters the tqdm progress output.
+warn.filterwarnings(
+    "ignore",
+    message="invalid value encountered in cast",
+    category=RuntimeWarning,
+)
+
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -108,11 +121,12 @@ def main(
     # ========== Find a list of projects that have shp files ==========
     Panel_files = locate_qc_panels(path)
     QC_list = []
+    
 
     # ========== Find a list of projects that have shp files ==========
     for panel in tqdm(Panel_files, total=len(Panel_files), desc="Processing panels"):
         # print(f"Processing panel: {panel['path']}")
-        df_list = extract_panel_spectra(panel, args)
+        df_list = extract_panel_spectra(panel, args, path)
         QC_list.extend(df_list)
     
     # ========== Load external spectra from --load-dir if provided ==========
@@ -192,8 +206,9 @@ def plot_panel_spectra(QC_list: List[pd.DataFrame]) -> None:
                 if sensor in bad_bands and rtype in bad_bands[sensor]:
                     cut_bands = bad_bands[sensor][rtype]
                     if args.verbose:
-                        print(f"Cutting bad bands {cut_bands} for sensor: {sensor}, panel: {panel_name}, type: {rtype}")
-                    type_df_clipped = type_df[~type_df["band"].isin(cut_bands)]
+                        print(f"Zeroing bad bands {cut_bands} for sensor: {sensor}, panel: {panel_name}, type: {rtype}")
+                    type_df_clipped = type_df.copy()
+                    type_df_clipped.loc[type_df_clipped["band"].isin(cut_bands), "value"] = 0
 
 
                 else:
@@ -231,7 +246,7 @@ def plot_panel_spectra(QC_list: List[pd.DataFrame]) -> None:
                         g_clipped.figure.subplots_adjust(top=0.92)
                         plt.show()
 
-    breakpoint()
+    # breakpoint()
 
 
 def save_spectra_copies(
@@ -350,14 +365,6 @@ def load_external_spectra(
             skipped += 1
             continue
 
-        # +++++ Fix common column-name issues (same logic as _check_table_structure) +++++
-        if "panel_ref" in df.columns and "Panel_ref" not in df.columns:
-            df = df.rename(columns={"panel_ref": "Panel_ref"})
-        if "index_right" in df.columns:
-            df = df.drop(columns=["index_right"])
-        if "type" in df.columns and "EM_Region" not in df.columns:
-            df = df.rename(columns={"type": "EM_Region"})
-
         # +++++ Validate required columns +++++
         missing = required_columns - set(df.columns)
         if missing:
@@ -385,6 +392,7 @@ def load_external_spectra(
 def extract_panel_spectra(
         panel: Dict[str, Any],
         args: argparse.Namespace,
+        root_path: pathlib.Path,
     ) -> List[pd.DataFrame]:
     """Extract spectral data for a given panel from associated rasters.
 
@@ -413,17 +421,13 @@ def extract_panel_spectra(
     # ========== Load the shape files ==========
     
     shpdf     = gpd.read_file(panel["path"])
-    # implement a check to make sure the shapefile has the expected structure and columns, and raise an error if not. This will help to catch any issues with the shapefile early on.
-    expected_columns = ["geometry", "Panel_ref"] # type: ignore
+    # ========== Validate the vector file structure ==========
+    expected_columns = ["geometry", "Panel_ref"]
     if not all(col in shpdf.columns for col in expected_columns):
-        if "panel_ref" in shpdf.columns:
-            tqdm.write(f"Shapefile {panel['path']} has 'panel_ref' column instead of 'Panel_ref'. This may be due to a case sensitivity issue in the shapefile structure. Please check the shapefile and ensure that the column is named 'Panel_ref' with the correct case.")
-            # Fix the column name and re-save the shapefile with the correct column name for future use
-            shpdf = shpdf.rename(columns={"panel_ref": "Panel_ref"})
-            shpdf.to_file(panel["path"])
-        else:
-            raise ValueError(f"Shapefile {panel['path']} does not have the expected columns {expected_columns}. Found columns: {shpdf.columns}. Please check the shapefile structure and ensure it has the required columns.")
-            # breakpoint()
+        raise ValueError(
+            f"QC panel file {panel['path']} does not have the expected columns "
+            f"{expected_columns}. Found columns: {list(shpdf.columns)}. "
+            "Fix the file to match the AerialDataQC protocol before re-running.")
 
     if shpdf.crs is None:
         raise ValueError(f"Shapefile {panel['path']} does not have a CRS defined. Please set a CRS on the shapefile before running this script.")
@@ -440,10 +444,11 @@ def extract_panel_spectra(
         elif not ras["exists"] or args.force:
             # In the future this will open the file
             try:
-                _process_raster(ras, shpdf, panel)
+                _process_raster(ras, shpdf, panel, root_path, keep_xy=args.keep_xy)
             except Exception as er:
                 tqdm.write(f"Error processing raster {ras['InputRaster']}: {er}. Skipping raster.")
                 continue
+
         # ========== Load the data ==========
         try:
             if args.type == "csv":
@@ -455,7 +460,7 @@ def extract_panel_spectra(
             warn.warn(f"Could not read output file {ras['outfile']} for raster {ras['InputRaster']}. Error: {er}. May require manual inspection of the file and raster. Skipping file.")
             continue
         
-        df, check = _check_table_structure(panel, ras, df)
+        df, check = _check_table_structure(panel, ras, df, args)
         if check:
             QC_tables.append(df)
         else:
@@ -464,49 +469,42 @@ def extract_panel_spectra(
     return QC_tables
 
 
-def _check_table_structure(panel, ras, df):
+def _check_table_structure(
+        panel: Dict[str, Any],
+        ras: Dict[str, Any],
+        df: pd.DataFrame,
+        args: argparse.Namespace,
+    ) -> Tuple[pd.DataFrame, bool]:
     """Check if the DataFrame has the expected structure for QC tables.
 
     Parameters
     ----------
+    panel : dict
+        Panel metadata dictionary (from :func:`locate_qc_panels`).
+    ras : dict
+        Raster entry for the table being checked.
     df : pd.DataFrame
         The DataFrame to check.
+    args : argparse.Namespace
+        Parsed command-line arguments (uses ``args.no_radiance_check``).
 
     Returns
     -------
+    pd.DataFrame
+        The (unmodified) DataFrame.
     bool
         True if the DataFrame has the expected structure, False otherwise.
     """
     valid = True
-    # ========== Drop index_right if present (artifact from gpd.sjoin in older outputs) ==========
-    if "index_right" in df.columns:
-        tqdm.write(f"Output file {ras['outfile']} contains 'index_right' column. Removing it and re-saving.")
-        df = df.drop(columns=["index_right"])
-        df.to_csv(ras["outfile"].as_posix(), index=False)
+    # ========== Require the standard output columns ==========
+    required_columns = {"band", "value", "Panel_ref", "sensor", "EM_Region", "gpro_nu"}
+    missing = required_columns - set(df.columns)
+    if missing:
+        warn.warn(
+            f"Output file {ras['outfile']} is missing required columns {missing}. "
+            "Re-run with --force to regenerate it with the current schema.")
+        return df, False
 
-    # ========== Rename legacy "type" column to "EM_Region" in existing files ==========
-    if "type" in df.columns and "EM_Region" not in df.columns:
-        tqdm.write(f"Output file {ras['outfile']} has legacy 'type' column. Renaming to 'EM_Region' and re-saving.")
-        df = df.rename(columns={"type": "EM_Region"})
-        df.to_csv(ras["outfile"].as_posix(), index=False)
-
-    # ========== Temp fix, remove when all files have the EM_Region column correctly written out ==========
-    if "EM_Region" not in df.columns:
-        tqdm.write(f"Output file {ras['outfile']} does not have an 'EM_Region' column. This may be due to an error in the processing step. Adding 'EM_Region' column with value {ras['type']} for now, but please remove code when all files have the 'EM_Region' column correctly written out.")
-        df["EM_Region"] = ras["type"]
-        df.to_csv(ras["outfile"].as_posix(), index=False)
-
-    if not "gpro_nu" in df.columns:
-        tqdm.write(f"Output file {ras['outfile']} does not have a 'gpro_nu' column. This may be due to an error in the processing step. Adding 'gpro_nu' column with value {ras['gpro_nu']} for now, but please remove code when all files have the 'gpro_nu' column correctly written out.")
-        df["gpro_nu"] = ras["gpro_nu"]
-        df.to_csv(ras["outfile"].as_posix(), index=False)
-        # breakpoint()
-
-    if "panel_ref" in df.columns:
-        tqdm.write(f"Output file {ras['outfile']} does not have a 'Panel_ref' column. This may be due to an error in the processing step. Adding 'Panel_ref' column with value 'unknown' for now, but please remove code when all files have the 'Panel_ref' column correctly written out.")
-        # rename the column to have the correct case for consistency with the expected structure
-        df = df.rename(columns={"panel_ref": "Panel_ref"})
-        df.to_csv(ras["outfile"].as_posix(), index=False)
     # ========== Check if the Dataframe has values in the expected ranges ==========
     # This is a check for reflectance vs radiance
     if panel["sensor"] in ["GOBI", "CALVIS"] and not args.no_radiance_check:
@@ -515,31 +513,19 @@ def _check_table_structure(panel, ras, df):
                 warn.warn(f"Maximum value in DataFrame for raster {ras['InputRaster']} is less than 100. This may indicate that the values are in reflectance rather than radiance, which is unexpected for this sensor. Please check the processing step and ensure that the correct values are being extracted. Skipping file.")
                 valid = False
         elif df["value"].dtype == float:
-            if df["value"].max() > 10.:
-                warn.warn(f"Maximum value in DataFrame for raster {ras['InputRaster']} is greater than 10. This may indicate that the values are in reflectance rather than radiance, which is unexpected for this sensor. Please check the processing step and ensure that the correct values are being extracted. Skipping file.")
+            if df["value"].max() > 13.:
+                warn.warn(f"Maximum value in DataFrame for raster {ras['InputRaster']} is greater than 13. This may indicate that the values are in reflectance rather than radiance, which is unexpected for this sensor. Please check the processing step and ensure that the correct values are being extracted. Skipping file.")
+                # breakpoint()
                 valid = False
     return df, valid
-
-    # required_columns = {
-    #     "node": str,
-    #     "project": str,
-    #     "site": str,
-    #     "sensor": str,
-    #     "date": pd.Timestamp,
-    #     "run": str,
-    #     "panel_name": str,
-    #     "EM_Region": str,
-    #     "gpro_nu": int,
-    #     "band": int,
-    #     "value": float,
-    #     "Panel_ref": float,
-    # }
 
 
 def _process_raster(
         ras: Dict[str, Any],
         shpdf: gpd.GeoDataFrame,
         panel: Dict[str, Any],
+        root_path: pathlib.Path,
+        keep_xy: bool = False,
     ) -> None:
     """Clip a raster to the panel geometries and save the result.
 
@@ -562,6 +548,12 @@ def _process_raster(
         Values for keys ``"node"``, ``"project"``, ``"site"``,
         ``"sensor"``, ``"date"``, ``"run"``, and ``"panel_name"``
         are written as columns in the output file.
+    root_path : pathlib.Path
+        Repository/data root used for display-friendly relative paths.
+    keep_xy : bool, optional
+        If True, retain the per-pixel ``x`` and ``y`` coordinate columns
+        (in the raster's native CRS) in the output table instead of
+        dropping them during the spatial join. Default is False.
 
     Returns
     -------
@@ -573,7 +565,8 @@ def _process_raster(
         If the raster does not have a CRS defined.
     """
     # +++++ open the raster dataset +++++
-    tqdm.write(f"Processing raster: {ras['InputRaster']} started at {pd.Timestamp.now()}. This may take a while for large rasters, but will be printed to the console when finished.")
+    _ras_display = pathlib.Path(ras["InputRaster"]).relative_to(root_path)
+    tqdm.write(f"Processing raster: {_ras_display} started at {pd.Timestamp.now()}. This may take a while.")
     ds  = rioxarray.open_rasterio(ras["InputRaster"])
     crs = ds.rio.crs # type: ignore
     if crs is None:
@@ -587,7 +580,10 @@ def _process_raster(
     points_gdf = gpd.GeoDataFrame(
             df_xr, geometry=gpd.points_from_xy(df_xr['x'], df_xr['y']),
             crs=crs)
-    gdf = gpd.sjoin(points_gdf, shpdf.to_crs(crs), how='inner', predicate='within').drop(columns=['geometry', 'y', 'x', 'spatial_ref', 'index_right'])
+    _drop_cols = ['geometry', 'spatial_ref', 'index_right']
+    if not keep_xy:
+        _drop_cols += ['y', 'x']
+    gdf = gpd.sjoin(points_gdf, shpdf.to_crs(crs), how='inner', predicate='within').drop(columns=_drop_cols)
     # print(f"Processing raster: {ras['InputRaster']}")
     for vname in ["node", "project", "site", "sensor", "date", "run", "panel_name"]:
         # Skip if the value is not in the panel dict for some reason
@@ -596,6 +592,14 @@ def _process_raster(
     # Add the EM range type and gpro number from the raster dict to the DataFrame
     gdf["EM_Region"] = ras["type"]
     gdf["gpro_nu"]   = ras["gpro_nu"] # this only matter if there a multiple gpros
+    # +++++ Add a boolean QC check for the expected +++++
+    # check if value column is int or float
+    if pd.api.types.is_integer_dtype(gdf["value"]):
+        gdf["Valid_Range"] = (gdf["value"] > 0) & (gdf["value"] <= 10000)
+    elif pd.api.types.is_float_dtype(gdf["value"]):
+        gdf["Valid_Range"] = (gdf["value"] > 0) & (gdf["value"] <= 1.0)
+    else:
+        gdf["Valid_Range"] = False
 
     # ========= Save the DataFrame to file ==========
     if args.type == "csv":
@@ -609,11 +613,14 @@ def locate_qc_panels(
         valid_sensors: List[str] = ["GOBI", "CALVIS"],
         # data_format: str = "csv",
     ) -> List[Dict[str, Any]]:
-    """Find spectral validation panel shapefiles in the given directory tree.
+    """Find spectral validation panel vector files in the given directory tree.
 
-    Recursively searches ``path`` for shapefiles matching the pattern
-    ``*QC_*_Panel*.shp`` and returns a list of dictionaries containing
-    panel metadata and associated raster information.
+    Recursively searches ``path`` for QC panel files following the official
+    AerialDataQC naming convention
+    ``QC_{ELM|VAL}[_{TargetIdentifier}]_Panels[_{Extra}].geojson`` (GeoJSON
+    preferred, shapefile accepted) stored under ``<run>/T1_proc/QC_data/``,
+    and returns a list of dictionaries containing panel metadata and
+    associated raster information.
 
     Parameters
     ----------
@@ -646,22 +653,49 @@ def locate_qc_panels(
     NotImplementedError
         If a sensor name is not handled by the current implementation.
     """
-    # +++++ Find all the shape files in the path +++++
+    # +++++ Find all the panel files (geojson preferred, shp accepted) +++++
     print(f"Scanning directory for panel files and rasters. {pd.Timestamp.now()}")
 
-    files = list(path.rglob("*QC_*_Panel*.shp"))	
-    # breakpoint()
+    # Official pattern: QC_{TargetType}[_{TargetIdentifier}]_Panels[_{Extra}]
+    # (AerialDataQC protocol); only ELM and VAL target types carry panels.
+    name_re       = re.compile(r"^QC_(ELM|VAL)(_.+)?_Panels(_.+)?$")
+    shp_files     = [f for f in path.rglob("QC_*.shp") if name_re.match(f.stem)]
+    geojson_files = [f for f in path.rglob("QC_*.geojson") if name_re.match(f.stem)]
+
+    # +++++ Prefer geojson when both share the same parent dir + stem +++++
+    geojson_keys = {(f.parent, f.stem) for f in geojson_files}
+    shp_files    = [f for f in shp_files if (f.parent, f.stem) not in geojson_keys]
+    files        = sorted(geojson_files + shp_files)
+
     if len(files) == 0:
-        raise ValueError(f"No QC panel shapefiles found in {path}. Please check the path and file naming conventions. Expected pattern: *QC_*_Panel*.shp")
+        raise ValueError(
+            f"No QC panel files found in {path}. Please check the path and file "
+            "naming conventions. Expected pattern: "
+            "QC_{ELM|VAL}[_{TargetIdentifier}]_Panels[_{Extra}].geojson (or .shp) "
+            "under <run>/T1_proc/QC_data/ (see the AerialDataQC protocol).")
+
+    # ========== Filter out excluded directories ==========
+    if args.exclude_dir:
+        exclude_set = set(args.exclude_dir)
+        before = len(files)
+        files = [f for f in files if not (set(p.name for p in f.parents) & exclude_set)]
+        if args.verbose and len(files) < before:
+            print(f"Excluded {before - len(files)} panel file(s) matching --exclude-dir {args.exclude_dir}")
+
     pan_list    = [] # List of dicts with information about the panel files
     # ========== loop over each project and write out files ==========
     for panel in files:
+        # ========== Enforce the official storage location: <run>/T1_proc/QC_data/ ==========
+        if panel.parent.name != "QC_data" or panel.parents[1].name != "T1_proc":
+            if args.verbose:
+                tqdm.write(f"Skipping {panel}: not under T1_proc/QC_data (see the AerialDataQC protocol).")
+            continue
         # ========== Check if the sensor is valid ==========
         sensor = panel.parents[4].name
         if not sensor in valid_sensors:
             if args.verbose:
                 warn.warn(f"Found panel file for sensor {sensor} which is not in the list of valid sensors {valid_sensors}. Skipping file: {panel}")
-            breakpoint()
+            # breakpoint()
             continue
         # ========== Make a dict of information ==========
         p_dict = ({
@@ -738,13 +772,15 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Generate dataset folder structure.")
     parser.add_argument("--path", type=str, default=None, help="The path of the folder to look for QA shape files. By default it will search from the root dir of the git repo")
     parser.add_argument("-f","--force", default=False, action="store_true", help="Force the creation of files even if one already exists. Default is to skip creating files that already exist to prevent overwriting.")
-    parser.add_argument("--type", type=str, default="csv", help="The file type for the output files. Default is csv, but can be set to parquet for more efficient storage and faster read/write times. Note that .parquet files will require additional dependencies to read and write.")
-    parser.add_argument("-s","--skipplot", default=False, action="store_false", help="Generate plots for the extracted spectra. Default is to generate plots. Set this flag to skip plotting if you only want the extracted data tables.")
+    parser.add_argument("--type", type=str, default="parquet", help="The file type for the output files. Default is parquet for more efficient storage and faster read/write times, but can be set to csv. Note that .parquet files will require additional dependencies to read and write.")
+    parser.add_argument("-s","--skipplot", default=False, action="store_true", help="Skip plotting and only produce the extracted data tables. Default is to generate plots.")
     parser.add_argument("--skip-processing", default=False, action="store_true", help="Skip raster processing and only load existing output files for plotting. Useful for faster re-runs when output files already exist.")
     parser.add_argument("--save-dir", type=str, default=None, help="Also save a copy of each extracted spectra file into this directory. Creates the directory if it doesn't exist. Useful for sharing extracted spectra with collaborators or keeping a central record.")
     parser.add_argument("--load-dir", type=str, default=None, help="Load previously extracted spectra files from this folder (e.g. data received from other nodes). Loaded files are appended to the QC list for plotting and can also be copied via --save-dir.")
     parser.add_argument("-v", "--verbose", default=False, action="store_true", help="Enable verbose output for debugging and additional information during processing.")
     parser.add_argument("--no-radiance-check", default=False, action="store_true", help="Disable the reflectance vs radiance range check (value < 100). Useful when processing data known to be in reflectance units.")
+    parser.add_argument("--exclude-dir", type=str, nargs="+", default=[], help="One or more directory names to exclude from the panel search. Any panel whose path contains a directory matching one of these names will be skipped. e.g. --exclude-dir 2025_TestData 2026_TestData")
+    parser.add_argument("--keep-xy", default=False, action="store_true", help="Retain the per-pixel x and y coordinate columns (in the raster's native CRS) in the extracted spectra tables. By default these are dropped during the spatial join.")
     
     args = parser.parse_args()
 

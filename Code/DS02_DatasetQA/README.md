@@ -2,14 +2,16 @@
 
 ## Overview
 
-This script automates the extraction and quality control (QC) of spectral data from validation panels in hyperspectral imaging datasets. It crawls the dataset file structure to locate QC panel shapefiles and their corresponding raster orthomosaics, extracts pixel values from the panels, and generates visualization plots for quality assessment. It is designed to work in directorys that follow the APPN folder structure.  
+This script automates the extraction and quality control (QC) of spectral data from validation panels in hyperspectral imaging datasets. It crawls the dataset file structure to locate QC panel vector files and their corresponding raster orthomosaics, extracts pixel values from the panels, and generates visualization plots for quality assessment. It is designed to work in directorys that follow the APPN folder structure.
+
+QC panel files must follow the official [AerialDataQC naming convention](https://github.com/aus-plant-phenomics-network/APPN-Field-Protocols-and-Pipelines/blob/main/Protocols/QA/QAprocess/AerialDataQC.md): `QC_{ELM|VAL}[_{TargetIdentifier}]_Panels[_{Extra}].geojson` (GeoJSON preferred, shapefile accepted), stored in `<run>/T1_proc/QC_data/`.
 
 **Version:** v1.0 (03.03.2026)  
 **Author:** Arden Burrell
 
 ## What It Does
 
-1. **Searches** for QC panel shapefiles matching the pattern `*QC_*_Panel*.shp`
+1. **Searches** for QC panel files matching the official convention `QC_{ELM|VAL}[_{TargetIdentifier}]_Panels[_{Extra}].geojson` (or `.shp`) under `T1_proc/QC_data/`
 2. **Locates** corresponding VNIR and SWIR orthomosaic raster files
 3. **Extracts** spectral reflectance values from pixels within the panel geometries
 4. **Saves** extracted data as CSV or Parquet files
@@ -166,7 +168,7 @@ workspace_root/
                     └── run_name/     # e.g., Run01
                         └── T1_proc/
                             ├── QC_data/
-                            │   ├── *QC_*_Panel*.shp  # Panel shapefile
+                            │   ├── QC_ELM_Panels.geojson  # Panel file (official naming)
                             │   └── QC_Spectral_Tables/    # Output directory (created by script)
                             └── *.gpro/
                                 └── products/
@@ -175,7 +177,7 @@ workspace_root/
 ```
 
 ### Required Files
-- **Panel Shapefile**: Must contain:
+- **Panel File** (GeoJSON preferred, shapefile accepted): Must contain:
   - `geometry` column (polygon geometries)
   - `Panel_ref` column (reference reflectance values, 0-1 scale)
 - **Orthomosaic Rasters**: VNIR and SWIR (CALVIS only) `.bin` files
@@ -183,7 +185,7 @@ workspace_root/
 ## Output Files
 
 ### Spectral Tables
-Located in `QC_Spectral_Tables/` subdirectories alongside panel shapefiles.
+Located in `QC_Spectral_Tables/` subdirectories alongside panel files.
 
 **Filename Format:**
 ```
@@ -220,8 +222,8 @@ Bad bands are automatically identified and can be excluded from plots:
 ## Workflow
 
 1. **Initialization**: Determine git root or use provided `--path`
-2. **Discovery**: Recursively search for QC panel shapefiles
-3. **Validation**: Check shapefile structure and locate orthomosaics
+2. **Discovery**: Recursively search for QC panel files under `T1_proc/QC_data/`
+3. **Validation**: Check panel file structure and locate orthomosaics
 4. **Processing**: For each panel:
    - Load panel geometries
    - Clip raster to panel boundaries
@@ -236,13 +238,12 @@ Bad bands are automatically identified and can be excluded from plots:
 
 ### Common Issues
 
-**"No QC panel shapefiles found"**
-- Check that shapefiles match the pattern `*QC_*_Panel*.shp`
+**"No QC panel files found"**
+- Check that files match the official convention `QC_{ELM|VAL}[_{TargetIdentifier}]_Panels[_{Extra}].geojson` (or `.shp`) and live under `T1_proc/QC_data/`
 - Verify you're in the correct directory or provided the right `--path`
 
-**"Shapefile does not have expected columns"**
-- Ensure `Panel_ref` column exists (case-sensitive)
-- Script will auto-fix lowercase `panel_ref` if found
+**"Panel file does not have expected columns"**
+- Ensure `Panel_ref` column exists (case-sensitive) — fix the file, the script does not auto-repair non-standard files
 
 **"No VNIR/SWIR orthomosaic found"**
 - Check that `.gpro/products/` folders contain orthomosaic `.bin` files

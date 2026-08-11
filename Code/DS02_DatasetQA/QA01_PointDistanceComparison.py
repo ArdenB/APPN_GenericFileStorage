@@ -4,7 +4,14 @@ Crawls the dataset directory tree for pairs of point files following
 the APPN naming convention:
 
 * a groundtruth file under ``.../<run>/T1_proc/QC_data/QC_GCP_groundtruth_points.geojson``
-* the matching QC file at ``.../<run>/T1_proc/QC_data/QC_GCP_points.geojson``
+* one or more matching QC files at
+  ``.../<run>/T1_proc/QC_data/QC_GCP_points.geojson`` (single layer,
+  valid when every data product aligns) or
+  ``QC_GCP_{Product}_points.geojson`` (one digitised layer per data
+  product when they do not align, e.g. ``QC_GCP_VNIR_points.geojson``).
+  Either form may carry optional trailing information after another
+  underscore (e.g. ``QC_GCP_points_20260805.geojson``), which is
+  carried through to the output names.
 
 GeoJSON is the preferred format throughout; ``.shp`` files are only
 accepted as a legacy fallback when no geojson sibling exists.
@@ -24,9 +31,12 @@ height_b_m, delta_easting_m, delta_northing_m, distance_2d_m,
 bearing_deg, distance_3d_m, delta_height_m``
 
 A companion accuracy report is written alongside as
-``QC_GCP_distances_report.json``. These names are constant across
-runs so it is easy to check whether a flight has already been
-processed.
+``QC_GCP_distances_report.json``. Per-product QC layers use the
+product identifier in the stem instead (``QC_GCP_{Product}_distances``,
+e.g. ``QC_GCP_VNIR_distances.csv``), and any extra-info suffix on the
+QC file is appended (``QC_GCP_distances_{extraInfo}``). These names
+are constant across runs so it is easy to check whether a flight has
+already been processed.
 
 The report includes a ``bias`` section that decomposes the signed
 errors into a systematic component (mean offset) and a random
@@ -151,7 +161,7 @@ class QAConfig:
     # +++++ JSON schema version +++++
     # Changing this triggers regeneration of cached reports, so bump whenever the
     # report structure or interpretation changes in a non-backwards-compatible way. 
-    schema_version: float = 1.02
+    schema_version: float = 1.03
 
     # +++++ Warning thresholds (metres) +++++
     # These are not pass/fail thresholds but rather trigger warnings in the report 
@@ -182,9 +192,9 @@ def main(args: argparse.Namespace, path: pathlib.Path) -> pd.DataFrame:
     Returns
     -------
     pandas.DataFrame
-        One row per pair with columns ``project, sensor, date, run, n,
-        mean_m, max_m, status, reason``. Callers may persist this for
-        later inspection.
+        One row per pair with columns ``project, sensor, date, run,
+        product, n, mean_m, max_m, status, reason``. Callers may
+        persist this for later inspection.
     """
     print(f"Starting search for groundtruth/QC pairs under {path} at: {pd.Timestamp.now()}")
     cfg = default_config()
@@ -201,7 +211,8 @@ def main(args: argparse.Namespace, path: pathlib.Path) -> pd.DataFrame:
     for pair in pbar:
         vali = pair["vali"]
         pbar.set_postfix_str(str(vali.relative_to(path)))
-        meta = _summary_metadata(pair["run_dir"])
+        meta = {**_summary_metadata(pair["run_dir"]),
+                "product": pair.get("product")}
         try:
             report = _process_pair(pair, args, cfg)
         except (FileNotFoundError, ValueError) as exc:
@@ -245,7 +256,7 @@ def _summary_dataframe(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     keys the input rows happen to carry, so callers can rely on the
     schema for downstream saving.
     """
-    columns = ["project", "sensor", "date", "run",
+    columns = ["project", "sensor", "date", "run", "product",
                "n", "mean_m", "max_m", "status", "warning", "cached", "reason"]
     df = pd.DataFrame(rows, columns=columns)
     return df
@@ -269,6 +280,8 @@ def _format_summary_for_print(df: pd.DataFrame) -> pd.DataFrame:
         )
     if "reason" in out.columns:
         out["reason"] = out["reason"].fillna("")
+    if "product" in out.columns:
+        out["product"] = out["product"].fillna("")
     if "warning" in out.columns:
         out["warning"] = out["warning"].apply(
             lambda v: "" if v is None or (isinstance(v, float) and pd.isna(v))
@@ -295,19 +308,19 @@ def _print_summary_tables(df: pd.DataFrame) -> None:
     skipped = df[~df["status"].isin(["pass", "fail"])]
 
     if not skipped.empty:
-        cols = ["project", "sensor", "date", "run",
+        cols = ["project", "sensor", "date", "run", "product",
                 "status", "reason"]
         print(f"\nSKIPPED ({len(skipped)}):")
         print(_format_summary_for_print(skipped[cols]).to_string(index=False))
 
     if not passed.empty:
-        cols = ["project", "sensor", "date", "run",
+        cols = ["project", "sensor", "date", "run", "product",
                 "n", "mean_m", "max_m", "status", "warning", "cached"]
         print(f"\nPASSED ({len(passed)}):")
         print(_format_summary_for_print(passed[cols]).to_string(index=False))
 
     if not failed.empty:
-        cols = ["project", "sensor", "date", "run",
+        cols = ["project", "sensor", "date", "run", "product",
                 "n", "mean_m", "max_m", "status", "warning", "cached", "reason"]
         print(f"\nFAILED ({len(failed)}):")
         print(_format_summary_for_print(failed[cols]).to_string(index=False))
@@ -374,7 +387,10 @@ def _process_pair(
         found = ", ".join(str(p) for p in err["found_dirs"]) or "(none)"
         raise ValueError(f"{err['reason']} [found: {found}]")
 
-    out_stem = "QC_GCP_distances"
+    product = pair.get("product")
+    extra = pair.get("extra")
+    out_stem = ("QC_GCP_" + (f"{product}_" if product else "")
+                + "distances" + (f"_{extra}" if extra else ""))
     out_path = file_b.parent / f"{out_stem}.{args.type}"
     report_path = file_b.parent / f"{out_stem}_report.json"
     plots_dir = file_b.parent / "QC_plots"
@@ -494,9 +510,12 @@ def locate_point_pairs(
     For each groundtruth file at
     ``.../<run>/T1_proc/QC_data/QC_GCP_groundtruth_points.geojson`` the
     sibling ``QC_data`` directory is inspected for related
-    inputs. The required pair is the groundtruth geojson and the QC GCP
-    file (``QC_GCP_points.geojson``, legacy ``.shp`` accepted as a
-    fallback); additional optional inputs
+    inputs. The required pair is the groundtruth geojson and one or
+    more observed QC GCP layers: ``QC_GCP_points.geojson`` when a
+    single digitised layer is valid for every data product, or
+    ``QC_GCP_{Product}_points.geojson`` per product when the products
+    do not align (legacy ``.shp`` accepted as a fallback for either
+    form). Additional optional inputs
     (e.g. flight-line info, a Z-augmented QC layer) are looked up by
     role and included only when present, so callers can opt in as
     those datasets become available without changing this signature.
@@ -513,13 +532,20 @@ def locate_point_pairs(
     Returns
     -------
     list of dict
-        One dict per matched run. Always contains:
+        One dict per groundtruth/QC pair (a run with N per-product QC
+        layers yields N dicts sharing the same groundtruth). Always
+        contains:
 
         * ``"vali"``  -- groundtruth geojson (validation points).
-        * ``"qc"``    -- ``QC_GCP_points.geojson`` (or legacy ``.shp``).
+        * ``"qc"``    -- the observed QC GCP layer (geojson, or
+          legacy ``.shp``).
 
         May additionally contain (when the file is found on disk):
 
+        * ``"product"``     -- the ``{Product}`` identifier when the
+          QC layer is per-product (absent for ``QC_GCP_points``).
+        * ``"extra"``       -- trailing ``_{extraInfo}`` suffix on the
+          QC layer's filename, when present.
         * ``"qc_z"``        -- QC GCP points with Z heights.
         * ``"flightlines"`` -- flight-line information layer.
         * ``"run_dir"``     -- the ``<run>`` directory itself, useful
@@ -539,15 +565,15 @@ def locate_point_pairs(
     def _excluded(p: pathlib.Path) -> bool:
         return bool(exclude and (set(part.name for part in p.parents) & exclude))
 
-    def _find_points(stem: str) -> List[pathlib.Path]:
+    def _find_points(pattern: str) -> List[pathlib.Path]:
         # +++++ Prefer .geojson; legacy .shp only where no geojson sibling exists +++++
-        geo = [p for p in path.rglob(f"{stem}.geojson") if not _excluded(p)]
-        geo_dirs = {p.parent for p in geo}
+        geo = [p for p in path.rglob(f"{pattern}.geojson") if not _excluded(p)]
+        geo_keys = {(p.parent, p.stem) for p in geo}
         shp: List[pathlib.Path] = []
-        for p in path.rglob(f"{stem}.shp"):
+        for p in path.rglob(f"{pattern}.shp"):
             if _excluded(p):
                 continue
-            if p.parent in geo_dirs:
+            if (p.parent, p.stem) in geo_keys:
                 if verbose:
                     print(f"  ignoring legacy {p}: geojson sibling preferred")
                 continue
@@ -555,7 +581,16 @@ def locate_point_pairs(
         return sorted(geo + shp)
 
     vali_files = _find_points("QC_GCP_groundtruth_points")
-    qc_files = _find_points("QC_GCP_points")
+
+    # +++++ Observed layers: QC_GCP[_{Product}]_points[_{extraInfo}] +++++
+    # `groundtruth` is a reserved identifier for the reference layer above;
+    # `_z`/`_3d` suffixes are the qc_z role, not extra info.
+    qc_files: List[Tuple[pathlib.Path, Optional[str], Optional[str]]] = []
+    for p in _find_points("QC_GCP_*points*"):
+        m = re.match(r"QC_GCP_(?:(.+)_)?points(?:_(.+))?$", p.stem)
+        if m is None or m.group(1) == "groundtruth" or m.group(2) in ("z", "3d"):
+            continue
+        qc_files.append((p, m.group(1), m.group(2)))
 
     # +++++ Optional inputs: role -> candidate filenames in QC_data +++++
     # Add new role/filename(s) here as additional layers become
@@ -568,14 +603,16 @@ def locate_point_pairs(
     }
 
     # +++++ Index QC files by their parent run_dir for fast cross-lookup +++++
-    qc_by_run: Dict[pathlib.Path, pathlib.Path] = {}
-    for qc in qc_files:
+    qc_by_run: Dict[
+        pathlib.Path, List[Tuple[pathlib.Path, Optional[str], Optional[str]]]
+    ] = {}
+    for qc, product, extra in qc_files:
         # +++++ QC lives in <run>/T1_proc/QC_data/, so <run> is parents[2] +++++
         if qc.parent.name != "QC_data" or qc.parents[1].name != "T1_proc":
             if verbose:
                 print(f"  ignoring {qc}: not under T1_proc/QC_data")
             continue
-        qc_by_run[qc.parents[2]] = qc
+        qc_by_run.setdefault(qc.parents[2], []).append((qc, product, extra))
 
     pairs: List[Dict[str, Any]] = []
     seen_runs: set = set()
@@ -588,60 +625,70 @@ def locate_point_pairs(
         run_dir = vali.parents[2]
         seen_runs.add(run_dir)
         qc_dir = run_dir / "T1_proc" / "QC_data"
-        qc_file = qc_by_run.get(run_dir, qc_dir / "QC_GCP_points.geojson")
-        if not qc_file.is_file():
+        qc_list = qc_by_run.get(run_dir, [])
+        if not qc_list:
             # +++++ Surface groundtruth-without-QC in the skipped summary +++++
             pairs.append({
                 "vali": vali,
-                "qc": qc_file,
+                "qc": qc_dir / "QC_GCP_points.geojson",
                 "run_dir": run_dir,
                 "missing_input": (
-                    f"no QC_GCP_points.geojson (or legacy .shp) for "
-                    f"groundtruth (expected {qc_file})"
+                    "no QC_GCP_points.geojson or QC_GCP_{Product}_points.geojson "
+                    f"(or legacy .shp) for groundtruth (expected in {qc_dir})"
                 ),
             })
             continue
 
-        entry: Dict[str, Any] = {
-            "vali": vali,
-            "qc": qc_file,
-            "run_dir": run_dir,
-        }
+        # +++++ Run-level lookups shared by every product's pair +++++
+        optional_entries: Dict[str, pathlib.Path] = {}
         for role, candidates in optional_qc_files.items():
             for name in candidates:
                 candidate = qc_dir / name
                 if candidate.is_file():
-                    entry[role] = candidate
+                    optional_entries[role] = candidate
                     break
 
         # +++++ Locate the run's products folder and DSM TIF (if any) +++++
         products_dir, gpro_error = _resolve_products_dir(run_dir)
-        if gpro_error is not None:
-            entry["gpro_error"] = gpro_error
-            if verbose:
+        dsm = None if products_dir is None else _resolve_dsm(products_dir)
+        if verbose:
+            if gpro_error is not None:
                 print(
                     f"  ambiguous .gpro for {vali}: "
                     f"count={gpro_error['count']}"
                 )
-        else:
-            assert products_dir is not None
-            entry["products_dir"] = products_dir
-            dsm = _resolve_dsm(products_dir)
-            if dsm is not None:
-                entry["dsm"] = dsm
-            elif verbose:
+            elif dsm is None:
                 print(f"  no LiDAR DSM TIF in {products_dir}")
 
-        pairs.append(entry)
+        # +++++ One pair per QC layer (all share the run's groundtruth) +++++
+        for qc_file, product, extra in qc_list:
+            entry: Dict[str, Any] = {
+                "vali": vali,
+                "qc": qc_file,
+                "run_dir": run_dir,
+                **optional_entries,
+            }
+            if product is not None:
+                entry["product"] = product
+            if extra is not None:
+                entry["extra"] = extra
+            if gpro_error is not None:
+                entry["gpro_error"] = gpro_error
+            else:
+                assert products_dir is not None
+                entry["products_dir"] = products_dir
+                if dsm is not None:
+                    entry["dsm"] = dsm
+            pairs.append(entry)
 
     # +++++ Also surface QC files whose run has no groundtruth input +++++
-    for run_dir, qc_file in qc_by_run.items():
+    for run_dir, qc_list in qc_by_run.items():
         if run_dir in seen_runs:
             continue
         gt_dir = run_dir / "T1_proc" / "QC_data"
         pairs.append({
             "vali": gt_dir / "QC_GCP_groundtruth_points.geojson",
-            "qc": qc_file,
+            "qc": qc_list[0][0],
             "run_dir": run_dir,
             "missing_input": (
                 f"no QC_GCP_groundtruth_points.geojson for QC (expected in {gt_dir})"
@@ -1304,10 +1351,12 @@ def _build_report(
             "worst_distance_2d_m": worst,
         },
         "warnings": warnings_payload,
+        "product": pair.get("product"),
+        "extra": pair.get("extra"),
         "inputs": {
-            role: str(path)
-            for role, path in pair.items()
-            if isinstance(path, (str, pathlib.PurePath))
+            role: str(p)
+            for role, p in pair.items()
+            if isinstance(p, pathlib.PurePath)
         },
         "id_columns": {
             "a": id_column_a,
