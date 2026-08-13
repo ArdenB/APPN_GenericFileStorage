@@ -10,7 +10,7 @@ node
 
 	YYYY_ProjectDesc{_internal/external}{_Researcher}{_org} 
 
-		ProjectSummary.yaml	# auto: project metadata, researcher, sites
+		ProjectSummary.yaml	# auto: project metadata, researchers, sites
 		FieldLog.csv		# auto: log of every field collection event
 
 		Site{_source}

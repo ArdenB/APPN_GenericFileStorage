@@ -486,15 +486,17 @@ def _defaultProjectYAML(project):
             "status": "",
             "ProjectCode":"",
             "Internal":None,
-            "researcher": {
-                "FirstName": "",
-                "LastName":"",
-                "Title":"",
-                "email": "",
-                "institution": "",
-                "role": "Principal Investigator",
-                "orcid": ""
-            },
+            "researchers": [
+                {
+                    "FirstName": "",
+                    "LastName": "",
+                    "Title": "",
+                    "email": "",
+                    "institution": "",
+                    "role": "Principal Investigator",
+                    "orcid": ""
+                },
+            ],
             "sites": [
                 {
                     "name": "",
@@ -604,6 +606,35 @@ def update_yaml_structure(proj_data, default_structure):
     updated_data = create_ordered_dict(proj_data, default_structure)
     return convert_to_dict(updated_data)  # Convert to regular dict recursively
 
+def _migrateResearchers(proj_data):
+    """
+    Convert a legacy single ``researcher`` mapping to the ``researchers`` list.
+
+    Parameters
+    ----------
+    proj_data : dict
+        Loaded project YAML data (mutated in place).
+
+    Returns
+    -------
+    bool
+        True if a migration was performed, False otherwise.
+    """
+    project_block = proj_data.get("project") if isinstance(proj_data, dict) else None
+    if not isinstance(project_block, dict):
+        return False
+    if "researchers" in project_block or "researcher" not in project_block:
+        return False
+    legacy = project_block.pop("researcher")
+    if isinstance(legacy, dict):
+        project_block["researchers"] = [legacy]
+    elif isinstance(legacy, list):
+        project_block["researchers"] = legacy
+    else:
+        project_block["researchers"] = []
+    return True
+
+
 def _projYAML(project, pym_fn, args, repo, gitmod):
     """
     Ensure a project YAML file exists and is loaded.
@@ -647,13 +678,19 @@ def _projYAML(project, pym_fn, args, repo, gitmod):
     # +++++ Load the yaml file +++++
     Proj_data = yaml.safe_load(open(f"{pym_fn}", "r"))
 
+    # ========== Migrate legacy single-researcher files ==========
+    migrated = _migrateResearchers(Proj_data)
+    if migrated:
+        print(f"Migrated 'researcher' mapping to 'researchers' list in {pym_fn}")
+
     # ========== Check structure and update if needed ==========
     default_structure = _defaultProjectYAML(project)
     is_valid, missing_keys = check_yaml_structure(Proj_data, default_structure)
 
-    if not is_valid:
-        print(f"YAML structure missing keys in {pym_fn}: {missing_keys}")
-        # Optionally update the structure
+    if not is_valid or migrated:
+        if not is_valid:
+            print(f"YAML structure missing keys in {pym_fn}: {missing_keys}")
+        # update_yaml_structure also restores the canonical key order
         updated_data = update_yaml_structure(Proj_data, default_structure)
         with open(pym_fn, "w") as f:
             yaml.dump(updated_data, f, sort_keys=False)
