@@ -78,7 +78,6 @@ from git import exc as git_exc
 import numpy as np
 import pandas as pd
 import rioxarray
-import rasterio
 import geopandas as gpd
 from tqdm import tqdm
 import warnings as warn
@@ -797,39 +796,6 @@ def _check_table_structure(
     return df, valid
 
 
-def _band_wavelengths(raster_path: pathlib.Path) -> Tuple[Dict[int, float], str]:
-    """Read per-band centre wavelengths and the native dtype of a raster.
-
-    GDAL exposes the ENVI header ``wavelength`` block as per-band metadata
-    tags, which is where GRYFN orthomosaics store their band centres.
-
-    Parameters
-    ----------
-    raster_path : pathlib.Path
-        Path to the raster (ENVI ``.bin`` with ``.hdr`` sidecar, or any
-        GDAL-readable format).
-
-    Returns
-    -------
-    dict of int to float
-        Mapping of 1-based band index to centre wavelength (nm). Bands
-        without a wavelength tag map to NaN.
-    str
-        The native (on-disk) dtype of band 1, e.g. ``"uint16"``.
-    """
-    wavelengths: Dict[int, float] = {}
-    with rasterio.open(raster_path) as src:
-        src_dtype = src.dtypes[0]
-        for bidx in range(1, src.count + 1):
-            tag = src.tags(bidx).get("wavelength")
-            wavelengths[bidx] = float(tag) if tag is not None else np.nan
-    if all(np.isnan(v) for v in wavelengths.values()):
-        warn.warn(
-            f"No per-band wavelength metadata found for {raster_path}. "
-            "The 'wavelength' column will be NaN; check the ENVI .hdr sidecar.")
-    return wavelengths, src_dtype
-
-
 def _process_raster(
         ras: Dict[str, Any],
         shpdf: gpd.GeoDataFrame,
@@ -889,7 +855,7 @@ def _process_raster(
         raise ValueError(f"Raster {ras['InputRaster']} does not have a CRS defined. Please check the raster file and ensure it has a defined CRS.")
 
     # +++++ Per-band wavelengths + native dtype from the raster metadata +++++
-    wavelengths, src_dtype = _band_wavelengths(ras["InputRaster"])
+    wavelengths, src_dtype = cf.band_wavelengths(ras["InputRaster"])
 
     # +++++ Clip each polygon via its own bounding box (windowed read) +++++
     shpdf_r = shpdf.to_crs(crs)

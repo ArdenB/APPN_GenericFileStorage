@@ -21,7 +21,8 @@ This repository provides a data structure and automation scripts for managing da
    ```
 2. **Setup a Conda environment**
    ```bash
-   conda create -n datastorage python=3.12 numpy pandas pyyaml gitpython git
+   conda create -n datastorage python=3.12 numpy pandas pyyaml gitpython git \
+       geopandas rioxarray rasterio pyarrow laspy lazrs-python tqdm matplotlib seaborn spyndex
    conda activate datastorage
    ```
 
