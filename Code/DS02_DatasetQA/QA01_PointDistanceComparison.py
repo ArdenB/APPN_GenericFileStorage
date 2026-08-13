@@ -84,7 +84,7 @@ Command-line Arguments
 
 __title__ = "Point distance comparison"
 __author__ = "Arden Burrell"
-__version__ = "v1.0(28.04.2026)"
+__version__ = "v1.1(13.08.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -122,6 +122,7 @@ except git_exc.InvalidGitRepositoryError:
     pass
 
 import Code.functions.core_functions as cf
+import Code.functions.gcp_qc as gq
 
 
 # +++++ DSM filename pattern: <stem>_LiDAR_DSM_<cm>cm.tif +++++
@@ -328,31 +329,6 @@ def _print_summary_tables(df: pd.DataFrame) -> None:
 
 
 # ==================================================================================
-def _outputs_up_to_date(
-        outputs: List[pathlib.Path],
-        inputs: List[pathlib.Path],
-    ) -> bool:
-    """Return True when every output exists and is newer than every input.
-
-    Treats a missing input as "no constraint" (skipped). Returns False
-    if any output is missing, any input is missing, or any output is
-    older than any input.
-    """
-    out_mtimes = []
-    for p in outputs:
-        if not p.is_file():
-            return False
-        out_mtimes.append(p.stat().st_mtime)
-    oldest_out = min(out_mtimes)
-    for p in inputs:
-        if not p.is_file():
-            return False
-        if p.stat().st_mtime > oldest_out:
-            return False
-    return True
-
-
-# ==================================================================================
 def _process_pair(
         pair: Dict[str, Any],
         args: argparse.Namespace,
@@ -400,7 +376,7 @@ def _process_pair(
     inputs_for_cache = [file_a, file_b]
     if pair.get("dsm") is not None:
         inputs_for_cache.append(pair["dsm"])
-    if not args.force and _outputs_up_to_date(
+    if not args.force and cf.outputs_up_to_date(
         [out_path, report_path, plot_path], inputs_for_cache,
     ):
         with report_path.open("r", encoding="utf-8") as fh:
@@ -1086,120 +1062,6 @@ def _flatten(
     return out
 
 
-def _classify_bias_fraction(frac: Optional[float]) -> str:
-    """Label a bias fraction as random / mixed / biased.
-
-    ``frac`` is ``|bias| / rmse`` in [0, 1]. Cut-offs follow the
-    convention: <=0.3 dominantly random scatter, >=0.7 dominantly
-    systematic offset, anything in between is a mixture.
-    """
-    if frac is None or not np.isfinite(frac):
-        return "unknown"
-    if frac <= 0.3:
-        return "random"
-    if frac >= 0.7:
-        return "biased"
-    return "mixed"
-
-
-def _axis_bias(series: pd.Series) -> Dict[str, Any]:
-    """Decompose a signed-error series into bias + random scatter.
-
-    For a residual series ``r``, the mean is the systematic bias, the
-    population standard deviation is the random scatter, and they
-    satisfy ``rmse**2 = mean**2 + std**2``. ``bias_fraction`` is
-    ``|mean| / rmse`` in [0, 1] (0 = purely random, 1 = purely
-    systematic). Empty input yields ``{"n": 0}``.
-    """
-    series = series.dropna()
-    if series.empty:
-        return {"n": 0}
-    arr = series.to_numpy(dtype=float)
-    mean = float(arr.mean())
-    std = float(arr.std(ddof=0))
-    rmse = float(np.sqrt(np.mean(arr ** 2)))
-    frac: Optional[float] = float(abs(mean) / rmse) if rmse > 0 else None
-    return {
-        "n": int(arr.size),
-        "mean": mean,
-        "std": std,
-        "rmse": rmse,
-        "bias_fraction": frac,
-        "classification": _classify_bias_fraction(frac),
-    }
-
-
-def _bias_analysis(matched: pd.DataFrame) -> Dict[str, Any]:
-    """Quantify whether matched-point errors are random or systematic.
-
-    Reports per-axis bias for easting, northing and height, plus a
-    combined 2D bias vector (magnitude and bearing clockwise from
-    grid north). The 2D summary uses the planar RMSE so its
-    ``bias_fraction`` is directly comparable to ``distance_2d``'s
-    ``rmse``.
-    """
-    east = _axis_bias(matched["delta_easting_m"])
-    north = _axis_bias(matched["delta_northing_m"])
-    height = _axis_bias(matched["delta_height_m"])
-
-    d2d = matched["distance_2d_m"].dropna().to_numpy(dtype=float)
-    if d2d.size == 0:
-        planar: Dict[str, Any] = {"n": 0}
-    else:
-        mean_e = float(matched["delta_easting_m"].dropna().mean())
-        mean_n = float(matched["delta_northing_m"].dropna().mean())
-        bias_mag = float(np.hypot(mean_e, mean_n))
-        rmse_2d = float(np.sqrt(np.mean(d2d ** 2)))
-        if bias_mag > 0:
-            bearing = float(np.degrees(np.arctan2(mean_e, mean_n)) % 360.0)
-        else:
-            bearing = None
-        frac: Optional[float] = float(bias_mag / rmse_2d) if rmse_2d > 0 else None
-        planar = {
-            "n": int(d2d.size),
-            "mean_delta_easting_m": mean_e,
-            "mean_delta_northing_m": mean_n,
-            "bias_magnitude_m": bias_mag,
-            "bias_bearing_deg": bearing,
-            "rmse_2d_m": rmse_2d,
-            "bias_fraction": frac,
-            "classification": _classify_bias_fraction(frac),
-        }
-
-    return {
-        "rule": (
-            "bias_fraction = |mean(error)| / rmse, in [0, 1]. "
-            "<=0.3 random, >=0.7 biased, otherwise mixed."
-        ),
-        "planar_2d": planar,
-        "easting": east,
-        "northing": north,
-        "height": height,
-    }
-
-
-def _distance_stats(series: pd.Series) -> Dict[str, Any]:
-    """Summary statistics for a distance series, in metres.
-
-    Returns a JSON-friendly dict. ``rmse`` is the root-mean-square of
-    the values; counts are integers, all other numbers are floats.
-    Empty input yields ``{"n": 0}``.
-    """
-    series = series.dropna()
-    if series.empty:
-        return {"n": 0}
-    arr = series.to_numpy(dtype=float)
-    return {
-        "n": int(arr.size),
-        "mean": float(arr.mean()),
-        "median": float(np.median(arr)),
-        "min": float(arr.min()),
-        "max": float(arr.max()),
-        "std": float(arr.std(ddof=0)),
-        "rmse": float(np.sqrt(np.mean(arr ** 2))),
-    }
-
-
 def _evaluate_warnings(
         stats: Dict[str, Dict[str, Any]],
         bias: Dict[str, Any],
@@ -1224,7 +1086,7 @@ def _evaluate_warnings(
     stats : dict
         ``statistics_metres`` payload from :func:`_build_report`.
     bias : dict
-        ``bias`` payload from :func:`_bias_analysis`.
+        ``bias`` payload from :func:`Code.functions.gcp_qc.bias_analysis`.
     cfg : QAConfig
         Threshold configuration for this run.
 
@@ -1312,13 +1174,13 @@ def _build_report(
         Nested mapping suitable for ``json.dump``.
     """
     stats = {
-        "distance_2d":   _distance_stats(matched["distance_2d_m"]),
-        "distance_3d":   _distance_stats(matched["distance_3d_m"]),
-        "delta_height":  _distance_stats(matched["delta_height_m"]),
-        "delta_easting": _distance_stats(matched["delta_easting_m"]),
-        "delta_northing":_distance_stats(matched["delta_northing_m"]),
+        "distance_2d":   gq.distance_stats(matched["distance_2d_m"]),
+        "distance_3d":   gq.distance_stats(matched["distance_3d_m"]),
+        "delta_height":  gq.distance_stats(matched["delta_height_m"]),
+        "delta_easting": gq.distance_stats(matched["delta_easting_m"]),
+        "delta_northing": gq.distance_stats(matched["delta_northing_m"]),
     }
-    bias = _bias_analysis(matched)
+    bias = gq.bias_analysis(matched)
     if cfg is None:
         cfg = default_config()
     warnings_payload = _evaluate_warnings(stats, bias, cfg)

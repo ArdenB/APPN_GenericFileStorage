@@ -1,5 +1,21 @@
 # Spectral Validation Panel Extraction (QA00)
 
+## Scripts in this folder
+
+| | Per-run (extract + report) | Cross-run (compare + figures) |
+|---|---|---|
+| Panel spectra | `QA00_SpectralValidation.py` | `QA02_SpectralRunComparison.py` |
+| GCP point distances | `QA01_PointDistanceComparison.py` | `QA03_GCPRunComparison.py` |
+
+The per-run scripts open the source data (orthomosaic rasters, GCP
+point layers) and write stable-named artefacts into each run's
+`T1_proc/QC_data/`. The cross-run scripts consume those artefacts
+**only** — they never re-open rasters or geojson — and write comparison
+tables/figures/reports into the routed `QCReports/` folder (project →
+`Documentation/QCReports/`, node → `Documents/QCReports/`, anything
+else requires `--output-dir`). See the [QA03 section](#multi-run-gcp-comparison-qa03)
+below; the rest of this README documents QA00/QA02.
+
 ## Overview
 
 This script automates the extraction and quality control (QC) of spectral data from validation panels in hyperspectral imaging datasets. It crawls the dataset file structure to locate QC panel vector files and their corresponding raster orthomosaics, extracts pixel values from the panels, and generates visualization plots for quality assessment. It is designed to work in directorys that follow the APPN folder structure.
@@ -296,6 +312,55 @@ Planned features (see TODO in code):
 - Add reference panel reflectance curves to plots for comparison
 - Additional QA metrics and statistics
 - Automated outlier detection
+
+## Multi-run GCP comparison (QA03)
+
+`QA03_GCPRunComparison.py` is to `QA01_PointDistanceComparison.py` what
+QA02 is to QA00: it gathers the per-run GCP distance tables
+(`QC_GCP[_{Product}]_distances[_{extra}].{csv|parquet}`) and accuracy
+report JSONs written by QA01 across every run under `--path` and
+compares them.
+
+**Inputs**: QA01 artefacts only (run QA01 first). Stats come from the
+report JSON where present and current; missing, stale, or
+foreign-schema reports are recomputed from the distance table with the
+same maths (`Code/functions/gcp_qc`, shared with QA01) — the
+`stats_source` column records which path was used.
+
+**Grouping**: sensor × product layer (`QC_GCP_points` → "all
+products"; `QC_GCP_{Product}_points` → per product; `_extra` filename
+suffixes stay part of the label so duplicate layers in one run plot as
+distinct lines).
+
+**Outputs** (into the routed `QCReports/` dir):
+- `QC_GCP_run_comparison.{parquet,csv}` — per run × product summary
+  (counts, 2D/3D RMSE, mean/median/max, bias magnitude + bearing +
+  fraction + class, QA01 pass/fail).
+- `QC_GCP_{sensor}_metrics.png` — RMSE/median/bias per run.
+- `QC_GCP_{sensor}_bias_vectors.png` — per-run 2D bias vectors on a
+  compass polar axis (systematic-offset drift check).
+- `QC_GCP_{sensor}_per_gcp.png` — per-GCP-id displacement across runs
+  (a single moved marker vs a whole-flight shift).
+- `QC_GCP_run_comparison.md` — overview report embedding the figures
+  with relative paths (renders in the VS Code / GitHub preview).
+
+**Sharing**: `--save-dir` builds a portable container (`tables/` +
+`reports/` + `figures/` + `comparison_figures/` + `manifest.csv`);
+`--load-dir` merges a received container (or any folder of QA01
+tables) into the comparison. `--start-date`/`--end-date` bound the run
+window. Outputs are mtime-cached against every gathered input; use
+`--force` to regenerate.
+
+```bash
+# Project-level comparison (saves to <Project>/Documentation/QCReports/)
+python Code/DS02_DatasetQA/QA03_GCPRunComparison.py --path USYD_Narrabri/2026_APEx
+
+# Build a container to send to another node
+python Code/DS02_DatasetQA/QA03_GCPRunComparison.py --path <node> --save-dir /path/to/share
+
+# Merge a received container into the local comparison
+python Code/DS02_DatasetQA/QA03_GCPRunComparison.py --path <node> --load-dir /path/to/received
+```
 
 ## Contact
 

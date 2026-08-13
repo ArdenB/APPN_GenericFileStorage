@@ -50,13 +50,12 @@ Command-line Arguments
 
 __title__ = "Spectral run comparison"
 __author__ = "Arden Burrell"
-__version__ = "v1.2(13.08.2026)"
+__version__ = "v1.3(13.08.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
 # ========== Import core packages ==========
 import os
-import re
 import sys
 import shutil
 import argparse
@@ -111,7 +110,7 @@ def main(
     None
     """
     # ========== Resolve where the outputs go ==========
-    out_dir = resolve_output_dir(path, args.output_dir, args.no_save)
+    out_dir = cf.resolve_qcreports_dir(path, args.output_dir, args.no_save)
 
     # ========== Gather the extracted spectra tables ==========
     tables = gather_spectra_tables(
@@ -153,65 +152,6 @@ def main(
         print(f"\nAll comparison figures saved to: {out_dir}")
     else:
         print("\n*** NOTHING WAS SAVED (--no-save): figures were displayed only. ***")
-
-
-# ==================================================================================
-def resolve_output_dir(
-        path: pathlib.Path,
-        output_dir: Optional[str],
-        no_save: bool,
-    ) -> Optional[pathlib.Path]:
-    """Resolve the output folder from the path level (node/project rules).
-
-    Node folders save to ``<Node>/Documents/QCReports/``, project folders
-    to ``<Project>/Documentation/QCReports/``. Any other level requires
-    an explicit ``--output-dir`` (or ``--no-save``).
-
-    Parameters
-    ----------
-    path : pathlib.Path
-        The crawl root passed on the command line.
-    output_dir : str or None
-        Explicit output directory (overrides the level-based routing).
-    no_save : bool
-        When True nothing is saved and None is returned.
-
-    Returns
-    -------
-    pathlib.Path or None
-        The output directory (created if missing), or None in
-        ``--no-save`` mode.
-
-    Raises
-    ------
-    ValueError
-        If the path is neither node nor project level and no
-        ``--output-dir`` was given (and ``--no-save`` is not set).
-    """
-    if no_save:
-        print("*** --no-save: figures will be displayed, NOT saved. ***")
-        return None
-    if output_dir is not None:
-        out = pathlib.Path(output_dir)
-    else:
-        parsed = cf.parse_APPN_dataset_path(path)
-        level = parsed.get("path_level")
-        # The path parser cannot classify a bare node folder (no APPN
-        # pattern in the name), so detect node level via its markers.
-        is_node = ((path / "Documents").is_dir()
-                   or any(path.glob("*_ProjectsSummary.csv")))
-        if level == "project":
-            out = path / "Documentation" / "QCReports"
-        elif is_node:
-            out = path / "Documents" / "QCReports"
-        else:
-            raise ValueError(
-                f"{path} parses as level '{level}', not a node or project "
-                "folder. Provide --output-dir to choose where the comparison "
-                "outputs are saved (or --no-save to only display them).")
-    out.mkdir(parents=True, exist_ok=True)
-    print(f"Output directory: {out}")
-    return out
 
 
 # ==================================================================================
@@ -832,7 +772,7 @@ def _make_comparison_figure(
             ax.grid(False, which="minor")
 
     if plot_dir is not None or copy_dir is not None:
-        parts = (_safe_filename_component(v)
+        parts = (cf.safe_filename_component(v)
                  for v in (sensor, target, region, var))
         fname = f"{'_'.join(parts)}.png"
         for dest in (plot_dir, copy_dir):
@@ -846,24 +786,6 @@ def _make_comparison_figure(
     if show:
         plt.show()
     plt.close(g.figure)
-
-
-# ==================================================================================
-def _safe_filename_component(value: str) -> str:
-    """Convert a plot label to a stable, preview-safe filename component.
-
-    Parameters
-    ----------
-    value : str
-        Sensor, target, region, or metric label.
-
-    Returns
-    -------
-    str
-        ASCII filename component without spaces or URL-sensitive symbols.
-    """
-    expanded = value.replace("_pct", "_percent").replace("%", "percent")
-    return re.sub(r"[^A-Za-z0-9_-]+", "_", expanded).strip("_")
 
 
 # ==================================================================================
