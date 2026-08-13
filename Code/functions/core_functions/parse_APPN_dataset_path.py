@@ -78,7 +78,7 @@ def parse_APPN_dataset_path(
     sensor_names = ({
         "GOBI", "HIRES", "M3M", "CALVIS", "PHENOMATE", "MOLE", "TEMS",
         "PTEMS", "MPROBES", "LITERAL", "H30T", "RHIZO", "MAXAR", "JILIN",
-        "FIELDOBS", "IRT", "M3T", "SVC",
+        "FIELDOBS", "IRT", "M3T", "SVC", "RGB", "FIELDCAMS", "ITRES",
     })
     date_regex = re.compile(r"^\d{8}$|^\d{4}-\d{2}-\d{2}$")
     run_regex = re.compile(r"^[A-Za-z]+_?(\d+)$")
@@ -161,14 +161,17 @@ def parse_APPN_dataset_path(
             _fields_populated = True
         else:
             # Fallback heuristic when no date folder is present.
+            # Project (YYYY_Name) is checked before site so '2026_APEx'
+            # is classified as project, not site (site_regex is more
+            # permissive and would otherwise match first).
             if tier_regex.match(pth.name):
                 path_level = "tier"
             elif pth.name in sensor_names:
                 path_level = "sensor"
-            elif site_regex.match(pth.name):
-                path_level = "site"
             elif project_regex.match(pth.name):
                 path_level = "project"
+            elif site_regex.match(pth.name):
+                path_level = "site"
             else:
                 # Use glob to distinguish 'node' (dates 4 levels deep) from 'root' (dates 5 levels deep).
                 # Also accepts tier folders at the corresponding depths as a secondary signal.
@@ -352,6 +355,10 @@ def parse_APPN_dataset_path(
                 if actual_shape == exp:
                     continue
                 if exp == "other":
+                    continue
+                # Fault tolerance: an unrecognised all-caps token at the
+                # sensor position is treated as a new sensor, not an error.
+                if exp == "sensor" and re.match(r"^[A-Z][A-Z0-9]+$", name):
                     continue
                 hint = (f" (looks like a {actual_shape} folder)"
                         if actual_shape and actual_shape not in ("other", exp) else "")

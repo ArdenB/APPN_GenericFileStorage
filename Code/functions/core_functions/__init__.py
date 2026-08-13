@@ -8,5 +8,6 @@ __version__ = "1.0.0"
 __author__ = "Arden Burrell"
 
 from .parse_APPN_dataset_path import parse_APPN_dataset_path
+from .outputs_up_to_date import outputs_up_to_date
 
-__all__ = ['parse_APPN_dataset_path']
+__all__ = ['parse_APPN_dataset_path', 'outputs_up_to_date']

@@ -1,4 +1,4 @@
-# ELM Validation Panel Extraction
+# Spectral Validation Panel Extraction (QA00)
 
 ## Overview
 
@@ -87,72 +87,89 @@ conda install -c conda-forge \
 | `-f, --force` | flag | False | Force re-creation of output files, overwriting existing ones. |
 | `--type` | str | csv | Output file format: `csv` or `parquet`. Parquet is more efficient but requires additional dependencies. |
 | `-s, --skipplot` | flag | False | Skip plot generation (only extract data tables). |
-| `--skip-processing` | flag | False | Skip raster processing; only load existing output files for plotting. |
-| `--save-dir` | str | None | Save copies of extracted spectra to this directory for sharing/archiving. |
-| `--load-dir` | str | None | Load previously extracted spectra from this directory (e.g., from other nodes). |
+| `--skip-processing` | flag | False | Skip raster processing; only load existing output files for reporting. |
 | `-v, --verbose` | flag | False | Enable detailed output for debugging. |
+
+> **Multi-run comparison** (figures across runs/sites/nodes, plus the
+> `--save-dir` / `--load-dir` sharing workflow) lives in
+> `QA02_SpectralRunComparison.py`. QA00 is the per-run extraction + QC
+> report step. QA02 also accepts an inclusive `--start-date` /
+> `--end-date` window (e.g. `2026-06-01` or `20260601`) to limit which
+> runs are compared.
 
 ## Usage Examples
 
 ### Suggested Usage for Sharing files between APPN nodes
-This workflow extracts spectra from your local datasets and saves copies to a shared location, making it easy for other nodes to access and combine with their own data.
+This workflow extracts spectra from your local datasets (QA00), then gathers
+and saves copies to a shared location (QA02), making it easy for other nodes
+to access and combine with their own data.
 
 ```bash
-python QA00_ELMvaliditation.py --path /path/to/APPNfolderstructure --save-dir /path/to/shared/spectra
+python QA00_SpectralValidation.py --path /path/to/APPNfolderstructure
+python QA02_SpectralRunComparison.py --path /path/to/APPNfolderstructure --save-dir /path/to/shared/spectra
 ```
 
 **Parameters:**
 - `--path`: Point to your local APPN dataset root (e.g., `/mnt/d/APPN-42-datastorage/USYD_Narrabri`)
 - `--save-dir`: A local directory that can be easily compressed (zip or tar) then shared with other nodes via filesender or globus
 
-This creates standardized spectral files that other nodes can then load using `--load-dir` to combine all data for comprehensive QC analysis.  
+This creates standardized spectral files that other nodes can then load using
+`QA02_SpectralRunComparison.py --load-dir` to combine all data for
+comprehensive QC analysis.
 
 ### Basic Usage
 Run from within the git repository:
 ```bash
-python QA00_ELMvaliditation.py
+python QA00_SpectralValidation.py
 ```
 
 ### Specify Custom Path
 Search a specific directory:
 ```bash
-python QA00_ELMvaliditation.py --path /path/to/dataset
+python QA00_SpectralValidation.py --path /path/to/dataset
 ```
 
-### Extract Only (Skip Plotting)
-Create data tables without generating plots:
+### Extract Only (Skip Per-run Figures)
+Create data tables and reports without generating figures:
 ```bash
-python QA00_ELMvaliditation.py -s
+python QA00_SpectralValidation.py -s
 ```
 
 ### Force Regeneration
 Overwrite existing output files:
 ```bash
-python QA00_ELMvaliditation.py --force
+python QA00_SpectralValidation.py --force
 ```
 
 ### Use Parquet Format
 More efficient for large datasets:
 ```bash
-python QA00_ELMvaliditation.py --type parquet
+python QA00_SpectralValidation.py --type parquet
 ```
 
-### Save Data for Sharing
-Extract spectra and save copies to a central directory:
+### Save Data for Sharing (QA02)
+Gather extracted spectra and save copies to a central directory:
 ```bash
-python QA00_ELMvaliditation.py --save-dir /path/to/shared/spectra
+python QA02_SpectralRunComparison.py --path /path/to/node --save-dir /path/to/shared/spectra
 ```
 
-### Load External Data
+### Load External Data (QA02)
 Combine local data with spectra from other nodes:
 ```bash
-python QA00_ELMvaliditation.py --load-dir /path/to/external/spectra --type csv
+python QA02_SpectralRunComparison.py --path /path/to/node --load-dir /path/to/external/spectra
 ```
 
-### Quick Re-plotting
-Skip processing, just regenerate plots from existing files:
+### Limit the Comparison to a Date Window (QA02)
+Only compare runs inside an inclusive date range (either bound may be
+omitted; any `pandas`-parseable date form works):
 ```bash
-python QA00_ELMvaliditation.py --skip-processing
+python QA02_SpectralRunComparison.py --path /path/to/node --start-date 2026-06-01 --end-date 2026-08-31
+```
+
+### Quick Re-reporting
+Skip processing, just regenerate reports/figures from existing files:
+```bash
+python QA00_SpectralValidation.py --skip-processing
 ```
 
 ## Expected Folder Structure
@@ -262,7 +279,7 @@ Bad bands are automatically identified and can be excluded from plots:
 ### Verbose Mode
 Use `-v` or `--verbose` for detailed diagnostic output:
 ```bash
-python QA00_ELMvaliditation.py --verbose
+python QA00_SpectralValidation.py --verbose
 ```
 
 ## Notes
