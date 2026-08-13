@@ -17,6 +17,7 @@ from Code.functions.plot_layout import (
     plot_layout_dir,
     find_plot_file,
     load_plot_file,
+    load_site_plots,
     find_trial_info,
 )
 
@@ -179,6 +180,32 @@ class TestLoadPlotFile:
         assert gdf is not None
         assert "genotype" not in gdf.columns
         assert any("plot_id" in i for i in issues)
+
+
+# ==================================================================================
+class TestLoadSitePlots:
+    def test_loads_each_site_once(self, site_dir):
+        _write_geojson(plot_layout_dir(site_dir) / "2026TestSite_plots.geojson")
+        result = load_site_plots([site_dir, site_dir])
+        assert list(result) == [site_dir]
+        gdf, issues = result[site_dir]
+        assert gdf is not None
+        assert issues == []
+        assert gdf.attrs["plot_file"].name == "2026TestSite_plots.geojson"
+
+    def test_missing_main_warns_and_returns_none(self, site_dir):
+        with pytest.warns(UserWarning, match="Mandatory main plot file"):
+            result = load_site_plots([site_dir])
+        gdf, issues = result[site_dir]
+        assert gdf is None
+        assert issues
+
+    def test_trial_info_flag_without_csv_flags_issue(self, site_dir):
+        _write_geojson(plot_layout_dir(site_dir) / "2026TestSite_plots.geojson")
+        with pytest.warns(UserWarning, match="no trial-info CSV"):
+            result = load_site_plots([site_dir], join_trial_info=True)
+        gdf, issues = result[site_dir]
+        assert gdf is not None  # missing trial info is a warning, not a failure
 
 
 # ==================================================================================

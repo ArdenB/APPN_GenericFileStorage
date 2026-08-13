@@ -197,6 +197,56 @@ def load_plot_file(
 
 
 # ==================================================================================
+def load_site_plots(
+        site_dirs,
+        variant: Optional[str] = None,
+        join_trial_info: bool = False,
+    ) -> dict:
+    """Resolve and load the plot file for a set of site folders.
+
+    One :func:`find_plot_file` + :func:`load_plot_file` pass per site,
+    with every issue emitted as a warning. Used by the DS03 extraction
+    scripts to load each site's plots exactly once per crawl.
+
+    Parameters
+    ----------
+    site_dirs : iterable of pathlib.Path
+        Site folders (``<root>/<node>/<project>/<site>``).
+    variant : str, optional
+        Plot-file variant selector (see :func:`find_plot_file`).
+    join_trial_info : bool, optional
+        Join the site's trial-info CSV onto the plots via ``plot_id``.
+        Default False.
+
+    Returns
+    -------
+    dict of pathlib.Path to tuple
+        Mapping of site folder to ``(plots GeoDataFrame or None, issues)``.
+        The GeoDataFrame carries the source path in ``.attrs['plot_file']``.
+    """
+    plots: dict = {}
+    for site_dir in sorted(set(site_dirs)):
+        plot_path, issues = find_plot_file(site_dir, variant=variant)
+        if plot_path is None:
+            plots[site_dir] = (None, issues)
+            for issue in issues:
+                warn.warn(f"{site_dir.name}: {issue}")
+            continue
+        trial = find_trial_info(site_dir) if join_trial_info else None
+        if join_trial_info and trial is None:
+            issues.append(f"join_trial_info set but no trial-info CSV found "
+                          f"for {site_dir.name}.")
+        gdf, load_issues = load_plot_file(plot_path, trial_info=trial)
+        issues = issues + load_issues
+        if gdf is not None:
+            gdf.attrs["plot_file"] = plot_path
+        plots[site_dir] = (gdf, issues)
+        for issue in issues:
+            warn.warn(f"{site_dir.name}: {issue}")
+    return plots
+
+
+# ==================================================================================
 def find_trial_info(site_dir: pathlib.Path) -> Optional[pathlib.Path]:
     """Locate the current trial-information CSV for a site.
 

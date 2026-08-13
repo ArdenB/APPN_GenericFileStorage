@@ -128,7 +128,9 @@ def main(args: argparse.Namespace, path: pathlib.Path) -> pd.DataFrame:
     jobs = locate_lidar_runs(path, cfg, args)
 
     # ========== Load each site's plot file once ==========
-    plots_by_site = load_site_plots(jobs, args)
+    plots_by_site = pl.load_site_plots(
+        (j["site_dir"] for j in jobs),
+        variant=args.plot_variant, join_trial_info=args.join_trial_info)
 
     # ========== Extract each run (cached) ==========
     summary_rows: List[Dict[str, Any]] = []
@@ -272,47 +274,6 @@ def locate_lidar_runs(
             "run": parsed["run_folder"],
         })
     return jobs
-
-
-# ==================================================================================
-def load_site_plots(
-        jobs: List[Dict[str, Any]],
-        args: argparse.Namespace,
-    ) -> Dict[pathlib.Path, Tuple[Optional[gpd.GeoDataFrame], List[str]]]:
-    """Resolve and load the plot file for every site referenced by the jobs.
-
-    Parameters
-    ----------
-    jobs : list of dict
-        Job dicts from :func:`locate_lidar_runs`.
-    args : argparse.Namespace
-        Parsed command-line arguments (``plot_variant``,
-        ``join_trial_info``).
-
-    Returns
-    -------
-    dict of pathlib.Path to tuple
-        Mapping of site folder to ``(plots GeoDataFrame or None, issues)``.
-        The GeoDataFrame carries the source path in ``.attrs['plot_file']``.
-    """
-    plots: Dict[pathlib.Path, Tuple[Optional[gpd.GeoDataFrame], List[str]]] = {}
-    for site_dir in sorted({j["site_dir"] for j in jobs}):
-        plot_path, issues = pl.find_plot_file(site_dir, variant=args.plot_variant)
-        if plot_path is None:
-            plots[site_dir] = (None, issues)
-            continue
-        trial = pl.find_trial_info(site_dir) if args.join_trial_info else None
-        if args.join_trial_info and trial is None:
-            issues.append(f"--join-trial-info set but no trial-info CSV found "
-                          f"for {site_dir.name}.")
-        gdf, load_issues = pl.load_plot_file(plot_path, trial_info=trial)
-        issues = issues + load_issues
-        if gdf is not None:
-            gdf.attrs["plot_file"] = plot_path
-        plots[site_dir] = (gdf, issues)
-        for issue in issues:
-            warn.warn(f"{site_dir.name}: {issue}")
-    return plots
 
 
 # ==================================================================================

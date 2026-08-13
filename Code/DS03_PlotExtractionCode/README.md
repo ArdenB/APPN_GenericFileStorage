@@ -12,7 +12,7 @@ ML-model-derived products).
 |--------|-------|--------|
 | `PE00_LIDAR_extraction.py` | `*_LiDAR_CombinedPointCloud.las/.laz` + DSM/DTM | `PE_LIDAR_points[…].parquet` + metadata YAML |
 | `PE01_HyperspecPlotExtraction.py` | `*_{VNIR\|SWIR}_Orthomosaic.bin` (GOBI: VNIR, CALVIS: VNIR+SWIR) | `PE_{REGION}_pixels[…].parquet`, `PE_{REGION}_plot_metrics[…].parquet`, `PE_extraction_report[…].md` + `PE_figures/` |
-| `PE02` (planned) | DS05/SI00 spectral-index maps | per-plot index aggregate tables |
+| `PE02_IndexPlotExtraction.py` | DS05/SI00 index maps (`SpectralIndices/SI_*_report.json` manifests + NetCDF/GeoTIFF) | `PE_SI_{REGION}_{METHOD}_plot_metrics[…].parquet`, `PE_SI_{REGION}_{METHOD}_report.md` + `PE_figures/` |
 
 `[…]` = optional `_gproN` (only with `--allow-multi-gpro`) and
 `_{variant}` (only with `--plot-variant`) suffixes.
@@ -85,6 +85,24 @@ grids and are the default.
 python Code/DS03_PlotExtractionCode/PE01_HyperspecPlotExtraction.py --path <Node>/<Project>
 # metrics/report refresh without touching the .bin:
 python Code/DS03_PlotExtractionCode/PE01_HyperspecPlotExtraction.py --path <Node>/<Project> --metrics-only
+```
+
+## PE02 — spectral-index plot extraction
+
+Consumes the **SI00 manifests** (`SI_*_report.json`) rather than
+re-discovering rasters, and never opens the `.bin` orthos — the raster
+boundary is DS05's (SI00 computes maps, PE02 extracts plots). Index maps
+are opened with `decode_coords="all"` (CRS on `spatial_ref`) and each
+plot is read through its own bounding-box window; all index variables in
+the window aggregate at once. Output is a long-format trait table (one
+row per plot × index: `mean/median/std/count/valid_fraction` + run
+metadata and any trial-info columns), a markdown report with a
+per-index summary table, and figures (headline-index choropleth,
+per-index distribution boxplots). `--indices NDVI NDREI …` restricts
+the set; caching keys on index maps + manifest + plot file.
+
+```bash
+python Code/DS03_PlotExtractionCode/PE02_IndexPlotExtraction.py --path <Node>/<Project>
 ```
 
 ## Tests
