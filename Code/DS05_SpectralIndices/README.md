@@ -75,6 +75,10 @@ shared with QA00/PE01):
 another sensor's band widths (min/max/peak table) through the
 `definitions` argument of `map_bands_to_spyndex` to produce indices
 band-matched to that sensor (e.g. Sentinel-2-like NDVI from GOBI).
+The DS05 TODO list (new sensor types — M3M multispectral, satellite
+scenes, other `.gpro` sensors — and the cross-sensor band matching)
+lives in the node-side repo's DS05 README; features are ported here
+as they land.
 
 ## Dependencies
 
