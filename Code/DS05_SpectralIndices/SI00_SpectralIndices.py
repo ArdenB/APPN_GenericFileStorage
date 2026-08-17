@@ -40,9 +40,9 @@ Command-line Arguments
 --path : str, optional
     Folder to crawl for orthomosaics. Defaults to the git repo root.
 --method : str, optional
-    Band aggregation: ``Peak`` (single nearest band per symbol,
-    default), ``Mean`` (average over the symbol's wavelength window),
-    or ``both``.
+    Band aggregation: ``Mean`` (average over the symbol's wavelength
+    window, default), ``Peak`` (single nearest band per symbol), or
+    ``both``.
 --indices : str [str ...], optional
     Restrict to a curated list of spyndex index names. Default is every
     index computable from the sensor's bands.
@@ -1222,7 +1222,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Compute spyndex spectral index maps from hyperspectral orthomosaics (DS05).")
     parser.add_argument("--path", type=str, default=None, help="The path of the folder to crawl for orthomosaics. By default it will search from the root dir of the git repo.")
     parser.add_argument("-f", "--force", default=False, action="store_true", help="Force recomputation even when outputs are newer than the source orthomosaics.")
-    parser.add_argument("--method", type=str, default="Peak", choices=["Peak", "Mean", "both"], help="Band aggregation method: Peak selects the single band nearest each spyndex symbol's nominal centre (default); Mean averages every band inside the symbol's wavelength window; both computes the two variants.")
+    parser.add_argument("--method", type=str, default="Mean", choices=["Peak", "Mean", "both"], help="Band aggregation method: Mean averages every band inside the symbol's wavelength window (default; closer to what a broadband sensor integrates); Peak selects the single band nearest each spyndex symbol's nominal centre; both computes the two variants.")
     parser.add_argument("--indices", type=str, nargs="+", default=None, help="Restrict computation to a curated list of spyndex index names (e.g. --indices NDVI NDRE EVI). Default is every index computable from the sensor's bands.")
     parser.add_argument("--format", type=str, default="netcdf", choices=["netcdf", "geotiff"], help="Index-map output format. netcdf (default) writes one compressed file per product (split into part files when memory-bound); geotiff writes one single-band tiled GTiff per index.")
     parser.add_argument("--resample-method", type=str, default="nearest", choices=["nearest", "linear"], help="Interpolation used to resample VNIR bands onto the SWIR grid for the combined VNIRSWIR product. Default nearest.")

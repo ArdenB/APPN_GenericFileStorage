@@ -17,9 +17,9 @@ python Code/DS05_SpectralIndices/SI00_SpectralIndices.py --path <node_or_project
 
 Key arguments (see `--help` for all):
 
-- `--method {Peak,Mean,both}` — band aggregation (default `Peak`: single
-  band nearest each spyndex symbol's nominal centre; `Mean` averages every
-  band inside the symbol's wavelength window).
+- `--method {Peak,Mean,both}` — band aggregation (default `Mean`: averages
+  every band inside the symbol's wavelength window; `Peak` selects the
+  single band nearest each spyndex symbol's nominal centre).
 - `--indices NDVI NDREI …` — curated index list (default: **all** indices
   computable from the sensor's bands).
 - `--format {netcdf,geotiff}` — NetCDF default; GTiff writes one

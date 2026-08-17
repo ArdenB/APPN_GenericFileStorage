@@ -10,22 +10,28 @@ The orthomosaics are 16 GB+ single files, so nothing is ever read whole:
 each plot polygon is read through its own bounding-box window (the
 proven QA00 pattern; ``--read-strategy block`` reads one window per
 block of adjacent plots instead, but benchmarked slower — see
-``--read-strategy``). Raw pixel rows stream to parquet via a pyarrow
-writer so peak memory is one window plus one plot's rows.
+``--read-strategy``).
 
-Per run and EM region two tables are written to
+Per run and EM region the outputs land in
 ``<run>/T1_proc/PlotExtracts/``:
 
-- ``PE_{VNIR|SWIR}_pixels[...].parquet`` — raw long-format per-pixel table
-  (``plot_id``, ``band``, ``wavelength``, ``value``).
-- ``PE_{VNIR|SWIR}_plot_metrics[...].parquet`` — per plot x band metrics
-  (mean/median/std/count/valid_fraction) plus the run metadata columns.
+- ``PixelLevel/PE_{VNIR|SWIR}_pixels[...]/`` — raw long-format per-pixel
+  parquet *dataset*: one zstd part file per plot (``plot_id``, ``band``,
+  ``value``; wavelengths live in the sidecar), readable as one table by
+  any parquet dataset reader. The YAML sidecar beside the directory is
+  written last and doubles as the completion marker, so extraction is
+  cached on it and an interrupted run resumes at the first missing or
+  stale plot instead of restarting.
+- ``PlotLevel/PE_{VNIR|SWIR}_plot_metrics[...].parquet`` — per plot x
+  band metrics (mean/median/std/count/valid_fraction + wavelength) plus
+  the run metadata columns.
+- ``Reports/`` — a markdown overview report with embedded QC figures
+  (``PE_extraction_report[...].md`` + ``PE_figures/``).
 
-Metrics are always derived from the saved raw table (never a second ortho
-read) unless ``--force``; a metrics-only rerun on an already-extracted run
-touches parquet, not the 16 GB ``.bin``. A markdown overview report with
-embedded QC figures (``PE_extraction_report[...].md`` + ``PE_figures/``)
-is written alongside the tables.
+Metrics are always derived from the saved raw dataset (never a second
+ortho read) unless ``--force``; a metrics-only rerun on an
+already-extracted run touches parquet, not the 16 GB ``.bin``, and
+holds one plot in memory at a time.
 
 Command-line Arguments
 ----------------------
@@ -54,7 +60,7 @@ Command-line Arguments
 
 __title__ = "Hyperspectral plot extraction"
 __author__ = "Arden Burrell"
-__version__ = "v1.0(13.08.2026)"
+__version__ = "v1.1(17.08.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -71,8 +77,8 @@ import git
 from git import exc as git_exc
 import numpy as np
 import pandas as pd
-import pyarrow as pa
 import pyarrow.parquet as pq
+import yaml
 import rioxarray
 import geopandas as gpd
 from tqdm import tqdm
@@ -99,6 +105,7 @@ if _git_root not in sys.path:
 # ========== Import custom packages ==========
 import Code.functions.core_functions as cf
 import Code.functions.plot_layout as pl
+import Code.functions.plot_extracts as pex
 
 
 # ==================================================================================
@@ -112,10 +119,8 @@ class PE01Config:
         Sensor platform folder names handled by this script.
     em_regions : tuple of str
         Orthomosaic EM-region tokens searched per run.
-    extracts_dirname : str
-        Name of the output folder inside ``T1_proc/``.
     figures_dirname : str
-        Name of the figure folder inside the extracts folder.
+        Name of the figure folder inside the reports folder.
     block_size : int
         Plots per read block for the ``block`` strategy.
     max_window_mb : float
@@ -124,7 +129,6 @@ class PE01Config:
     """
     valid_sensors: Tuple[str, ...] = ("GOBI", "CALVIS")
     em_regions: Tuple[str, ...] = ("VNIR", "SWIR")
-    extracts_dirname: str = "PlotExtracts"
     figures_dirname: str = "PE_figures"
     block_size: int = 24
     max_window_mb: float = 1024.0
@@ -282,7 +286,7 @@ def locate_ortho_runs(
 
         site_dir = (pathlib.Path(parsed["root"]) / parsed["node"]
                     / parsed["project"] / parsed["site_folder"])
-        extracts_dir = t1_dir / cfg.extracts_dirname
+        dirs = pex.plotextract_dirs(t1_dir)
 
         suffix_parts: List[str] = []
         if gpro_nu is not None:
@@ -293,9 +297,9 @@ def locate_ortho_runs(
 
         run = runs.setdefault(run_dir, {
             "site_dir": site_dir,
-            "extracts_dir": extracts_dir,
-            "figures_dir": extracts_dir / cfg.figures_dirname,
-            "report_file": extracts_dir / f"PE_extraction_report{suffix}.md",
+            "extracts_dir": dirs["extracts"],
+            "figures_dir": dirs["reports"] / cfg.figures_dirname,
+            "report_file": dirs["reports"] / f"PE_extraction_report{suffix}.md",
             "node": parsed["node"],
             "project": parsed["project"],
             "site": parsed["site_folder"],
@@ -304,14 +308,15 @@ def locate_ortho_runs(
             "run": parsed["run_folder"],
             "orthos": [],
         })
-        raw_file = extracts_dir / f"PE_{region}_pixels{suffix}.parquet"
+        # raw_file is a parquet dataset *directory* (one part per plot)
+        raw_file = dirs["pixel"] / f"PE_{region}_pixels{suffix}"
         run["orthos"].append({
             "ortho": ortho,
             "region": region,
             "gpro_nu": gpro_nu,
             "raw_file": raw_file,
-            "metrics_file": extracts_dir / f"PE_{region}_plot_metrics{suffix}.parquet",
-            "metadata_outfile": raw_file.with_name(f"{raw_file.stem}_metadata.yaml"),
+            "metrics_file": dirs["plot"] / f"PE_{region}_plot_metrics{suffix}.parquet",
+            "metadata_outfile": dirs["pixel"] / f"PE_{region}_pixels{suffix}_metadata.yaml",
         })
     return list(runs.values())
 
@@ -327,10 +332,11 @@ def process_ortho(
     ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
     """Extract one orthomosaic into raw + metrics tables (cached).
 
-    The raw pixel table is regenerated only when missing or older than
-    the ortho/plot file (or ``--force``). Metrics are derived from the
-    saved raw table — the ortho is never re-read for a metrics-only
-    refresh.
+    The raw pixel dataset is regenerated only when missing or older
+    than the ortho/plot file (or ``--force``), and regeneration resumes
+    at the first missing/stale per-plot part. Metrics are derived from
+    the saved raw dataset — the ortho is never re-read for a
+    metrics-only refresh.
 
     Parameters
     ----------
@@ -357,19 +363,24 @@ def process_ortho(
         the region was skipped or is raw-only.
     """
     plot_file = plotshp.attrs["plot_file"]
-    raw_fresh = cf.outputs_up_to_date([job["raw_file"]], [job["ortho"], plot_file])
+    # The sidecar is written last, so it is the completion marker + mtime anchor.
+    raw_fresh = (len(pex.dataset_parts(job["raw_file"])) > 0
+                 and cf.outputs_up_to_date([job["metadata_outfile"]],
+                                           [job["ortho"], plot_file]))
     metrics_fresh = (job["metrics_file"].is_file()
-                     and cf.outputs_up_to_date([job["metrics_file"]], [job["raw_file"]]))
+                     and cf.outputs_up_to_date([job["metrics_file"]],
+                                               [job["metadata_outfile"]]))
 
-    # ========== Raw extraction (streams to parquet) ==========
+    # ========== Raw extraction (per-plot parts; resumes at stale plots) ==========
     extract_stats: Optional[Dict[str, Any]] = None
     if args.force or (not raw_fresh and not args.metrics_only):
         tqdm.write(f"Extracting {job['ortho'].name} ({job['region']}) started at "
                    f"{pd.Timestamp.now()}.")
         extract_stats = extract_ortho_pixels(
-            job["ortho"], plotshp, job["raw_file"],
+            job["ortho"], plotshp, job["raw_file"], plot_file,
             strategy=args.read_strategy, block_size=args.block_size,
-            keep_xy=args.keep_xy, max_window_mb=cfg.max_window_mb)
+            keep_xy=args.keep_xy, max_window_mb=cfg.max_window_mb,
+            force=args.force)
         meta = cf.build_run_metadata(
             {**{k: run[k] for k in ["node", "project", "site", "sensor", "date", "run"]},
              "ortho": job["ortho"], "region": job["region"],
@@ -381,12 +392,13 @@ def process_ortho(
         raw_fresh = True
         metrics_fresh = False
     elif not raw_fresh and args.metrics_only:
-        if not job["raw_file"].is_file():
+        if (not pex.dataset_parts(job["raw_file"])
+                or not job["metadata_outfile"].is_file()):
             return (_summary_row(run, job, "skipped",
-                                 "--metrics-only but no raw pixel table exists"),
+                                 "--metrics-only but no raw pixel dataset exists"),
                     None)
         warn.warn(f"{job['raw_file'].name} is older than its inputs; metrics "
-                  "will be derived from the stale raw table (--metrics-only).")
+                  "will be derived from the stale raw dataset (--metrics-only).")
         raw_fresh = True
 
     if args.raw_only:
@@ -394,7 +406,7 @@ def process_ortho(
         n_px = extract_stats["n_pixels"] if extract_stats else None
         return _summary_row(run, job, status, None, n_pixels=n_px), None
 
-    # ========== Metrics (from the saved raw table, never the ortho) ==========
+    # ========== Metrics (from the saved raw dataset, never the ortho) ==========
     if metrics_fresh and extract_stats is None:
         metrics = pd.read_parquet(job["metrics_file"])
         stats = _stats_from_metrics(job, metrics)
@@ -403,7 +415,8 @@ def process_ortho(
                              n_plots=stats["n_plots_with_pixels"]),
                 stats)
 
-    metrics = compute_plot_metrics(job["raw_file"])
+    wavelengths = _sidecar_wavelengths(job["metadata_outfile"])
+    metrics = compute_plot_metrics(job["raw_file"], wavelengths)
     # +++++ Attach run metadata (+ optional trial-info columns) +++++
     for key in ["node", "project", "site", "sensor", "date", "run"]:
         metrics[key] = run[key]
@@ -416,7 +429,8 @@ def process_ortho(
         metrics = metrics.merge(
             pd.DataFrame(plotshp[["plot_id"] + trial_cols]),
             on="plot_id", how="left")
-    metrics.to_parquet(job["metrics_file"], index=False)
+    job["metrics_file"].parent.mkdir(parents=True, exist_ok=True)
+    metrics.to_parquet(job["metrics_file"], index=False, compression="zstd")
 
     stats = _stats_from_metrics(job, metrics)
     if extract_stats is not None:
@@ -432,13 +446,15 @@ def process_ortho(
 def extract_ortho_pixels(
         ortho: pathlib.Path,
         plotshp: gpd.GeoDataFrame,
-        raw_file: pathlib.Path,
+        dataset_dir: pathlib.Path,
+        plot_file: pathlib.Path,
         strategy: str = "plot",
         block_size: int = 24,
         keep_xy: bool = False,
         max_window_mb: float = 1024.0,
+        force: bool = False,
     ) -> Dict[str, Any]:
-    """Stream per-plot pixels from an orthomosaic into a parquet table.
+    """Extract per-plot pixels from an orthomosaic into a parquet dataset.
 
     Plots are read through per-polygon bounding-box windows:
     ``clip_box`` (a windowed read) then one exact ``clip`` per polygon
@@ -446,9 +462,14 @@ def extract_ortho_pixels(
     window per block of adjacent polygons instead and clips each plot
     from the in-memory window — benchmarked slower on the 16 GB GOBI
     test ortho (631 s vs 369 s; the block bbox drags in inter-plot gap
-    pixels across every band). Rows are appended per plot through a
-    :class:`pyarrow.parquet.ParquetWriter`, so peak memory is one
-    window plus one plot's rows.
+    pixels across every band).
+
+    Each plot becomes its own zstd part file inside *dataset_dir*,
+    written atomically (``.tmp`` then rename). A plot whose part file
+    is already newer than the ortho and plot file is skipped without
+    touching the raster — an interrupted run resumes at the first
+    missing/stale plot. Orphan parts from plots no longer in the plot
+    file are removed at the end.
 
     Parameters
     ----------
@@ -456,8 +477,11 @@ def extract_ortho_pixels(
         The ENVI ``.bin`` orthomosaic.
     plotshp : geopandas.GeoDataFrame
         Validated plot polygons with a ``plot_id`` column.
-    raw_file : pathlib.Path
-        Output parquet path (parent created if missing).
+    dataset_dir : pathlib.Path
+        Output dataset directory (created if missing).
+    plot_file : pathlib.Path
+        The plot-layout source file (freshness input for per-plot
+        resume checks).
     strategy : {'plot', 'block'}, optional
         Read strategy. Default ``"plot"``.
     block_size : int, optional
@@ -467,18 +491,23 @@ def extract_ortho_pixels(
     max_window_mb : float, optional
         A block whose bbox window would exceed this cap (native dtype)
         is processed per plot instead. Default 1024.
+    force : bool, optional
+        Clear all existing parts and re-extract everything. Default
+        False.
 
     Returns
     -------
     dict
         Extraction stats: ``n_pixels``, ``n_plots_total``,
-        ``n_plots_with_pixels``, ``n_plots_empty``, ``n_bands``,
-        ``wavelength_range_nm``, ``elapsed_s``.
+        ``n_plots_with_pixels``, ``n_plots_empty``, ``n_plots_reused``,
+        ``n_bands``, ``wavelength_range_nm``, ``wavelengths_nm`` (band
+        index to nm, recorded in the sidecar), ``elapsed_s``.
 
     Raises
     ------
     ValueError
-        If the raster has no CRS or *strategy* is unknown.
+        If the raster has no CRS, *strategy* is unknown, or no plot
+        yielded pixels.
     """
     if strategy not in ("block", "plot"):
         raise ValueError(f"Unknown read strategy '{strategy}'.")
@@ -487,6 +516,15 @@ def extract_ortho_pixels(
     # +++++ Per-band wavelengths + native dtype from the raster metadata +++++
     wavelengths, src_dtype = cf.band_wavelengths(ortho)
     np_dtype = np.dtype(src_dtype)
+    n_bands = max(len(wavelengths), 1)
+
+    def _part_path(plot_id: Any) -> pathlib.Path:
+        return dataset_dir / f"{cf.safe_filename_component(str(plot_id))}.parquet"
+
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    if force:
+        for old in dataset_dir.glob("*.parquet*"):
+            old.unlink()
 
     # +++++ Open lazily (masked=True -> nodata becomes NaN) +++++
     ds = rioxarray.open_rasterio(ortho, masked=True)
@@ -510,53 +548,68 @@ def extract_ortho_pixels(
             blocks = [plots.iloc[i:i + block_size]
                       for i in range(0, len(plots), block_size)]
 
-        raw_file.parent.mkdir(parents=False, exist_ok=True)
-        writer: Optional[pq.ParquetWriter] = None
         n_pixels = 0
+        n_reused = 0
         plots_with_px: set = set()
-        try:
-            for block in tqdm(blocks, desc=f"{ortho.stem} ({strategy})", leave=False):
-                minx, miny, maxx, maxy = block.total_bounds
-                window_mb = ((maxx - minx) / res_x) * ((maxy - miny) / res_y) \
-                    * bytes_per_px / 2 ** 20
-                if strategy == "block" and window_mb > max_window_mb:
-                    warn.warn(
-                        f"Block window would be {window_mb:.0f} MB "
-                        f"(> {max_window_mb:.0f} MB cap); reading its "
-                        f"{len(block)} plots individually.")
-                    sub_blocks = [block.iloc[[i]] for i in range(len(block))]
+        for block in tqdm(blocks, desc=f"{ortho.stem} ({strategy})", leave=False):
+            # +++++ Per-plot resume: fresh parts never touch the raster +++++
+            todo_ids = []
+            for _, prow in block.iterrows():
+                part = _part_path(prow["plot_id"])
+                if cf.outputs_up_to_date([part], [ortho, plot_file]):
+                    n_pixels += pq.read_metadata(part).num_rows // n_bands
+                    plots_with_px.add(prow["plot_id"])
+                    n_reused += 1
                 else:
-                    sub_blocks = [block]
-                for sub in sub_blocks:
-                    try:
-                        window = ds.rio.clip_box(*sub.total_bounds)  # type: ignore[union-attr]
-                        window = window.load()
-                    except Exception as er:  # rioxarray raises several types here
-                        warn.warn(f"Could not read window for plots "
-                                  f"{sub['plot_id'].tolist()} from {ortho.name}: "
-                                  f"{er}. Skipping.")
+                    todo_ids.append(prow["plot_id"])
+            if not todo_ids:
+                continue
+            block = block[block["plot_id"].isin(todo_ids)]
+
+            minx, miny, maxx, maxy = block.total_bounds
+            window_mb = ((maxx - minx) / res_x) * ((maxy - miny) / res_y) \
+                * bytes_per_px / 2 ** 20
+            if strategy == "block" and window_mb > max_window_mb:
+                warn.warn(
+                    f"Block window would be {window_mb:.0f} MB "
+                    f"(> {max_window_mb:.0f} MB cap); reading its "
+                    f"{len(block)} plots individually.")
+                sub_blocks = [block.iloc[[i]] for i in range(len(block))]
+            else:
+                sub_blocks = [block]
+            for sub in sub_blocks:
+                try:
+                    window = ds.rio.clip_box(*sub.total_bounds)  # type: ignore[union-attr]
+                    window = window.load()
+                except Exception as er:  # rioxarray raises several types here
+                    warn.warn(f"Could not read window for plots "
+                              f"{sub['plot_id'].tolist()} from {ortho.name}: "
+                              f"{er}. Skipping.")
+                    continue
+                for _, prow in sub.iterrows():
+                    df = _clip_plot(window, prow, crs, np_dtype, keep_xy)
+                    if df is None or df.empty:
                         continue
-                    for _, prow in sub.iterrows():
-                        df = _clip_plot(window, prow, crs, wavelengths,
-                                        np_dtype, keep_xy)
-                        if df is None or df.empty:
-                            continue
-                        table = pa.Table.from_pandas(df, preserve_index=False)
-                        if writer is None:
-                            writer = pq.ParquetWriter(raw_file, table.schema)
-                        writer.write_table(table)
-                        n_pixels += int(df["band"].value_counts().iloc[0])
-                        plots_with_px.add(prow["plot_id"])
-                    del window
-        finally:
-            if writer is not None:
-                writer.close()
+                    pex.write_dataset_part(df, _part_path(prow["plot_id"]))
+                    n_pixels += int(df["band"].value_counts().iloc[0])
+                    plots_with_px.add(prow["plot_id"])
+                del window
     finally:
         # Close the GDAL handle now; open handles at interpreter shutdown
         # trigger a harmless-but-noisy "Error in sys.excepthook" teardown race.
         ds.close()
 
-    if writer is None:
+    # +++++ Remove orphan parts from plots no longer in the plot file +++++
+    valid_names = {_part_path(pid).name for pid in plots["plot_id"]}
+    orphans = [p for p in pex.dataset_parts(dataset_dir)
+               if p.name not in valid_names]
+    for orphan in orphans:
+        orphan.unlink()
+    if orphans:
+        warn.warn(f"Removed {len(orphans)} orphan part file(s) from "
+                  f"{dataset_dir.name} (plots no longer in the plot file).")
+
+    if not pex.dataset_parts(dataset_dir):
         raise ValueError(
             f"No plot polygons yielded pixels from {ortho}. Check that the "
             "plot geometries overlap the raster extent.")
@@ -567,8 +620,10 @@ def extract_ortho_pixels(
         "n_plots_total": len(plots),
         "n_plots_with_pixels": len(plots_with_px),
         "n_plots_empty": len(plots) - len(plots_with_px),
+        "n_plots_reused": n_reused,
         "n_bands": len(wavelengths),
         "wavelength_range_nm": ([float(min(wl)), float(max(wl))] if wl else None),
+        "wavelengths_nm": {int(b): float(w) for b, w in wavelengths.items()},
         "elapsed_s": float((pd.Timestamp.now() - t0).total_seconds()),
     })
 
@@ -578,7 +633,6 @@ def _clip_plot(
         window: Any,
         prow: pd.Series,
         crs: Any,
-        wavelengths: Dict[int, float],
         np_dtype: np.dtype,
         keep_xy: bool,
     ) -> Optional[pd.DataFrame]:
@@ -592,8 +646,6 @@ def _clip_plot(
         Plot row with ``plot_id`` and ``geometry``.
     crs : Any
         The raster CRS (rasterio CRS object).
-    wavelengths : dict of int to float
-        Band index to wavelength (nm) mapping.
     np_dtype : numpy.dtype
         Native on-disk dtype to restore after the masked read.
     keep_xy : bool
@@ -602,8 +654,8 @@ def _clip_plot(
     Returns
     -------
     pandas.DataFrame or None
-        Long-format rows (``plot_id``, ``band``, ``wavelength``,
-        ``value``); None when the clip failed.
+        Long-format rows (``plot_id``, ``band``, ``value``; wavelengths
+        live in the dataset sidecar); None when the clip failed.
     """
     try:
         sub = window.rio.clip([prow.geometry], crs, drop=True)
@@ -621,26 +673,31 @@ def _clip_plot(
     if np.issubdtype(np_dtype, np.integer):
         df["value"] = df["value"].round().astype(np_dtype)
     df["band"] = df["band"].astype(np.int16)
-    df["wavelength"] = df["band"].map(wavelengths).astype(np.float32)
     df["plot_id"] = prow["plot_id"]
-    cols = ["plot_id", "band", "wavelength", "value"]
+    cols = ["plot_id", "band", "value"]
     if keep_xy:
         cols += ["x", "y"]
     return df[cols]
 
 
 # ==================================================================================
-def compute_plot_metrics(raw_file: pathlib.Path) -> pd.DataFrame:
-    """Compute per plot x band metrics from a saved raw pixel table.
+def compute_plot_metrics(
+        dataset_dir: pathlib.Path,
+        wavelengths: Dict[int, float],
+    ) -> pd.DataFrame:
+    """Compute per plot x band metrics from a saved raw pixel dataset.
 
-    Streams the parquet record batches (the raw table is written in
-    plot order) and buffers one plot at a time, so the 16 GB ortho is
-    never touched and memory stays at one plot's rows.
+    Reads one per-plot part file at a time, so the 16 GB ortho is never
+    touched and memory stays at one plot's rows regardless of flight
+    size.
 
     Parameters
     ----------
-    raw_file : pathlib.Path
-        The raw pixel parquet from :func:`extract_ortho_pixels`.
+    dataset_dir : pathlib.Path
+        The raw pixel dataset directory from :func:`extract_ortho_pixels`.
+    wavelengths : dict of int to float
+        Band index to wavelength (nm) mapping (from the dataset
+        sidecar).
 
     Returns
     -------
@@ -649,37 +706,51 @@ def compute_plot_metrics(raw_file: pathlib.Path) -> pd.DataFrame:
         ``mean``, ``median``, ``std``, ``count``, ``valid_fraction``
         (band count over the plot's best-covered band).
     """
-    print(f"Computing plot metrics from {raw_file.name} ...")
-    pf = pq.ParquetFile(raw_file)
+    print(f"Computing plot metrics from {dataset_dir.name} ...")
     out: List[pd.DataFrame] = []
-    buffer: List[pd.DataFrame] = []
-    current: Optional[Any] = None
-
-    def _flush() -> None:
-        if not buffer:
-            return
-        pdf = pd.concat(buffer, ignore_index=True)
-        g = pdf.groupby("band", sort=True).agg(
-            wavelength=("wavelength", "first"),
+    for part in tqdm(pex.dataset_parts(dataset_dir),
+                     desc="plot metrics", leave=False):
+        pdf = pd.read_parquet(part, columns=["plot_id", "band", "value"])
+        if pdf.empty:
+            continue
+        g = pdf.groupby("band", sort=True, observed=True).agg(
             mean=("value", "mean"),
             median=("value", "median"),
             std=("value", "std"),
             count=("value", "size"),
         ).reset_index()
+        g.insert(1, "wavelength", g["band"].map(wavelengths).astype(np.float32))
         g["valid_fraction"] = g["count"] / g["count"].max()
-        g.insert(0, "plot_id", current)
+        # Keep the source dtype: plot files may use int or str plot ids.
+        g.insert(0, "plot_id", pdf["plot_id"].iloc[0])
         out.append(g)
-        buffer.clear()
-
-    for batch in pf.iter_batches(columns=["plot_id", "band", "wavelength", "value"]):
-        pdf = batch.to_pandas()
-        for pid, grp in pdf.groupby("plot_id", sort=False):
-            if current is not None and pid != current:
-                _flush()
-            current = pid
-            buffer.append(grp)
-    _flush()
     return pd.concat(out, ignore_index=True)
+
+
+# ==================================================================================
+def _sidecar_wavelengths(metadata_outfile: pathlib.Path) -> Dict[int, float]:
+    """Load the band-to-wavelength table from a pixel-dataset sidecar.
+
+    Parameters
+    ----------
+    metadata_outfile : pathlib.Path
+        The dataset's YAML provenance sidecar (written by
+        :func:`process_ortho` after extraction).
+
+    Returns
+    -------
+    dict of int to float
+        Band index to wavelength (nm). Empty (with a warning) when the
+        sidecar lacks the table, so metrics fall back to band indices.
+    """
+    with open(metadata_outfile, "r", encoding="utf-8") as fh:
+        meta = yaml.safe_load(fh)
+    wl = (meta or {}).get("data", {}).get("wavelengths_nm")
+    if not wl:
+        warn.warn(f"No wavelengths_nm table in {metadata_outfile.name}; "
+                  "metrics will carry NaN wavelengths.")
+        return {}
+    return {int(k): float(v) for k, v in wl.items()}
 
 
 # ==================================================================================
@@ -711,7 +782,7 @@ def write_run_report(
     """
     figures: List[Tuple[str, pathlib.Path]] = []
     if not args.skipplot:
-        run["figures_dir"].mkdir(parents=False, exist_ok=True)
+        run["figures_dir"].mkdir(parents=True, exist_ok=True)
         figures.append(("Plot footprints (pixel counts)",
                         plot_footprint_figure(run, run_stats, plotshp)))
         for stats in run_stats:
@@ -752,6 +823,7 @@ def write_run_report(
     for title, figpath in figures:
         rel = figpath.relative_to(run["report_file"].parent).as_posix()
         lines += [f"## {title}", "", f"![{title}]({rel})", ""]
+    run["report_file"].parent.mkdir(parents=True, exist_ok=True)
     run["report_file"].write_text("\n".join(lines), encoding="utf-8")
     print(f"Report written: {run['report_file']}")
 

@@ -8,12 +8,18 @@ site's mandatory Plot_Layout file
 point it also samples the sibling DTM and DSM rasters and computes the
 canopy height ``Delta_z = z - DTM``.
 
-Per run the output is a long-format parquet table (one row per point,
-tagged with ``plot_id`` and the run metadata) written to
-``<run>/T1_proc/PlotExtracts/PE_LIDAR_points[_gproN][_{variant}].parquet``
-plus a YAML provenance sidecar. Extraction is cached: a table is only
-regenerated when it is missing or older than its inputs (point cloud,
-DSM/DTM, plot file). Use ``--force`` to override.
+Per run the output is a long-format parquet *dataset* (one row per
+point, tagged with ``plot_id`` and the run metadata) written as a
+directory of per-scan-chunk part files to
+``<run>/T1_proc/PlotExtracts/PixelLevel/PE_LIDAR_points[_gproN][_{variant}]/``
+plus a YAML provenance sidecar beside the directory. Chunks stream
+straight to disk, so peak memory is one laspy chunk regardless of
+point-cloud size, and any parquet dataset reader (pandas, pyarrow,
+duckdb) reads the directory as one table. The sidecar is written last
+and doubles as the completion marker: extraction is cached via
+``outputs_up_to_date`` on the sidecar (inputs = point cloud, DSM/DTM,
+plot file). Use ``--force`` to override. ``--type csv`` writes a single
+flat file instead (debugging escape hatch).
 
 Command-line Arguments
 ----------------------
@@ -33,7 +39,7 @@ Command-line Arguments
 
 __title__ = "LIDAR plot extraction"
 __author__ = "Arden Burrell & Richard Harwood"
-__version__ = "v2.0(13.08.2026)"
+__version__ = "v2.1(17.08.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -75,6 +81,7 @@ if _git_root not in sys.path:
 # ========== Import custom packages ==========
 import Code.functions.core_functions as cf
 import Code.functions.plot_layout as pl
+import Code.functions.plot_extracts as pex
 
 
 # ==================================================================================
@@ -86,14 +93,11 @@ class PEConfig:
     ----------
     valid_sensors : tuple of str
         Sensor platform folder names handled by this script.
-    extracts_dirname : str
-        Name of the output folder inside ``T1_proc/``.
     chunk_points : int
         Number of points read per laspy chunk. Bounds peak memory for
         large point clouds (~100 MB of coordinates per 4M points).
     """
     valid_sensors: Tuple[str, ...] = ("GOBI", "CALVIS")
-    extracts_dirname: str = "PlotExtracts"
     chunk_points: int = 4_000_000
 
 
@@ -254,15 +258,20 @@ def locate_lidar_runs(
             stem_parts.append(f"gpro{gpro_nu}")
         if args.plot_variant:
             stem_parts.append(args.plot_variant)
-        outdir = run_dir / "T1_proc" / cfg.extracts_dirname
-        outfile = outdir / f"{'_'.join(stem_parts)}.{args.type}"
+        stem = "_".join(stem_parts)
+        dirs = pex.plotextract_dirs(run_dir / "T1_proc")
+        # parquet -> dataset directory of chunk parts; csv -> single flat file
+        if args.type == "csv":
+            outfile = dirs["pixel"] / f"{stem}.csv"
+        else:
+            outfile = dirs["pixel"] / stem
 
         jobs.append({
             "las": las,
             "dsm": dsm,
             "dtm": dtm,
             "outfile": outfile,
-            "metadata_outfile": outfile.with_name(f"{outfile.stem}_metadata.yaml"),
+            "metadata_outfile": dirs["pixel"] / f"{stem}_metadata.yaml",
             "site_dir": site_dir,
             "gpro_nu": gpro_nu,
             "issues": issues,
@@ -284,10 +293,12 @@ def process_lidar(
         args: argparse.Namespace,
         repo: Optional[git.Repo],
     ) -> Dict[str, Any]:
-    """Extract one point cloud into a per-plot parquet table (cached).
+    """Extract one point cloud into a per-plot parquet dataset (cached).
 
-    Skips the extraction when the output is newer than all of its inputs
-    (point cloud, DSM/DTM rasters, plot file) unless ``--force`` is set.
+    Skips the extraction when the provenance sidecar (written last, so
+    it marks completion) is newer than all of the inputs (point cloud,
+    DSM/DTM rasters, plot file) and the output exists, unless
+    ``--force`` is set.
 
     Parameters
     ----------
@@ -310,44 +321,37 @@ def process_lidar(
     """
     plot_file = plotshp.attrs["plot_file"]
     inputs = [job["las"], plot_file] + [p for p in (job["dsm"], job["dtm"]) if p]
-    if not args.force and cf.outputs_up_to_date([job["outfile"]], inputs):
+    # The sidecar is written last, so it is the completion marker + mtime anchor.
+    have_out = (job["outfile"].is_file() if args.type == "csv"
+                else len(pex.dataset_parts(job["outfile"])) > 0)
+    if (not args.force and have_out
+            and cf.outputs_up_to_date([job["metadata_outfile"]], inputs)):
         n = _row_count(job["outfile"], args.type)
         return _summary_row(job, "cached", None, n_points=n)
 
     tqdm.write(f"Processing {job['las'].name} started at {pd.Timestamp.now()}.")
 
-    # ========== Clip the point cloud to the plots (chunked) ==========
-    clipped, issues = extract_plot_points(
-        job["las"], plotshp, chunk_points=cfg.chunk_points)
+    # ========== Stream the clipped + sampled chunks to disk ==========
+    run_meta = {k: job[k] for k in ["node", "project", "site", "sensor",
+                                    "date", "run"]}
+    if job["gpro_nu"] is not None:
+        run_meta["gpro_nu"] = job["gpro_nu"]
+    n_points, n_plots, issues = extract_plot_points(
+        job["las"], plotshp, job["outfile"], dtm=job["dtm"], dsm=job["dsm"],
+        run_meta=run_meta, chunk_points=cfg.chunk_points, file_type=args.type)
     issues = job["issues"] + issues
-    if clipped is None or clipped.empty:
+    if n_points == 0:
         issues.append("No points fell inside any plot polygon; check the plot "
                       "file and point-cloud coverage.")
         return _summary_row(job, "skipped", "; ".join(issues))
 
-    # ========== Sample the DTM / DSM at every point ==========
-    clipped, sample_issues = sample_surface_rasters(
-        clipped, dtm=job["dtm"], dsm=job["dsm"])
-    issues += sample_issues
-
-    # ========== Add the run metadata columns ==========
-    for key in ["node", "project", "site", "sensor", "date", "run"]:
-        clipped[key] = job[key]
-    if job["gpro_nu"] is not None:
-        clipped["gpro_nu"] = job["gpro_nu"]
-
-    # ========== Save the table + provenance sidecar ==========
-    job["outfile"].parent.mkdir(parents=False, exist_ok=True)
-    if args.type == "csv":
-        clipped.to_csv(job["outfile"], index=False)
-    else:
-        clipped.to_parquet(job["outfile"], index=False)
+    # ========== Provenance sidecar (written last: completion marker) ==========
     meta = cf.build_run_metadata(
         {**{k: job[k] for k in ["las", "dsm", "dtm", "outfile", "gpro_nu",
                                 "node", "project", "site", "sensor", "date", "run"]},
          "plot_file": plot_file,
-         "n_points": len(clipped),
-         "n_plots_with_points": int(clipped["plot_id"].nunique()),
+         "n_points": n_points,
+         "n_plots_with_points": n_plots,
          "n_plots_total": len(plotshp),
          "issues": issues},
         script_path=__file__, repo=repo)
@@ -355,22 +359,30 @@ def process_lidar(
 
     status = "extracted" if not issues else "extracted_with_issues"
     return _summary_row(job, status, "; ".join(issues) or None,
-                        n_points=len(clipped),
-                        n_plots=int(clipped["plot_id"].nunique()))
+                        n_points=n_points, n_plots=n_plots)
 
 
 # ==================================================================================
 def extract_plot_points(
         las_path: pathlib.Path,
         plotshp: gpd.GeoDataFrame,
+        outfile: pathlib.Path,
+        dtm: Optional[pathlib.Path],
+        dsm: Optional[pathlib.Path],
+        run_meta: Dict[str, Any],
         chunk_points: int = 4_000_000,
-    ) -> Tuple[Optional[pd.DataFrame], List[str]]:
-    """Read a point cloud in chunks and keep the points inside plot polygons.
+        file_type: str = "parquet",
+    ) -> Tuple[int, int, List[str]]:
+    """Stream in-plot points (with DTM/DSM sampling) to a parquet dataset.
 
-    Each chunk is pre-filtered against the plot file's total bounds with a
-    cheap numpy box test before the exact point-in-polygon spatial join,
-    so only candidate points ever build geometries (QA00 bbox-first
-    lesson applied to points).
+    Each laspy chunk is pre-filtered against the plot file's total
+    bounds with a cheap numpy box test before the exact
+    point-in-polygon spatial join (QA00 bbox-first lesson applied to
+    points), sampled against the surface rasters, tagged with the run
+    metadata, and written straight to its own part file — peak memory
+    is one chunk regardless of point-cloud size. Parts are written
+    atomically (``.tmp`` then rename); stale parts from a previous run
+    are cleared first because chunk numbering restarts.
 
     Parameters
     ----------
@@ -378,25 +390,39 @@ def extract_plot_points(
         Path to the ``.las``/``.laz`` point cloud.
     plotshp : geopandas.GeoDataFrame
         Validated plot polygons with a ``plot_id`` column.
+    outfile : pathlib.Path
+        Dataset directory (``file_type="parquet"``) or flat file path
+        (``file_type="csv"``).
+    dtm : pathlib.Path or None
+        DTM raster path (None when missing).
+    dsm : pathlib.Path or None
+        DSM raster path (None when missing).
+    run_meta : dict of str to Any
+        Constant metadata columns added to every row.
     chunk_points : int, optional
         Points per laspy chunk. Default 4,000,000.
+    file_type : str, optional
+        ``"parquet"`` (dataset directory) or ``"csv"`` (single file).
 
     Returns
     -------
-    pandas.DataFrame or None
-        Columns ``plot_id``, ``x``, ``y``, ``z``; None when the CRS could
-        not be resolved.
+    int
+        Points written across all chunks (0 when the CRS could not be
+        resolved or nothing fell inside a plot).
+    int
+        Plots that received points.
     list of str
-        Issues encountered (CRS mismatch note, missing CRS, ...).
+        Issues encountered (CRS mismatch note, missing rasters, ...).
     """
     issues: List[str] = []
-    frames: List[pd.DataFrame] = []
+    n_points = 0
+    plot_ids: set = set()
     with laspy.open(las_path) as reader:
         crs = reader.header.parse_crs()
         if crs is None:
             issues.append(f"Point cloud {las_path} has no CRS; cannot "
                           "relate it to the plot file.")
-            return None, issues
+            return 0, 0, issues
         if plotshp.crs.to_epsg() != crs.to_epsg():  # type: ignore[union-attr]
             issues.append(
                 f"Plot file CRS (EPSG:{plotshp.crs.to_epsg()}) differs from the "  # type: ignore[union-attr]
@@ -407,46 +433,65 @@ def extract_plot_points(
         minx, miny, maxx, maxy = plots.total_bounds
         plots = plots[["plot_id", "geometry"]]
 
-        n_chunks = int(np.ceil(reader.header.point_count / chunk_points))
-        for points in tqdm(reader.chunk_iterator(chunk_points),
-                           total=n_chunks, desc=las_path.stem, leave=False):
-            x = np.asarray(points.x)
-            y = np.asarray(points.y)
-            # +++++ Cheap bbox pre-filter before any geometry work +++++
-            box = (x >= minx) & (x <= maxx) & (y >= miny) & (y <= maxy)
-            if not box.any():
-                continue
-            cand = gpd.GeoDataFrame(
-                {"x": x[box], "y": y[box], "z": np.asarray(points.z)[box]},
-                geometry=gpd.points_from_xy(x[box], y[box]), crs=crs)
-            joined = gpd.sjoin(cand, plots, how="inner", predicate="within")
-            if joined.empty:
-                continue
-            frames.append(pd.DataFrame(
-                joined[["plot_id", "x", "y", "z"]].reset_index(drop=True)))
+        # +++++ Open the surface rasters once for the whole run +++++
+        rasters, raster_issues = _open_surface_rasters(dtm, dsm)
+        issues += raster_issues
 
-    if len(frames) == 0:
-        return pd.DataFrame(columns=["plot_id", "x", "y", "z"]), issues
-    return pd.concat(frames, ignore_index=True), issues
+        # +++++ Clear stale parts: chunk numbering restarts every run +++++
+        if file_type == "parquet" and outfile.is_dir():
+            for old in outfile.glob("*.parquet*"):
+                old.unlink()
+        outfile.parent.mkdir(parents=True, exist_ok=True)
+        csv_tmp = outfile.with_suffix(".csv.tmp")
+
+        part_nu = 0
+        try:
+            n_chunks = int(np.ceil(reader.header.point_count / chunk_points))
+            for points in tqdm(reader.chunk_iterator(chunk_points),
+                               total=n_chunks, desc=las_path.stem, leave=False):
+                x = np.asarray(points.x)
+                y = np.asarray(points.y)
+                # +++++ Cheap bbox pre-filter before any geometry work +++++
+                box = (x >= minx) & (x <= maxx) & (y >= miny) & (y <= maxy)
+                if not box.any():
+                    continue
+                cand = gpd.GeoDataFrame(
+                    {"x": x[box], "y": y[box], "z": np.asarray(points.z)[box]},
+                    geometry=gpd.points_from_xy(x[box], y[box]), crs=crs)
+                joined = gpd.sjoin(cand, plots, how="inner", predicate="within")
+                if joined.empty:
+                    continue
+                chunk = pd.DataFrame(
+                    joined[["plot_id", "x", "y", "z"]].reset_index(drop=True))
+                chunk = _sample_rasters(chunk, rasters)
+                for key, val in run_meta.items():
+                    chunk[key] = val
+                if file_type == "csv":
+                    chunk.to_csv(csv_tmp, mode="a", index=False,
+                                 header=(n_points == 0))
+                else:
+                    pex.write_dataset_part(
+                        chunk, outfile / f"part_{part_nu:04d}.parquet")
+                n_points += len(chunk)
+                plot_ids.update(chunk["plot_id"].unique())
+                part_nu += 1
+        finally:
+            for ras in rasters.values():
+                ras.close()
+        if file_type == "csv" and n_points > 0:
+            os.replace(csv_tmp, outfile)
+    return n_points, len(plot_ids), issues
 
 
 # ==================================================================================
-def sample_surface_rasters(
-        points: pd.DataFrame,
+def _open_surface_rasters(
         dtm: Optional[pathlib.Path],
         dsm: Optional[pathlib.Path],
-    ) -> Tuple[pd.DataFrame, List[str]]:
-    """Sample DTM/DSM elevations at every point and compute canopy height.
-
-    Uses vectorised nearest-neighbour selection on the lazily opened
-    rasters (only the touched blocks are read from disk). Adds ``DTM``,
-    ``DSM`` and ``Delta_z = z - DTM`` columns where available.
+    ) -> Tuple[Dict[str, Any], List[str]]:
+    """Lazily open the DTM/DSM rasters for repeated per-chunk sampling.
 
     Parameters
     ----------
-    points : pandas.DataFrame
-        Point table with ``x``, ``y``, ``z`` columns (raster CRS assumed
-        to match the point cloud; mismatches are reported and skipped).
     dtm : pathlib.Path or None
         DTM raster path (None when missing).
     dsm : pathlib.Path or None
@@ -454,28 +499,57 @@ def sample_surface_rasters(
 
     Returns
     -------
-    pandas.DataFrame
-        The point table with the added columns.
+    dict of str to xarray.DataArray
+        Opened, band-squeezed rasters keyed ``"DTM"``/``"DSM"`` (missing
+        ones omitted). Caller closes them.
     list of str
-        Issues (CRS mismatch, missing raster, ...).
+        One issue per missing raster.
     """
+    rasters: Dict[str, Any] = {}
     issues: List[str] = []
-    x_idx = xr.DataArray(points["x"].to_numpy(), dims="points")
-    y_idx = xr.DataArray(points["y"].to_numpy(), dims="points")
     for name, ras_path in [("DTM", dtm), ("DSM", dsm)]:
         if ras_path is None:
             issues.append(f"No {name} raster found; {name} column omitted.")
             continue
-        ds = rioxarray.open_rasterio(ras_path, masked=True)
-        try:
-            vals = ds.squeeze("band", drop=True).sel(  # type: ignore[union-attr]
-                x=x_idx, y=y_idx, method="nearest").to_numpy()
-        finally:
-            ds.close()  # type: ignore[union-attr]
+        rasters[name] = rioxarray.open_rasterio(
+            ras_path, masked=True).squeeze("band", drop=True)  # type: ignore[union-attr]
+    return rasters, issues
+
+
+# ==================================================================================
+def _sample_rasters(
+        points: pd.DataFrame,
+        rasters: Dict[str, Any],
+    ) -> pd.DataFrame:
+    """Sample the opened rasters at every point and compute canopy height.
+
+    Uses vectorised nearest-neighbour selection (only the touched blocks
+    are read from disk). Adds ``DTM``, ``DSM`` and ``Delta_z = z - DTM``
+    columns where available.
+
+    Parameters
+    ----------
+    points : pandas.DataFrame
+        Point table with ``x``, ``y``, ``z`` columns (raster CRS assumed
+        to match the point cloud).
+    rasters : dict of str to xarray.DataArray
+        Opened rasters from :func:`_open_surface_rasters`.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The point table with the added columns.
+    """
+    if not rasters:
+        return points
+    x_idx = xr.DataArray(points["x"].to_numpy(), dims="points")
+    y_idx = xr.DataArray(points["y"].to_numpy(), dims="points")
+    for name, ras in rasters.items():
+        vals = ras.sel(x=x_idx, y=y_idx, method="nearest").to_numpy()
         points[name] = vals
         if name == "DTM":
             points["Delta_z"] = points["z"] - vals
-    return points, issues
+    return points
 
 
 # ==================================================================================
@@ -517,19 +591,18 @@ def _row_count(outfile: pathlib.Path, file_type: str) -> Optional[int]:
     Parameters
     ----------
     outfile : pathlib.Path
-        The output table path.
+        The output dataset directory (parquet) or file path (csv).
     file_type : str
         ``"parquet"`` or ``"csv"``.
 
     Returns
     -------
     int or None
-        Row count, or None when the file cannot be read.
+        Row count, or None when the output cannot be read.
     """
+    if file_type == "parquet":
+        return pex.dataset_row_count(outfile)
     try:
-        if file_type == "parquet":
-            import pyarrow.parquet as pq
-            return pq.read_metadata(outfile).num_rows
         return len(pd.read_csv(outfile, usecols=[0]))
     except (OSError, ValueError):
         return None
