@@ -19,7 +19,16 @@ duckdb) reads the directory as one table. The sidecar is written last
 and doubles as the completion marker: extraction is cached via
 ``outputs_up_to_date`` on the sidecar (inputs = point cloud, DSM/DTM,
 plot file). Use ``--force`` to override. ``--type csv`` writes a single
-flat file instead (debugging escape hatch).
+flat file instead (debugging escape hatch; no plot metrics).
+
+A per-plot canopy-height metrics table is then derived from the saved
+point dataset (never a second point-cloud read):
+``PlotLevel/PE_LIDAR_plot_metrics[…].parquet`` — one row per plot with
+the shared DS03 statistic set (count/mean/std/var/min/max/median/skew/
+kurtosis/normality/p01-p99 short percentiles) of ``Delta_z`` plus run
+metadata. ``--full-percentiles`` additionally writes the full 0-100
+percentile profile per plot to
+``PlotLevel/PE_LIDAR_plot_percentiles[…].parquet``.
 
 Command-line Arguments
 ----------------------
@@ -31,6 +40,9 @@ Command-line Arguments
 --join-trial-info : flag
     Join ``Documentation/Trial_Info/{YYYYSiteName}_trial_info.csv`` onto
     the plots via ``plot_id`` before extraction.
+--full-percentiles : flag
+    Also write the full 0-100 percentile profile of ``Delta_z`` per plot
+    to its own long-format parquet table.
 --force : flag
     Re-create output files even when they are up to date.
 """
@@ -39,7 +51,7 @@ Command-line Arguments
 
 __title__ = "LIDAR plot extraction"
 __author__ = "Arden Burrell & Richard Harwood"
-__version__ = "v2.1(17.08.2026)"
+__version__ = "v2.2(19.08.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -56,6 +68,7 @@ import git
 from git import exc as git_exc
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import laspy
 import rioxarray
 import xarray as xr
@@ -259,6 +272,7 @@ def locate_lidar_runs(
         if args.plot_variant:
             stem_parts.append(args.plot_variant)
         stem = "_".join(stem_parts)
+        suffix = ("_" + "_".join(stem_parts[1:])) if stem_parts[1:] else ""
         dirs = pex.plotextract_dirs(run_dir / "T1_proc")
         # parquet -> dataset directory of chunk parts; csv -> single flat file
         if args.type == "csv":
@@ -272,6 +286,8 @@ def locate_lidar_runs(
             "dtm": dtm,
             "outfile": outfile,
             "metadata_outfile": dirs["pixel"] / f"{stem}_metadata.yaml",
+            "metrics_file": dirs["plot"] / f"PE_LIDAR_plot_metrics{suffix}.parquet",
+            "percentiles_file": dirs["plot"] / f"PE_LIDAR_plot_percentiles{suffix}.parquet",
             "site_dir": site_dir,
             "gpro_nu": gpro_nu,
             "issues": issues,
@@ -298,7 +314,9 @@ def process_lidar(
     Skips the extraction when the provenance sidecar (written last, so
     it marks completion) is newer than all of the inputs (point cloud,
     DSM/DTM rasters, plot file) and the output exists, unless
-    ``--force`` is set.
+    ``--force`` is set. The per-plot ``Delta_z`` metrics table is then
+    derived from the saved dataset (parquet only) and refreshed
+    independently when stale.
 
     Parameters
     ----------
@@ -310,7 +328,8 @@ def process_lidar(
     cfg : PEConfig
         Tunable settings (chunk size).
     args : argparse.Namespace
-        Parsed command-line arguments (``force``, ``type``).
+        Parsed command-line arguments (``force``, ``type``,
+        ``full_percentiles``).
     repo : git.Repo or None
         Repository handle for the provenance sidecar.
 
@@ -327,7 +346,12 @@ def process_lidar(
     if (not args.force and have_out
             and cf.outputs_up_to_date([job["metadata_outfile"]], inputs)):
         n = _row_count(job["outfile"], args.type)
-        return _summary_row(job, "cached", None, n_points=n)
+        if args.type == "csv" or _plot_metrics_fresh(job, args):
+            return _summary_row(job, "cached", None, n_points=n)
+        # +++++ Raw dataset cached but the metrics table is stale +++++
+        metric_issues = write_plot_metrics(job, plotshp, args)
+        return _summary_row(job, "metrics_refreshed",
+                            "; ".join(metric_issues) or None, n_points=n)
 
     tqdm.write(f"Processing {job['las'].name} started at {pd.Timestamp.now()}.")
 
@@ -357,9 +381,111 @@ def process_lidar(
         script_path=__file__, repo=repo)
     cf.write_metadata_yaml(meta, job["metadata_outfile"])
 
+    # ========== Per-plot Delta_z metrics from the saved dataset ==========
+    if args.type == "parquet":
+        issues += write_plot_metrics(job, plotshp, args)
+
     status = "extracted" if not issues else "extracted_with_issues"
     return _summary_row(job, status, "; ".join(issues) or None,
                         n_points=n_points, n_plots=n_plots)
+
+
+# ==================================================================================
+def _plot_metrics_fresh(job: Dict[str, Any], args: argparse.Namespace) -> bool:
+    """Check whether the plot-metrics outputs are newer than the dataset.
+
+    Parameters
+    ----------
+    job : dict
+        Job dict from :func:`locate_lidar_runs`.
+    args : argparse.Namespace
+        Parsed command-line arguments (``full_percentiles``).
+
+    Returns
+    -------
+    bool
+        True when the metrics table (and, with ``--full-percentiles``,
+        the percentile table) is newer than the dataset sidecar.
+    """
+    fresh = (job["metrics_file"].is_file()
+             and cf.outputs_up_to_date([job["metrics_file"]],
+                                       [job["metadata_outfile"]]))
+    if args.full_percentiles:
+        fresh = (fresh and job["percentiles_file"].is_file()
+                 and cf.outputs_up_to_date([job["percentiles_file"]],
+                                           [job["metadata_outfile"]]))
+    return fresh
+
+
+# ==================================================================================
+def write_plot_metrics(
+        job: Dict[str, Any],
+        plotshp: gpd.GeoDataFrame,
+        args: argparse.Namespace,
+    ) -> List[str]:
+    """Derive and save the per-plot ``Delta_z`` metrics table(s).
+
+    Loads only the ``plot_id``/``Delta_z`` columns of the saved point
+    dataset (plots span scan-chunk parts, so a per-part pass cannot
+    aggregate per plot) and computes the shared DS03 statistic set per
+    plot, plus the full 0-100 percentile profile when
+    ``--full-percentiles`` is set. Run metadata and any trial-info
+    columns on *plotshp* are attached to the metrics table.
+
+    Parameters
+    ----------
+    job : dict
+        Job dict from :func:`locate_lidar_runs`.
+    plotshp : geopandas.GeoDataFrame
+        Validated plot polygons (plus trial-info columns when joined).
+    args : argparse.Namespace
+        Parsed command-line arguments (``full_percentiles``).
+
+    Returns
+    -------
+    list of str
+        Issues encountered (missing ``Delta_z`` column, no finite
+        heights); empty on success.
+    """
+    parts = pex.dataset_parts(job["outfile"])
+    if "Delta_z" not in pq.read_schema(parts[0]).names:
+        return ["Point dataset has no Delta_z column (DTM missing); "
+                "plot metrics skipped."]
+    print(f"Computing plot metrics from {job['outfile'].name} ...")
+    pdf = pd.read_parquet(job["outfile"], columns=["plot_id", "Delta_z"])
+    pdf = pdf[np.isfinite(pdf["Delta_z"])]
+    if pdf.empty:
+        return ["No finite Delta_z values in the point dataset; "
+                "plot metrics skipped."]
+
+    metrics = pex.group_value_stats(pdf, ["plot_id"], value_col="Delta_z")
+    # variable column keeps the schema stable for future height definitions
+    metrics.insert(1, "variable", "Delta_z")
+    for key in ["node", "project", "site", "sensor", "date", "run"]:
+        metrics[key] = job[key]
+    if job["gpro_nu"] is not None:
+        metrics["gpro_nu"] = job["gpro_nu"]
+    trial_cols = [c for c in plotshp.columns
+                  if c not in ("geometry",) and c != "plot_id"]
+    if trial_cols:
+        metrics = metrics.merge(
+            pd.DataFrame(plotshp[["plot_id"] + trial_cols]),
+            on="plot_id", how="left")
+    job["metrics_file"].parent.mkdir(parents=True, exist_ok=True)
+    metrics.to_parquet(job["metrics_file"], index=False, compression="zstd")
+
+    # +++++ Full percentile profile (own table; joined via plot_id) +++++
+    if args.full_percentiles:
+        pctl = pex.group_value_percentiles(pdf, ["plot_id"],
+                                           value_col="Delta_z")
+        pctl.insert(1, "variable", "Delta_z")
+        for key in ["node", "project", "site", "sensor", "date", "run"]:
+            pctl[key] = job[key]
+        if job["gpro_nu"] is not None:
+            pctl["gpro_nu"] = job["gpro_nu"]
+        pctl.to_parquet(job["percentiles_file"], index=False,
+                        compression="zstd")
+    return []
 
 
 # ==================================================================================
@@ -715,6 +841,7 @@ if __name__ == '__main__':
     parser.add_argument("--path", type=str, default=None, help="The folder to crawl for LiDAR products. By default it will search from the root dir of the git repo.")
     parser.add_argument("--plot-variant", type=str, default=None, help="Select a plot-file variant ({YYYYSiteName}_plots_{variant}[_vNN].geojson) instead of the mandatory main plot file. See the Plot_Layout spec (wiki Key-Files).")
     parser.add_argument("--join-trial-info", default=False, action="store_true", help="Join Documentation/Trial_Info/{YYYYSiteName}_trial_info.csv onto the plots via plot_id; the trial columns are carried into the output tables.")
+    parser.add_argument("--full-percentiles", default=False, action="store_true", help="Also write the full 0-100 percentile profile of Delta_z per plot to PlotLevel/PE_LIDAR_plot_percentiles[...].parquet (long format; joined via plot_id).")
     parser.add_argument("-f", "--force", default=False, action="store_true", help="Force the re-creation of output files even if they are up to date. Default is to skip files that are newer than their inputs.")
     parser.add_argument("--type", type=str, default="parquet", choices=["parquet", "csv"], help="Output table format. Default parquet.")
     parser.add_argument("--exclude-dir", type=str, nargs="+", default=[], help="One or more directory names to exclude from the crawl. e.g. --exclude-dir 2025_TestData")

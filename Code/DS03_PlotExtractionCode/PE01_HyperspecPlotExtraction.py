@@ -23,8 +23,12 @@ Per run and EM region the outputs land in
   cached on it and an interrupted run resumes at the first missing or
   stale plot instead of restarting.
 - ``PlotLevel/PE_{VNIR|SWIR}_plot_metrics[...].parquet`` — per plot x
-  band metrics (mean/median/std/count/valid_fraction + wavelength) plus
-  the run metadata columns.
+  band metrics (count/mean/std/var/min/max/median/skew/kurtosis/
+  normality_k2/normality_p/p01-p99 short percentiles/valid_fraction +
+  wavelength) plus the run metadata columns.
+- ``PlotLevel/PE_{VNIR|SWIR}_plot_percentiles[...].parquet`` — only
+  with ``--full-percentiles``: long-format full 0-100 percentile
+  profile per plot x band.
 - ``Reports/`` — a markdown overview report with embedded QC figures
   (``PE_extraction_report[...].md`` + ``PE_figures/``).
 
@@ -46,6 +50,9 @@ Command-line Arguments
 --raw-only / --metrics-only : flags
     Produce only the raw pixel table, or only the metrics table (from an
     existing raw table).
+--full-percentiles : flag
+    Also write the full 0-100 percentile profile per plot x band to its
+    own long-format parquet table.
 --read-strategy : {plot, block}
     One GDAL window per plot (default) or per block of adjacent plots.
     Benchmarked 2026-08-13 on the 16 GB GOBI test ortho (600 plots,
@@ -60,7 +67,7 @@ Command-line Arguments
 
 __title__ = "Hyperspectral plot extraction"
 __author__ = "Arden Burrell"
-__version__ = "v1.1(17.08.2026)"
+__version__ = "v1.2(19.08.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -316,6 +323,7 @@ def locate_ortho_runs(
             "gpro_nu": gpro_nu,
             "raw_file": raw_file,
             "metrics_file": dirs["plot"] / f"PE_{region}_plot_metrics{suffix}.parquet",
+            "percentiles_file": dirs["plot"] / f"PE_{region}_plot_percentiles{suffix}.parquet",
             "metadata_outfile": dirs["pixel"] / f"PE_{region}_pixels{suffix}_metadata.yaml",
         })
     return list(runs.values())
@@ -350,7 +358,8 @@ def process_ortho(
         Tunable settings.
     args : argparse.Namespace
         Parsed command-line arguments (``force``, ``raw_only``,
-        ``metrics_only``, ``read_strategy``, ``block_size``, ``keep_xy``).
+        ``metrics_only``, ``full_percentiles``, ``read_strategy``,
+        ``block_size``, ``keep_xy``).
     repo : git.Repo or None
         Repository handle for the provenance sidecar.
 
@@ -370,6 +379,10 @@ def process_ortho(
     metrics_fresh = (job["metrics_file"].is_file()
                      and cf.outputs_up_to_date([job["metrics_file"]],
                                                [job["metadata_outfile"]]))
+    if args.full_percentiles:
+        metrics_fresh = (metrics_fresh and job["percentiles_file"].is_file()
+                         and cf.outputs_up_to_date([job["percentiles_file"]],
+                                                   [job["metadata_outfile"]]))
 
     # ========== Raw extraction (per-plot parts; resumes at stale plots) ==========
     extract_stats: Optional[Dict[str, Any]] = None
@@ -416,7 +429,8 @@ def process_ortho(
                 stats)
 
     wavelengths = _sidecar_wavelengths(job["metadata_outfile"])
-    metrics = compute_plot_metrics(job["raw_file"], wavelengths)
+    metrics, percentiles = compute_plot_metrics(
+        job["raw_file"], wavelengths, full_percentiles=args.full_percentiles)
     # +++++ Attach run metadata (+ optional trial-info columns) +++++
     for key in ["node", "project", "site", "sensor", "date", "run"]:
         metrics[key] = run[key]
@@ -431,6 +445,16 @@ def process_ortho(
             on="plot_id", how="left")
     job["metrics_file"].parent.mkdir(parents=True, exist_ok=True)
     metrics.to_parquet(job["metrics_file"], index=False, compression="zstd")
+
+    # +++++ Full percentile profile (own table; joined via plot_id) +++++
+    if percentiles is not None:
+        for key in ["node", "project", "site", "sensor", "date", "run"]:
+            percentiles[key] = run[key]
+        percentiles["EM_Region"] = job["region"]
+        if job["gpro_nu"] is not None:
+            percentiles["gpro_nu"] = job["gpro_nu"]
+        percentiles.to_parquet(job["percentiles_file"], index=False,
+                               compression="zstd")
 
     stats = _stats_from_metrics(job, metrics)
     if extract_stats is not None:
@@ -684,7 +708,8 @@ def _clip_plot(
 def compute_plot_metrics(
         dataset_dir: pathlib.Path,
         wavelengths: Dict[int, float],
-    ) -> pd.DataFrame:
+        full_percentiles: bool = False,
+    ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
     """Compute per plot x band metrics from a saved raw pixel dataset.
 
     Reads one per-plot part file at a time, so the 16 GB ortho is never
@@ -698,33 +723,46 @@ def compute_plot_metrics(
     wavelengths : dict of int to float
         Band index to wavelength (nm) mapping (from the dataset
         sidecar).
+    full_percentiles : bool, optional
+        Also build the full 0-100 percentile profile per plot x band.
+        Default False.
 
     Returns
     -------
     pandas.DataFrame
         One row per plot x band: ``plot_id``, ``band``, ``wavelength``,
-        ``mean``, ``median``, ``std``, ``count``, ``valid_fraction``
-        (band count over the plot's best-covered band).
+        the :func:`pex.group_value_stats` metric set (count/mean/std/
+        var/min/max/median/skew/kurtosis/normality/p01-p99) and
+        ``valid_fraction`` (band count over the plot's best-covered
+        band).
+    pandas.DataFrame or None
+        Long-format full percentile table (``plot_id``, ``band``,
+        ``wavelength``, ``percentile``, ``value``); None unless
+        *full_percentiles*.
     """
     print(f"Computing plot metrics from {dataset_dir.name} ...")
     out: List[pd.DataFrame] = []
+    pctl_out: List[pd.DataFrame] = []
     for part in tqdm(pex.dataset_parts(dataset_dir),
                      desc="plot metrics", leave=False):
         pdf = pd.read_parquet(part, columns=["plot_id", "band", "value"])
         if pdf.empty:
             continue
-        g = pdf.groupby("band", sort=True, observed=True).agg(
-            mean=("value", "mean"),
-            median=("value", "median"),
-            std=("value", "std"),
-            count=("value", "size"),
-        ).reset_index()
+        g = pex.group_value_stats(pdf, ["band"])
         g.insert(1, "wavelength", g["band"].map(wavelengths).astype(np.float32))
         g["valid_fraction"] = g["count"] / g["count"].max()
         # Keep the source dtype: plot files may use int or str plot ids.
         g.insert(0, "plot_id", pdf["plot_id"].iloc[0])
         out.append(g)
-    return pd.concat(out, ignore_index=True)
+        if full_percentiles:
+            pctl = pex.group_value_percentiles(pdf, ["band"])
+            pctl.insert(1, "wavelength",
+                        pctl["band"].map(wavelengths).astype(np.float32))
+            pctl.insert(0, "plot_id", pdf["plot_id"].iloc[0])
+            pctl_out.append(pctl)
+    percentiles = (pd.concat(pctl_out, ignore_index=True)
+                   if full_percentiles else None)
+    return pd.concat(out, ignore_index=True), percentiles
 
 
 # ==================================================================================
@@ -1054,6 +1092,7 @@ if __name__ == '__main__':
     parser.add_argument("-f", "--force", default=False, action="store_true", help="Force re-extraction from the ortho even when outputs are up to date.")
     parser.add_argument("--raw-only", default=False, action="store_true", help="Only produce the raw per-pixel tables (skip metrics + report).")
     parser.add_argument("--metrics-only", default=False, action="store_true", help="Only (re)compute the per-plot metrics tables and report from existing raw tables; the ortho is never opened.")
+    parser.add_argument("--full-percentiles", default=False, action="store_true", help="Also write the full 0-100 percentile profile per plot x band to PlotLevel/PE_{REGION}_plot_percentiles[...].parquet (long format; joined via plot_id).")
     parser.add_argument("--read-strategy", type=str, default="plot", choices=["plot", "block"], help="One GDAL window per plot (default; benchmarked 369 s vs 631 s for block on the 16 GB GOBI test ortho) or one window per block of adjacent plots.")
     parser.add_argument("--block-size", type=int, default=24, help="Plots per read block for the block strategy. Default 24.")
     parser.add_argument("--keep-xy", default=False, action="store_true", help="Retain the per-pixel x and y coordinate columns (raster CRS) in the raw tables. By default these are dropped.")

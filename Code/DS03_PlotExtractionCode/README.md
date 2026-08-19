@@ -20,9 +20,9 @@ ML-model-derived products), split into three sub-folders:
 
 | Script | Input | Output |
 |--------|-------|--------|
-| `PE00_LIDAR_extraction.py` | `*_LiDAR_CombinedPointCloud.las/.laz` + DSM/DTM | `PixelLevel/PE_LIDAR_points[…]/` dataset + metadata YAML |
-| `PE01_HyperspecPlotExtraction.py` | `*_{VNIR\|SWIR}_Orthomosaic.bin` (GOBI: VNIR, CALVIS: VNIR+SWIR) | `PixelLevel/PE_{REGION}_pixels[…]/` dataset, `PlotLevel/PE_{REGION}_plot_metrics[…].parquet`, `Reports/PE_extraction_report[…].md` + `PE_figures/` |
-| `PE02_IndexPlotExtraction.py` | DS05/SI00 index maps (`SpectralIndices/SI_*_report.json` manifests + NetCDF/GeoTIFF) | `PixelLevel/PE_INDEX_{REGION}_{METHOD}_pixels[…]/` dataset, `PlotLevel/PE_INDEX_{REGION}_{METHOD}_plot_metrics[…].parquet`, `Reports/PE_INDEX_{REGION}_{METHOD}_report[…].md` + `PE_figures/` |
+| `PE00_LIDAR_extraction.py` | `*_LiDAR_CombinedPointCloud.las/.laz` + DSM/DTM | `PixelLevel/PE_LIDAR_points[…]/` dataset + metadata YAML, `PlotLevel/PE_LIDAR_plot_metrics[…].parquet` (+ `PE_LIDAR_plot_percentiles[…].parquet` with `--full-percentiles`) |
+| `PE01_HyperspecPlotExtraction.py` | `*_{VNIR\|SWIR}_Orthomosaic.bin` (GOBI: VNIR, CALVIS: VNIR+SWIR) | `PixelLevel/PE_{REGION}_pixels[…]/` dataset, `PlotLevel/PE_{REGION}_plot_metrics[…].parquet` (+ `…_plot_percentiles[…].parquet` with `--full-percentiles`), `Reports/PE_extraction_report[…].md` + `PE_figures/` |
+| `PE02_IndexPlotExtraction.py` | DS05/SI00 index maps (`SpectralIndices/SI_*_report.json` manifests + NetCDF/GeoTIFF) | `PixelLevel/PE_INDEX_{REGION}_{METHOD}_pixels[…]/` dataset, `PlotLevel/PE_INDEX_{REGION}_{METHOD}_plot_metrics[…].parquet` (+ `…_plot_percentiles[…].parquet` with `--full-percentiles`), `Reports/PE_INDEX_{REGION}_{METHOD}_report[…].md` + `PE_figures/` |
 
 `[…]` = optional `_gproN` (only with `--allow-multi-gpro`) and
 `_{variant}` (only with `--plot-variant`) suffixes.
@@ -66,6 +66,23 @@ wavelength (nm) table lives in the dataset's `*_metadata.yaml` sidecar
   (`cf.build_run_metadata`: user, host, git state, inputs, counts).
 - **Summary** — both scripts end with a REPORTED/SKIPPED table and
   `main()` returns it as a DataFrame.
+- **Plot metrics** — all three scripts share the DS03 statistic set
+  (`Code/functions/plot_extracts.group_value_stats`), computed per plot
+  × group from the saved pixel/point dataset: `count`, `mean`, `std`,
+  `var`, `min`, `max`, `median`, `skew`, `kurtosis` (bias-corrected,
+  pandas-compatible; Fisher excess), `l_cv`/`l_skew`/`l_kurt`
+  (L-moment ratios τ/τ3/τ4 — robust, bounded distribution-shape
+  fingerprint; strong bimodality such as half-soil/half-canopy plots or
+  lodged crops shows up as low `l_kurt`), `normality_k2`/`normality_p`
+  (D'Agostino-Pearson; NaN below n=20 — with thousands of pixels the
+  p-value rejects for trivial deviations, so prefer the statistic and
+  skew/kurtosis as effect sizes) and the short percentiles
+  `p01/p05/p10/p25/p50/p75/p90/p95/p99` (one `np.quantile` sort per
+  group). `--full-percentiles` additionally writes a long-format
+  `*_plot_percentiles[…].parquet` table (101 rows per group,
+  percentile 0–100 where 0 = min and 100 = max; join via `plot_id`) —
+  near-free to compute, kept separate so the main table stays wide-
+  readable.
 
 ## PE00 — LiDAR point extraction
 
@@ -77,7 +94,11 @@ nearest-neighbour on the lazily opened rasters) and canopy height is
 computed as `Delta_z = z - DTM`. Each chunk streams straight to its own
 part file in the `PE_LIDAR_points[…]/` dataset, so peak memory is one
 chunk regardless of point-cloud size (`--type csv` writes a single flat
-file instead).
+file instead; no plot metrics). A per-plot canopy-height metrics table
+(`PlotLevel/PE_LIDAR_plot_metrics[…].parquet`, shared statistic set of
+`Delta_z` + a `variable` column for future height definitions) is then
+derived from the saved dataset — the point cloud is never re-read — and
+refreshed independently when stale (`status=metrics_refreshed`).
 
 ```bash
 python Code/DS03_PlotExtractionCode/PE00_LIDAR_extraction.py --path <Node>/<Project>
@@ -97,12 +118,13 @@ Two tables per run × EM region are produced by default:
   Wavelengths come from the per-band GDAL `wavelength` tags and are
   recorded once in the sidecar (`data.wavelengths_nm`); values are
   cast back to the on-disk dtype after nodata removal.
-- **Plot metrics** — per plot × band `mean/median/std/count/
-  valid_fraction` + `wavelength` plus run metadata (and trial-info
-  columns when joined). Metrics are always derived **from the saved
-  raw dataset** (one plot-part at a time), never a second ortho read,
-  unless `--force`; `--metrics-only` refreshes metrics/report without
-  opening the ortho at all. `--raw-only` skips metrics + report.
+- **Plot metrics** — per plot × band: the shared statistic set (see
+  *Shared behaviour*) + `wavelength` + `valid_fraction` plus run
+  metadata (and trial-info columns when joined). Metrics are always
+  derived **from the saved raw dataset** (one plot-part at a time),
+  never a second ortho read, unless `--force`; `--metrics-only`
+  refreshes metrics/report without opening the ortho at all.
+  `--raw-only` skips metrics + report.
 
 A markdown overview report (`Reports/PE_extraction_report[…].md`) with
 the extraction statistics and embedded QC figures (plot-footprint

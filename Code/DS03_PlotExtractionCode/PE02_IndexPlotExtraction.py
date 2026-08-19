@@ -18,8 +18,12 @@ Per manifest the outputs land in ``<run>/T1_proc/PlotExtracts/``:
   missing/stale plot.
 - ``PlotLevel/PE_INDEX_{REGION}_{METHOD}_plot_metrics[…].parquet`` —
   long-format trait table (one row per plot x index:
-  mean/median/std/count/valid_fraction plus run metadata), derived
+  count/mean/std/var/min/max/median/skew/kurtosis/normality/p01-p99
+  short percentiles/valid_fraction plus run metadata), derived
   from the saved pixel dataset, with its own YAML sidecar.
+- ``PlotLevel/PE_INDEX_{REGION}_{METHOD}_plot_percentiles[…].parquet``
+  — only with ``--full-percentiles``: long-format full 0-100
+  percentile profile per plot x index.
 - ``Reports/`` — a markdown overview report with embedded QC figures.
 
 PE02 never opens the ``.bin`` orthomosaics — the raster boundary is
@@ -45,6 +49,9 @@ Command-line Arguments
     Restrict extraction to these indices (default: all in the manifest).
     Changing the restriction does not invalidate existing per-plot
     parts — combine with ``--force``.
+--full-percentiles : flag
+    Also write the full 0-100 percentile profile per plot x index to
+    its own long-format parquet table.
 --force : flag
     Re-create output files even when they are up to date.
 """
@@ -53,7 +60,7 @@ Command-line Arguments
 
 __title__ = "Spectral-index plot extraction"
 __author__ = "Arden Burrell"
-__version__ = "v1.1(17.08.2026)"
+__version__ = "v1.2(19.08.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -272,6 +279,7 @@ def locate_si_manifests(
             "extracts_dir": dirs["extracts"],
             "figures_dir": dirs["reports"] / cfg.figures_dirname,
             "outfile": outfile,
+            "percentiles_file": dirs["plot"] / f"{stem}_plot_percentiles.parquet",
             "metadata_outfile": outfile.with_name(f"{outfile.stem}_metadata.yaml"),
             # pixel_dataset is a parquet dataset *directory* (one part per plot)
             "pixel_dataset": dirs["pixel"] / f"{stem}_pixels",
@@ -313,7 +321,7 @@ def process_manifest(
         Tunable settings.
     args : argparse.Namespace
         Parsed command-line arguments (``force``, ``indices``,
-        ``skipplot``).
+        ``full_percentiles``, ``skipplot``).
     repo : git.Repo or None
         Repository handle for the provenance sidecar.
 
@@ -331,6 +339,10 @@ def process_manifest(
              and job["outfile"].is_file()
              and cf.outputs_up_to_date([job["outfile"]],
                                        [job["pixel_metadata_outfile"]]))
+    if args.full_percentiles:
+        fresh = (fresh and job["percentiles_file"].is_file()
+                 and cf.outputs_up_to_date([job["percentiles_file"]],
+                                           [job["pixel_metadata_outfile"]]))
     if fresh:
         metrics = pd.read_parquet(job["outfile"])
         return _summary_row(job, "cached", None,
@@ -362,7 +374,8 @@ def process_manifest(
     cf.write_metadata_yaml(pixel_meta, job["pixel_metadata_outfile"])
 
     # ========== Metrics from the saved pixel dataset ==========
-    metrics = compute_index_metrics(job["pixel_dataset"])
+    metrics, percentiles = compute_index_metrics(
+        job["pixel_dataset"], full_percentiles=args.full_percentiles)
 
     # ========== Attach run metadata (+ optional trial-info columns) ==========
     for key in ["node", "project", "site", "sensor", "date", "run"]:
@@ -380,6 +393,17 @@ def process_manifest(
     # ========== Save the table + provenance sidecar ==========
     job["outfile"].parent.mkdir(parents=True, exist_ok=True)
     metrics.to_parquet(job["outfile"], index=False, compression="zstd")
+
+    # +++++ Full percentile profile (own table; joined via plot_id) +++++
+    if percentiles is not None:
+        for key in ["node", "project", "site", "sensor", "date", "run"]:
+            percentiles[key] = job[key]
+        percentiles["EM_Region"] = job["region"]
+        percentiles["method"] = job["method"]
+        if job["gpro_nu"] is not None:
+            percentiles["gpro_nu"] = job["gpro_nu"]
+        percentiles.to_parquet(job["percentiles_file"], index=False,
+                               compression="zstd")
     meta = cf.build_run_metadata(
         {**{k: job[k] for k in ["manifest", "index_maps", "region", "method",
                                 "gpro_nu", "outfile",
@@ -577,7 +601,10 @@ def _plot_window_pixels(
 
 
 # ==================================================================================
-def compute_index_metrics(dataset_dir: pathlib.Path) -> pd.DataFrame:
+def compute_index_metrics(
+        dataset_dir: pathlib.Path,
+        full_percentiles: bool = False,
+    ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
     """Compute per plot x index metrics from a saved pixel dataset.
 
     Reads one per-plot part file at a time, so memory stays at one
@@ -587,35 +614,45 @@ def compute_index_metrics(dataset_dir: pathlib.Path) -> pd.DataFrame:
     ----------
     dataset_dir : pathlib.Path
         The pixel dataset directory from :func:`extract_index_pixels`.
+    full_percentiles : bool, optional
+        Also build the full 0-100 percentile profile per plot x index.
+        Default False.
 
     Returns
     -------
     pandas.DataFrame
-        One row per plot x index: ``plot_id``, ``index``, ``mean``,
-        ``median``, ``std``, ``count``, ``valid_fraction`` (valid pixels
-        over the plot's best-covered index — PE01 semantics, so plot
-        geometry does not deflate the fraction).
+        One row per plot x index: ``plot_id``, ``index``, the
+        :func:`pex.group_value_stats` metric set (count/mean/std/var/
+        min/max/median/skew/kurtosis/normality/p01-p99) and
+        ``valid_fraction`` (valid pixels over the plot's best-covered
+        index — PE01 semantics, so plot geometry does not deflate the
+        fraction).
+    pandas.DataFrame or None
+        Long-format full percentile table (``plot_id``, ``index``,
+        ``percentile``, ``value``); None unless *full_percentiles*.
     """
     print(f"Computing index metrics from {dataset_dir.name} ...")
     out: List[pd.DataFrame] = []
+    pctl_out: List[pd.DataFrame] = []
     for part in tqdm(pex.dataset_parts(dataset_dir),
                      desc="index metrics", leave=False):
         pdf = pd.read_parquet(part)
         if pdf.empty:
             continue
-        g = pdf.groupby("index", sort=True, observed=True).agg(
-            mean=("value", "mean"),
-            median=("value", "median"),
-            std=("value", "std"),
-            count=("value", "size"),
-        ).reset_index()
+        g = pex.group_value_stats(pdf, ["index"])
         g["index"] = g["index"].astype(str)
-        g["std"] = g["std"].fillna(0.0)  # single-pixel plots: match ddof=1 -> 0.0
         g["valid_fraction"] = g["count"] / g["count"].max()
         # Keep the source dtype: plot files may use int or str plot ids.
         g.insert(0, "plot_id", pdf["plot_id"].iloc[0])
         out.append(g)
-    return pd.concat(out, ignore_index=True)
+        if full_percentiles:
+            pctl = pex.group_value_percentiles(pdf, ["index"])
+            pctl["index"] = pctl["index"].astype(str)
+            pctl.insert(0, "plot_id", pdf["plot_id"].iloc[0])
+            pctl_out.append(pctl)
+    percentiles = (pd.concat(pctl_out, ignore_index=True)
+                   if full_percentiles else None)
+    return pd.concat(out, ignore_index=True), percentiles
 
 
 # ==================================================================================
@@ -881,6 +918,7 @@ if __name__ == '__main__':
     parser.add_argument("--plot-variant", type=str, default=None, help="Select a plot-file variant ({YYYYSiteName}_plots_{variant}[_vNN].geojson) instead of the mandatory main plot file. See the Plot_Layout spec (wiki Key-Files).")
     parser.add_argument("--join-trial-info", default=False, action="store_true", help="Join Documentation/Trial_Info/{YYYYSiteName}_trial_info.csv onto the plots via plot_id; the trial columns are carried into the trait tables.")
     parser.add_argument("--indices", type=str, nargs="+", default=None, help="Restrict extraction to these indices (e.g. --indices NDVI NDREI). Default: all indices in each manifest. Changing the restriction does not invalidate existing per-plot parts - combine with --force.")
+    parser.add_argument("--full-percentiles", default=False, action="store_true", help="Also write the full 0-100 percentile profile per plot x index to PlotLevel/PE_INDEX_{REGION}_{METHOD}_plot_percentiles[...].parquet (long format; joined via plot_id).")
     parser.add_argument("-f", "--force", default=False, action="store_true", help="Force the re-creation of output files even if they are up to date. Default is to skip files that are newer than their inputs.")
     parser.add_argument("-s", "--skipplot", default=False, action="store_true", help="Skip the report figure generation (the markdown report is still written, without embeds).")
     parser.add_argument("--exclude-dir", type=str, nargs="+", default=[], help="One or more directory names to exclude from the crawl. e.g. --exclude-dir 2025_TestData")
