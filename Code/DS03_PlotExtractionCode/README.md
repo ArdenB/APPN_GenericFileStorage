@@ -3,7 +3,7 @@
 Scripts that extract per-plot values from processed (Tier 1) sensor
 products using the site's **Plot_Layout** vector files
 (`Documentation/Plot_Layout/{YYYYSiteName}_plots.geojson` — see the
-[Key-Files wiki page](https://github.com/ArdenB/APPN_GenricFileStorage/wiki/Key-Files)).
+[Key-Files wiki page](https://github.com/ArdenB/APPN_GenericFileStorage/wiki/Key-Files)).
 All outputs are **Tier 1** products written to
 `<run>/T1_proc/PlotExtracts/` (`T2_traits/` is reserved for
 ML-model-derived products), split into three sub-folders:

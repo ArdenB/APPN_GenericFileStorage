@@ -86,7 +86,7 @@ python Code/OT00_OneTimeScripts/OT00_RenameTiertoT.py \
 **Why**: GOBI and CALVIS produce `*.graw` payload folders that
 sometimes land in `T1_proc` (the processed tier) when they should sit
 in `T0_raw`. This violates the
-[APPN folder structure](https://github.com/ArdenB/APPN_GenricFileStorage/wiki)
+[APPN folder structure](https://github.com/ArdenB/APPN_GenericFileStorage/wiki)
 and breaks downstream tools that expect raw payloads under `T0_raw`.
 
 **What it does**

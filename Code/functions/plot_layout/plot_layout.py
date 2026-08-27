@@ -11,7 +11,7 @@ Plot Delineation naming convention:
 ``{YYYYSiteName}`` is the site folder name without the trailing ``_F`` /
 ``_C`` suffix (e.g. site ``2025IAWatson_F`` -> ``2025IAWatson``).
 
-See https://github.com/ArdenB/APPN_GenricFileStorage/wiki/Key-Files
+See https://github.com/ArdenB/APPN_GenericFileStorage/wiki/Key-Files
 (Plot_Layout section) for the full specification.
 """
 

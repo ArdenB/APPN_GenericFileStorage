@@ -953,7 +953,9 @@ def Rowchecker(flog_fname, flrow, prow, ProjectInfo, historical, past_date=(pd.T
         """
         Internal function to make a standard error message
         """
-        raise ValueError(f"Problem in Field Log: {flog_fname}{nl}Issue in row:{nl}{flrow}{nl}{error_message}")
+        raise ValueError(
+            f"Problem found while checking the Field Log: {flog_fname}{nl}"
+            f"Offending row:{nl}{flrow}{nl}{nl}{error_message}")
 
     # ========== Do the Hashing of the data ==========
     hashes = pd.util.hash_pandas_object(flrow.drop("CheckSum"))
@@ -972,44 +974,75 @@ def Rowchecker(flog_fname, flrow, prow, ProjectInfo, historical, past_date=(pd.T
     # ========== Check all the dtypes rows ==========
     for vname in ["Year", "Month", "Day", "Runs"]:
         if not type(flrow[vname]) == int:
-            _ErrorMessage(f"dtype for {vname} must be int, current dytpe {type(flrow[vname])}", flog_fname, flrow)
+            _ErrorMessage(
+                f"'{vname}' must be a whole number, but this row has "
+                f"{flrow[vname]!r}. A blank or non-numeric cell is the usual "
+                f"cause - please put a plain integer in the '{vname}' column.",
+                flog_fname, flrow)
 
     for sname in ["Technician", "Sensor", "Site"]:
         if not type(flrow[sname]) == str:
-            _ErrorMessage(f"dtype for {sname} must be str, current dytpe {type(flrow[sname])}", flog_fname, flrow)
+            _ErrorMessage(
+                f"'{sname}' must be text, but this row has {flrow[sname]!r}. "
+                f"This usually means the '{sname}' cell was left blank - every "
+                f"row needs a value (e.g. Technician cannot be empty).",
+                flog_fname, flrow)
 
 
     # ========== Check the date of the row ==========
     try:
         date = pd.Timestamp(f"{flrow.Year}-{flrow.Month}-{flrow.Day}")
     except Exception as er:
-        _ErrorMessage(f"{str(er)}", flog_fname, flrow)
+        _ErrorMessage(
+            f"Could not build a valid date from Year={flrow.Year}, "
+            f"Month={flrow.Month}, Day={flrow.Day} ({er}). Please check the "
+            f"date columns of this row.",
+            flog_fname, flrow)
 
     # +++++ Check if the date is in the future or past +++++
     if not check is None:
         # Skip the datacheck in case of already complete data
         if date > (pd.Timestamp.now() + pd.Timedelta(hours=12)):
-            _ErrorMessage(f"Row Date: {date} is greater than system current time {pd.Timestamp.now()}. Future Dates Not allowed", flog_fname, flrow)
+            _ErrorMessage(
+                f"Row date {date:%Y-%m-%d} is in the future (current time "
+                f"{pd.Timestamp.now():%Y-%m-%d %H:%M}). Future dates are not "
+                f"allowed - please correct the Year/Month/Day columns.",
+                flog_fname, flrow)
         elif date < past_date:
             if not historical:
-                _ErrorMessage(f"Row Date: {date} is before than max historical date {past_date}. run 'python ProjectBuilder.py --historical' to allow past dates", flog_fname, flrow)
+                _ErrorMessage(
+                    f"Row date {date:%Y-%m-%d} is more than 14 days in the "
+                    f"past (cutoff {past_date:%Y-%m-%d}). If this is genuine "
+                    f"historical data, re-run with: "
+                    f"python ProjectBuilder.py --historical",
+                    flog_fname, flrow)
     
     # ========== Check if the sensor is valid ==========
-    if not flrow.Sensor in prow[prow == True].index:
+    valid_sensors = list(prow[prow == True].index)
+    if not flrow.Sensor in valid_sensors:
         _ErrorMessage(
-            f"Sensor: {flrow.Sensor} is not in the valid sensors for this project"
-            f"({prow[prow == True].index}). Edit Projects_Summary.csv to add sensors, "
-            f"or re-run with the --enable-sensors flag to automatically set "
-            f"{flrow.Sensor} to TRUE in the project summary CSV.",
+            f"Sensor '{flrow.Sensor}' is not enabled for this project. "
+            f"Currently enabled sensors: {valid_sensors}. To fix, either set "
+            f"{flrow.Sensor} to TRUE in the {{NodeName}}_ProjectsSummary.csv "
+            f"in the node folder, or re-run with --enable-sensors to do it "
+            f"automatically.",
             flog_fname, flrow,
         )
 
     # ========== Check the number of runs ==========
     if flrow.Runs < 1:
-        _ErrorMessage(f"The number of runs: {flrow.Runs} Must be greater than 0", flog_fname, flrow)
+        _ErrorMessage(
+            f"'Runs' is {flrow.Runs} but must be at least 1 (the number of "
+            f"runs/flights collected on this day).",
+            flog_fname, flrow)
     # ========== Check the site name and year ==========
-    if not flrow.Site in [site["name"] for site in  ProjectInfo["project"]["sites"]]:
-        _ErrorMessage(f"Site: {flrow.Site} is not in the valid sites for this project({ProjectInfo['project']['sites']}). Edit the ProjectSummary.yaml in the project folder to add sites", flog_fname, flrow)
+    valid_sites = [site["name"] for site in ProjectInfo["project"]["sites"]]
+    if not flrow.Site in valid_sites:
+        _ErrorMessage(
+            f"Site '{flrow.Site}' is not one of this project's sites "
+            f"({valid_sites}). Add the site to the ProjectSummary.yaml in the "
+            f"project folder, or fix the Site spelling in this row.",
+            flog_fname, flrow)
     else:
         # +++++ Check the site year matches row year +++++
         errorlog = "" # COntiner for error messages
@@ -1018,7 +1051,11 @@ def Rowchecker(flog_fname, flrow, prow, ProjectInfo, historical, past_date=(pd.T
 
             if site["name"] == flrow.Site:
                 if not site["year"] == flrow.Year:
-                    errorlog += f"Site: {flrow.Site} has year: {site['year']} but row has year: {flrow.Year}. Please edit the project yaml file to fix this"
+                    errorlog += (
+                        f"Site '{flrow.Site}' is registered with year "
+                        f"{site['year']} but this row has year {flrow.Year}. "
+                        f"Please fix the row, or update the site's year in "
+                        f"the ProjectSummary.yaml.")
                     continue
                 else:
                     outsite = site

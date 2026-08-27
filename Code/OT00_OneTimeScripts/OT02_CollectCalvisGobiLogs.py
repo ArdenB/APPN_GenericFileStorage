@@ -20,7 +20,7 @@ respective ``<original>.graw`` / ``<original>.gpro`` subfolder.
 A ``manifest.csv`` is written at the root of the output directory.
 In addition to identifying each collected folder, it records whether
 the source folder follows the APPN folder structure (see
-https://github.com/ArdenB/APPN_GenricFileStorage/wiki) using
+https://github.com/ArdenB/APPN_GenericFileStorage/wiki) using
 :func:`parse_APPN_dataset_path`. Columns:
 
 ``sensor, kind, group_label, group_number, label, source_path,
