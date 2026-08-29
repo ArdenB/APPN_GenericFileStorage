@@ -50,7 +50,7 @@ def main(args, repo):
 
         # ========== Check if there are any project ==========
         if df.empty:
-            break # Exit the loop as ther are no projects to make files for
+            continue # Skip this node as there are no projects to make files for
 
         # ========== Track whether the project summary CSV needs re-saving ==========
         pfilename = f"./{node['name']}/{node['name']}_ProjectsSummary.csv"
