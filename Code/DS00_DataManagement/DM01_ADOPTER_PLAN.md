@@ -1,11 +1,19 @@
 # DM01_StructureAdopter — plan
 
-Version: v1.1 (01.09.2026)
-Status: **implemented** (01.09.2026) — script + 25 tests landed; full
-suite 284 passing; CLI + `--apply` smoke-tested end-to-end on a
-synthetic tree. One post-plan refinement: non-project-shaped unknown
-folders at root grade **warn** (`unrecognised_root_folder`), not fail —
-only project-shaped strays block `--apply`.
+Version: v1.2 (01.09.2026)
+Status: **implemented + validated on a real store** (01.09.2026) —
+script + 25 tests landed; full suite 284 passing; end-to-end run on
+`/mnt/d/Tier3_ColdStorage` (18 projects): audit caught 6 genuine tree
+faults + two false-positive classes (fixed: NAS `@eaDir` noise ignored,
+doc/code folders at date level warn not fail), `--apply` merged
+append-only (WheatHeat metadata reconstructed from nothing, existing
+rows untouched), ProjectBuilder pass validated every checksum, adopted
+metadata committed to the Tier3-APPN-42-DataStorage repo. One post-plan
+refinement: non-project-shaped unknown folders at root grade **warn**
+(`unrecognised_root_folder`), not fail — only project-shaped strays
+block `--apply`. README "Adopting an Existing Data Store" documents the
+user workflow; `.gitignore` gained the master-repo depth-rule allowlist
+so wrapped data stores can never stage collected data.
 Home: `Code/DS00_DataManagement/DM01_StructureAdopter.py` (this repo — the
 generic repo is the product; users fork/template it, so the adopter is
 developed here, not synced down from the master).
