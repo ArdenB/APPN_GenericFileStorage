@@ -218,6 +218,98 @@ USYD_Narrabri/2026_WheatTrial_I_Smith/2026Narrabri_F/GOBI/20260827/
 The builder is safe to run again: it checks the existing structure and creates
 or updates only what is needed.
 
+## Adopting an Existing Data Store
+
+Use this workflow when you already have data organised in the APPN folder
+format (see `FolderStructureInfo.txt`) that was **not** built by
+`ProjectBuilder.py` — for example a hand-assembled archive or a copy
+received from another node. The repository is placed *around* the existing
+data, the tree is audited for naming compliance, and the ProjectBuilder
+metadata files are reconstructed so the store becomes a normal managed one.
+
+### 1. Create your repository from the template
+
+Open the [template repository](https://github.com/ArdenB/APPN_GenericFileStorage),
+select **Use this template** → **Create a new repository**, and choose the
+owner, name, and visibility for your store (private is fine). Do not add any
+files to it yet.
+
+### 2. Put the repository at the root of the data tree
+
+Run these inside the top-level folder of your existing data (the folder that
+contains — or will contain — your node folder):
+
+```bash
+cd /path/to/your/data/root
+git init -b main
+git remote add origin git@github.com:<owner>/<repository-name>.git
+git fetch origin
+git checkout main
+```
+
+If a file such as `NodeSummary.yaml` already exists in the data root,
+`git checkout` will refuse to overwrite it: move it aside first
+(`mv NodeSummary.yaml NodeSummary.local.yaml`), check out, then merge your
+local content back into the checked-out file.
+
+The repository `.gitignore` ignores everything except code and the
+ProjectBuilder-maintained metadata files, so the collected data itself can
+never be committed — `git status` should stay clean of data files.
+
+### 3. Configure the node and audit the tree
+
+Edit `NodeSummary.yaml` so the node `name` matches your existing node folder
+exactly and `SensorPlatforms` lists every sensor folder in use. Then run the
+audit (read-only):
+
+```bash
+python Code/DS00_DataManagement/DM01_StructureAdopter.py
+```
+
+This writes `{Node}/DM01_AdoptionReport.md` grading every folder against the
+naming convention:
+
+- **fail** — folders the metadata cannot be inferred from (bad project /
+  site / date / run names, sensors missing from `NodeSummary.yaml`). Rename
+  the folders (or fix `NodeSummary.yaml`) and re-run until no fails remain.
+- **warn** — non-blocking issues (missing tier folders, non-contiguous run
+  numbers, misplaced files). Review, fix what matters.
+- **info** — placeholders and disagreements to resolve later.
+
+The script exits nonzero while fail-class findings exist, so it can be used
+as a hand-over gate in scripts.
+
+### 4. Reconstruct the metadata and hand over to ProjectBuilder
+
+```bash
+python Code/DS00_DataManagement/DM01_StructureAdopter.py --apply
+```
+
+This prints the planned writes and asks for confirmation, then reconstructs
+the three ProjectBuilder input files from the tree: the node
+`{Node}_ProjectsSummary.csv`, each project's `ProjectSummary.yaml` (sites
+inverted from the folder names) and `FieldLog.csv` (one row per site /
+sensor / date, `Technician = Unknown`, checksums left blank). Existing
+metadata files are merged append-only — hand-entered rows are never
+modified. Then let ProjectBuilder create everything derived:
+
+```bash
+python ProjectBuilder.py --historical --enable-sensors --no-git
+```
+
+This fills the FieldLog checksums and creates `RunOverview.csv`,
+`FieldNotes.txt`, missing tier folders, and the site `Documentation/`
+templates. Finally, work through the TODO checklist at the bottom of
+`DM01_AdoptionReport.md` (real technician names, project/site metadata),
+review, and publish:
+
+```bash
+git status          # metadata files only -- no data
+git add -A
+git commit -m "Adopt existing data store"
+git push -u origin main
+```
+
 ## Git Behavior
 
 By default, `ProjectBuilder.py` pulls before making changes and commits and
@@ -238,6 +330,7 @@ git diff
 ## File Descriptions
 
 - **ProjectBuilder.py:** Main script for automating folder and metadata creation.
+- **Code/DS00_DataManagement/DM01_StructureAdopter.py:** Audits an existing APPN-format tree and reconstructs the ProjectBuilder metadata files so the tree can be adopted (see *Adopting an Existing Data Store*).
 - **NodeSummary.yaml:** YAML file listing nodes and their sensor platforms.
 - **{NodeName}_ProjectsSummary.csv:** CSV file summarizing projects and their associated sensors (auto-created in the node folder).
 - **ProjectSummary.yaml:** YAML file containing detailed project, researcher, and site information (auto-created in each project folder).

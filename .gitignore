@@ -1,59 +1,48 @@
-# VS Code
-.vscode/
+# ============================================================================
+# Data-store safety: this repo is designed to sit AT THE ROOT of a real data
+# tree (node folders full of sensor data live beside Code/). Ignore
+# everything by default and allowlist only code, docs and the
+# ProjectBuilder-maintained metadata files, so `git add -A` can never stage
+# collected data. Same pattern as the APPN-42 master repo.
+# ============================================================================
+*.*
 
-# Python
+# ---- repo plumbing ----
+!.gitignore
+!.gitattributes
+!.github/
+!.github/**
+
+# ---- code + docs (any depth) ----
+!*.py
+!*.sh
+!*.md
+
+# ---- repo-shipped reference + template files ----
+!Code/**
+!reference/**
+!/FolderStructureInfo.txt
+!/NodeSummary.yaml
+
+# ---- ProjectBuilder-maintained metadata (any depth) ----
+!*FieldLog.csv
+!*ProjectsSummary.csv
+!*RunOverview.csv
+!*ProjectSummary.yaml
+!*_Issues.yaml
+
+# ============================================================================
+# Ignores for extension-less / directory entries (*.* cannot catch these)
+# ============================================================================
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
+.vscode/
+.idea/
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual environments
 venv/
 env/
 ENV/
 .venv
-
-# Jupyter Notebook
 .ipynb_checkpoints
-
-# IDEs
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Project specific
 QC_Spectral_Tables/
-*.csv
-*.parquet
 
-# Keep CSVs created by ProjectBuilder.py
-!*_ProjectsSummary.csv
-!*_SyncSummary.csv
-!FieldLog.csv
-!RunOverview.csv
-
-# Logs
-*.log
-APPN_GenricFileStorage.code-workspace
-APPN_GenericFileStorage.code-workspace
