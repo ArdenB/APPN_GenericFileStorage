@@ -1,7 +1,7 @@
-"""Multi-run GCP accuracy comparison (QA03).
+"""Multi-run GCP accuracy comparison (QA00).
 
 Gathers the per-run GCP distance tables and accuracy reports produced by
-``QA01_PointDistanceComparison.py``
+``QC00_GCPCheck.py``
 (``<run>/T1_proc/QC_data/QC_GCP[_{Product}]_distances[_{extra}].{csv|parquet}``
 + ``..._report.json``) across every run under the given path, optionally
 appends artefacts received from other nodes (``--load-dir``), and produces
@@ -9,7 +9,7 @@ cross-run comparison outputs:
 
 - a per run x product summary table (parquet + csv) with counts, 2D/3D
   RMSE, mean/median distances and the bias decomposition (magnitude,
-  bearing, bias_fraction) — read from the QA01 report JSON where present
+  bearing, bias_fraction) — read from the QC00 report JSON where present
   and current, recomputed from the distance table otherwise;
 - comparison figures: accuracy metrics per run over time, per-run 2D
   bias vectors, and per-GCP-id displacement trends across runs;
@@ -17,14 +17,14 @@ cross-run comparison outputs:
   the figures with relative paths so it renders in the VS Code / GitHub
   preview.
 
-QA03 consumes QA01's saved artefacts **only** — it never re-opens the
+QA00 consumes QC00's saved artefacts **only** — it never re-opens the
 geojson point layers or rasters (mirroring QA02's "never opens .bin"
-rule). Run QA01 first to (re)generate per-run artefacts.
+rule). Run QC00 first to (re)generate per-run artefacts.
 
 Where results are saved depends on the level of the path provided:
 
-- node folder    -> ``<Node>/Documents/QCReports/``
-- project folder -> ``<Project>/Documentation/QCReports/``
+- node folder    -> ``<Node>/Documents/QAReports/``
+- project folder -> ``<Project>/Documentation/QAReports/``
 - anything else  -> ``--output-dir`` is required.
 
 ``--no-save`` displays the figures interactively instead of saving them.
@@ -32,7 +32,7 @@ Where results are saved depends on the level of the path provided:
 Command-line Arguments
 ----------------------
 --path : str, optional
-    Node/project folder to crawl for QA01 distance tables. Defaults to
+    Node/project folder to crawl for QC00 distance tables. Defaults to
     the root directory of the git repository.
 --output-dir : str, optional
     Where to save outputs. Required when --path is not a node or
@@ -44,7 +44,7 @@ Command-line Arguments
     e.g. a container produced by --save-dir on another node).
 --save-dir : str, optional
     Build a portable GCP-accuracy container in this directory: every
-    gathered distance table (``tables/``), the per-run QA01 reports
+    gathered distance table (``tables/``), the per-run QC00 reports
     (``reports/``) and displacement figures (``figures/``), plus the
     comparison figures produced by this script
     (``comparison_figures/``).
@@ -54,6 +54,14 @@ Command-line Arguments
     Only include runs on or before this date.
 --exclude-dir : str [str ...]
     Directory names to exclude from the search.
+--include-runs : {untriaged, degraded, failed}, optional
+    Cumulative severity ladder for runs flagged in ``RunOverview.csv``.
+    Default: clean runs only. ``untriaged`` also includes Issues runs
+    with open TODO/wip tickets; ``degraded`` adds confirmed
+    caution/failed tickets; ``failed`` adds RunFailed runs.
+--include-duplicates : flag
+    Include runs flagged ``DuplicateRun`` (orthogonal to
+    --include-runs).
 --force : flag
     Regenerate outputs even when they are newer than every input.
 --verbose : flag
@@ -64,7 +72,7 @@ Command-line Arguments
 
 __title__ = "GCP run comparison"
 __author__ = "Arden Burrell"
-__version__ = "v1.0(13.08.2026)"
+__version__ = "v1.1(26.08.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -76,7 +84,7 @@ import json
 import shutil
 import argparse
 import pathlib
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 
 # ========== Import other packages ==========
 import git
@@ -103,7 +111,9 @@ if _git_root not in sys.path:
 
 # ========== Import custom packages ==========
 import Code.functions.core_functions as cf
+import Code.functions.issue_yaml as iy
 import Code.functions.gcp_qc as gq
+import Code.functions.qc_report as qr
 
 
 # ==================================================================================
@@ -118,7 +128,7 @@ def main(
     args : argparse.Namespace
         Parsed command-line arguments.
     path : pathlib.Path
-        Node/project folder to crawl for QA01 distance tables.
+        Node/project folder to crawl for QC00 distance tables.
 
     Returns
     -------
@@ -128,23 +138,35 @@ def main(
         reason``.
     """
     # ========== Resolve where the outputs go ==========
-    out_dir = cf.resolve_qcreports_dir(path, args.output_dir, args.no_save)
+    qa_root = cf.resolve_qareports_dir(path, args.output_dir, args.no_save)
+    scope = cf.scope_label(path)
+    out_dir = None
+    if qa_root is not None:
+        out_dir = qa_root / f"QA00_GCPComparison_{scope}"
+        _migrate_legacy_outputs(qa_root, out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
 
     # ========== Gather the per-run distance artefacts ==========
     entries = gather_distance_artefacts(
-        path, exclude_dirs=args.exclude_dir, verbose=args.verbose)
+        path, exclude_dirs=args.exclude_dir,
+        include_runs=args.include_runs,
+        include_duplicates=args.include_duplicates,
+        verbose=args.verbose)
     if args.load_dir is not None:
         entries.extend(load_external_artefacts(
             pathlib.Path(args.load_dir), verbose=args.verbose))
     entries = filter_entries_by_date(entries, args.start_date, args.end_date)
     usable = [e for e in entries if e.get("skip_reason") is None]
     if len(usable) == 0:
+        _print_end_of_run(end_of_run_summary(entries))
         raise ValueError(
             f"No usable QC_GCP distance tables found under {path}"
             + (f" or {args.load_dir}" if args.load_dir else "")
             + (" within the requested date window"
                if (args.start_date or args.end_date) else "")
-            + ". Run QA01_PointDistanceComparison.py first to create them.")
+            + ". Run QC00_GCPCheck.py first to create them, or widen "
+            "--include-runs / --include-duplicates if runs were excluded "
+            "above.")
 
     # ========== Save copies to --save-dir if provided ==========
     save_dir = pathlib.Path(args.save_dir) if args.save_dir is not None else None
@@ -178,6 +200,11 @@ def main(
     if out_dir is not None:
         write_markdown_report(summary, entries, fig_paths, out_dir)
 
+    # ========== Contract report (§2, scope-labelled) ==========
+    if qa_root is not None:
+        report = build_contract_report(path, scope, summary, out_dir, qa_root)
+        qr.write_report(qa_root, report)
+
     # ========== End-of-run summary table ==========
     result = end_of_run_summary(entries)
     _print_end_of_run(result)
@@ -186,6 +213,107 @@ def main(
     else:
         print("\n*** NOTHING WAS SAVED (--no-save): figures were displayed only. ***")
     return result
+
+
+# ==================================================================================
+def _migrate_legacy_outputs(
+        qa_root: pathlib.Path,
+        out_dir: pathlib.Path,
+    ) -> None:
+    """Move pre-contract flat comparison outputs into the scoped folder.
+
+    Earlier versions wrote ``QC_GCP_run_comparison.*`` and the per-sensor
+    figures straight into the routed reports folder; scope-labelled
+    subfolders (plan §4) replace that so crawls at different scopes
+    never clobber.
+
+    Parameters
+    ----------
+    qa_root : pathlib.Path
+        The routed ``QAReports/`` folder.
+    out_dir : pathlib.Path
+        The scoped subfolder the outputs now live in.
+
+    Returns
+    -------
+    None
+    """
+    legacy = (list(qa_root.glob("QC_GCP_run_comparison.*"))
+              + list(qa_root.glob("QC_GCP_*_metrics.png"))
+              + list(qa_root.glob("QC_GCP_*_bias_vectors.png"))
+              + list(qa_root.glob("QC_GCP_*_per_gcp.png")))
+    for src in legacy:
+        dst = out_dir / src.name
+        if not dst.exists():
+            out_dir.mkdir(parents=True, exist_ok=True)
+            src.rename(dst)
+            print(f"  migrated legacy {src.name} -> {out_dir.name}/")
+
+
+# ==================================================================================
+def build_contract_report(
+        path: pathlib.Path,
+        scope: str,
+        summary: pd.DataFrame,
+        out_dir: pathlib.Path,
+        qa_root: pathlib.Path,
+    ) -> Dict[str, Any]:
+    """Assemble the §2 contract report for one comparison invocation.
+
+    Cross-run findings are monitoring signals, never hard fails: a
+    check grades ``warning`` when any run-layer raised it and ``good``
+    otherwise.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        The crawl root (recorded as the scope identity).
+    scope : str
+        Filename scope label.
+    summary : pd.DataFrame
+        Per run x product summary from :func:`build_run_summary`.
+    out_dir : pathlib.Path
+        The scoped artefact folder.
+    qa_root : pathlib.Path
+        The routed ``QAReports/`` folder the report is written into.
+
+    Returns
+    -------
+    dict
+        Contract detail-report dict, ready for ``qr.write_report``.
+    """
+    report = qr.new_report("QA00_GCPComparison", __version__, run={
+        "scope_path": str(path),
+        "n_run_layers": int(len(summary)),
+        "n_sensors": int(summary["sensor"].nunique()),
+    })
+    report["scope"] = scope
+
+    failing = summary[summary["status"] == "fail"]
+    if failing.empty:
+        qr.add_check(report, "gcp_gate_failures", "good",
+                     value="0 run-layers")
+    else:
+        labels = sorted(f"{r.run_label} ({r.product_label})"
+                        for r in failing.itertuples())
+        qr.add_check(report, "gcp_gate_failures", "warning",
+                     value=f"{len(labels)} run-layer(s)",
+                     note="QC00 gate failed on these run-layers",
+                     evidence=labels)
+
+    unmatched = summary[["n_only_groundtruth", "n_only_qc"]].sum(
+        numeric_only=True)
+    n_un = int(unmatched.get("n_only_groundtruth") or 0) \
+        + int(unmatched.get("n_only_qc") or 0)
+    qr.add_check(report, "unmatched_ids",
+                 "warning" if n_un else "good",
+                 value=f"{n_un} unmatched ID(s) across runs",
+                 note=("IDs present in only one layer — digitisation or "
+                       "groundtruth gaps" if n_un else None))
+
+    report["artifacts"] = sorted(
+        f"{out_dir.name}/{p.name}" for p in out_dir.iterdir() if p.is_file())
+    return report
 
 
 # ==================================================================================
@@ -198,14 +326,17 @@ def _comparison_up_to_date(
     Inputs are the distance tables plus any sibling report JSONs;
     outputs are the summary tables and the markdown report (figures
     share the report's regeneration cycle, so they are not checked
-    individually).
+    individually). Because mtimes cannot see membership changes
+    (``--include-runs`` / RunOverview flag flips shrink or grow the
+    gathered set without touching any input file), the run-layer
+    identity set recorded in the summary parquet must also match.
 
     Parameters
     ----------
     entries : list of dict
         Usable artefact entries.
     out_dir : pathlib.Path
-        Routed QCReports directory.
+        Routed QAReports directory.
 
     Returns
     -------
@@ -218,20 +349,64 @@ def _comparison_up_to_date(
     inputs = [e["table_path"] for e in entries]
     inputs += [e["report_path"] for e in entries
                if e.get("report_path") is not None]
-    return cf.outputs_up_to_date(outputs, inputs)
+    if not cf.outputs_up_to_date(outputs, inputs):
+        return False
+    prev = pd.read_parquet(outputs[0])
+    key_cols = ("sensor", "date", "run", "product", "extra")
+    if not set(key_cols) <= set(prev.columns):
+        return False  # pre-identity schema: regenerate once
+    prev_keys = {_layer_key(*row) for row in prev[list(key_cols)].itertuples(index=False)}
+    cur_keys = {_layer_key(*(e.get(c) for c in key_cols)) for e in entries}
+    return prev_keys == cur_keys
+
+
+# ==================================================================================
+def _layer_key(
+        sensor: Any,
+        date: Any,
+        run: Any,
+        product: Any,
+        extra: Any,
+    ) -> Tuple[str, str, str, str, str]:
+    """Normalise one run-layer identity for set comparison.
+
+    Parameters
+    ----------
+    sensor, date, run, product, extra : Any
+        Identity fields from either a gathered entry or the saved
+        summary parquet (types differ between the two sources).
+
+    Returns
+    -------
+    tuple of str
+        Canonical string tuple; missing values become ``""``.
+    """
+    d = pd.to_datetime(date, errors="coerce")
+    def _s(v: Any) -> str:
+        return "" if v is None or (pd.api.types.is_scalar(v) and pd.isna(v)) else str(v)
+    return (_s(sensor), "" if pd.isna(d) else d.strftime("%Y%m%d"),
+            _s(run), _s(product), _s(extra))
 
 
 # ==================================================================================
 def gather_distance_artefacts(
         path: pathlib.Path,
         exclude_dirs: Optional[List[str]] = None,
+        include_runs: Optional[str] = None,
+        include_duplicates: bool = False,
         verbose: bool = False,
     ) -> List[Dict[str, Any]]:
-    """Find every QA01 distance table (+ sibling report) under *path*.
+    """Find every QC00 distance table (+ sibling report) under *path*.
 
     Searches for ``QC_GCP*_distances*.{parquet,csv}`` files inside
-    ``T1_proc/QC_data`` folders (the QA01 output convention). When both
-    a parquet and a csv exist for the same stem, the parquet wins.
+    ``T1_proc/QC_data`` folders — both the contract location
+    (``QC_data/QC00_GCPCheck/``) and the pre-migration top level. When
+    the same stem exists in both places the contract copy wins; when
+    both a parquet and a csv exist for the same stem, the parquet wins.
+    Runs flagged in their date folder's ``RunOverview.csv`` are excluded
+    unless opted in (see
+    :func:`Code.functions.issue_yaml.run_exclusion`); their entries
+    carry the exclusion reason and surface in the end-of-run summary.
 
     Parameters
     ----------
@@ -239,6 +414,10 @@ def gather_distance_artefacts(
         Root directory to search recursively.
     exclude_dirs : list of str, optional
         Directory names to exclude from the search.
+    include_runs : str or None, optional
+        ``--include-runs`` severity ladder level (None = clean only).
+    include_duplicates : bool, optional
+        Include runs flagged ``DuplicateRun``. Default False.
     verbose : bool, optional
         Print per-file diagnostics. Default False.
 
@@ -255,21 +434,38 @@ def gather_distance_artefacts(
         return bool(exclude_set
                     and (set(par.name for par in p.parents) & exclude_set))
 
-    candidates: Dict[pathlib.Path, pathlib.Path] = {}
-    for ext in ("parquet", "csv"):
-        for f in path.rglob(f"QC_GCP*_distances*.{ext}"):
-            if _excluded(f) or f.parent.name != "QC_data":
-                continue
-            key = f.with_suffix("")
-            # +++++ parquet listed first, so csv never overwrites it +++++
-            candidates.setdefault(key, f)
+    candidates: Dict[Any, pathlib.Path] = {}
+    # Contract location first, then pre-migration top level, so the
+    # subfolder copy wins for a stem present in both; within each
+    # location parquet is listed before csv and never overwritten.
+    for subdir in ("QC00_GCPCheck", "QC_data"):
+        for ext in ("parquet", "csv"):
+            for f in path.rglob(f"QC_GCP*_distances*.{ext}"):
+                if _excluded(f) or f.parent.name != subdir:
+                    continue
+                if subdir == "QC00_GCPCheck" \
+                        and f.parent.parent.name != "QC_data":
+                    continue
+                qc_data = (f.parent if subdir == "QC_data"
+                           else f.parent.parent)
+                candidates.setdefault((qc_data, f.stem), f)
     files = sorted(candidates.values())
     print(f"Found {len(files)} distance table(s).")
 
     entries = []
     for fpath in tqdm(files, desc="Loading distance tables"):
-        entries.append(_load_entry(fpath, run_dir=fpath.parents[2],
-                                   verbose=verbose))
+        # <run>/T1_proc/QC_data[/QC00_GCPCheck]/<table>
+        depth = 3 if fpath.parent.name == "QC00_GCPCheck" else 2
+        run_dir = fpath.parents[depth]
+        exclusion = iy.run_exclusion(run_dir.parent, run_dir.name,
+                                     include_runs=include_runs,
+                                     include_duplicates=include_duplicates)
+        entries.append(_load_entry(fpath, run_dir=run_dir,
+                                   verbose=verbose, exclusion=exclusion))
+    n_excl = sum(1 for e in entries if e.get("excluded"))
+    if n_excl:
+        print(f"  EXCLUDED {n_excl} table(s) from flagged runs "
+              "(RunOverview.csv; see the end-of-run summary).")
     return entries
 
 
@@ -278,6 +474,7 @@ def _load_entry(
         fpath: pathlib.Path,
         run_dir: Optional[pathlib.Path],
         verbose: bool = False,
+        exclusion: Optional[str] = None,
     ) -> Dict[str, Any]:
     """Load one distance table plus its sibling report JSON.
 
@@ -290,14 +487,19 @@ def _load_entry(
         metadata is parsed from the copy filename instead).
     verbose : bool, optional
         Print the reason when a file is problematic. Default False.
+    exclusion : str or None, optional
+        Flagged-run exclusion reason from
+        :func:`Code.functions.issue_yaml.run_exclusion`; when set the
+        entry keeps its run metadata but the table is never read.
 
     Returns
     -------
     dict
         Keys: ``table_path``, ``report_path`` (or None), ``df``
         (or None), ``report`` (dict or None), ``product``, ``extra``,
-        and the run metadata (``node, project, site, sensor, date,
-        run``). Entries that cannot be used carry ``skip_reason``.
+        ``excluded`` (bool), and the run metadata (``node, project,
+        site, sensor, date, run``). Entries that cannot be used carry
+        ``skip_reason``.
     """
     stem_info = parse_distance_stem(fpath.stem)
     entry: Dict[str, Any] = {
@@ -306,6 +508,7 @@ def _load_entry(
         "df": None,
         "report": None,
         "skip_reason": None,
+        "excluded": False,
         **stem_info,
         "node": None, "project": None, "site": None,
         "sensor": None, "date": None, "run": None,
@@ -320,6 +523,14 @@ def _load_entry(
         for key in ("node", "project", "site", "sensor", "run"):
             entry[key] = parsed.get(key)
         entry["date"] = parsed.get("date")
+
+    # +++++ Flagged-run exclusion (before any table IO) +++++
+    if exclusion is not None:
+        entry["excluded"] = True
+        entry["skip_reason"] = exclusion
+        if verbose:
+            tqdm.write(f"Excluding {fpath.name}: {exclusion}")
+        return entry
 
     # +++++ Distance table +++++
     required = {"id", "delta_easting_m", "delta_northing_m",
@@ -336,7 +547,7 @@ def _load_entry(
     if missing:
         entry["skip_reason"] = (
             f"missing columns {sorted(missing)} "
-            "(old schema? re-run QA01_PointDistanceComparison.py)")
+            "(old schema? re-run QC00_GCPCheck.py)")
         if verbose:
             tqdm.write(f"Skipping {fpath.name}: {entry['skip_reason']}")
         return entry
@@ -363,7 +574,7 @@ def _load_entry(
 
 # ==================================================================================
 def parse_distance_stem(stem: str) -> Dict[str, Any]:
-    """Split a QA01 distance-table stem into product / extra parts.
+    """Split a QC00 distance-table stem into product / extra parts.
 
     ``QC_GCP_distances`` -> base layer; ``QC_GCP_VNIR_distances`` ->
     product ``VNIR``; trailing ``_{extra}`` after ``distances`` is the
@@ -580,7 +791,7 @@ def save_artefact_copies(
     """Build a portable GCP-accuracy container in *save_dir*.
 
     Copies every gathered distance table into ``tables/``, the sibling
-    QA01 report JSONs into ``reports/`` and the per-run displacement
+    QC00 report JSONs into ``reports/`` and the per-run displacement
     figures (``QC_plots/QC_GCP*_displacements.png``) into ``figures/``.
     Filenames get a run-metadata prefix so files from different nodes,
     projects, sensors, and dates stay uniquely identifiable, and a
@@ -680,7 +891,7 @@ def build_run_summary(
     ) -> pd.DataFrame:
     """Build the per run x product cross-run summary table.
 
-    Statistics come from the QA01 report JSON where present; when the
+    Statistics come from the QC00 report JSON where present; when the
     report is missing, unreadable, or older than the distance table,
     they are recomputed from the table via the shared
     :mod:`Code.functions.gcp_qc` helpers (identical maths).
@@ -900,7 +1111,7 @@ def save_summary_tables(summary: pd.DataFrame, out_dir: pathlib.Path) -> None:
     summary : pd.DataFrame
         Frame from :func:`build_run_summary`.
     out_dir : pathlib.Path
-        Routed QCReports directory.
+        Routed QAReports directory.
 
     Returns
     -------
@@ -1226,7 +1437,7 @@ def write_markdown_report(
         fig_paths: Dict[str, pathlib.Path],
         out_dir: pathlib.Path,
     ) -> None:
-    """Write the markdown overview report into the routed QCReports dir.
+    """Write the markdown overview report into the routed QAReports dir.
 
     Contains the per run x product headline table, worst-run callouts,
     unmatched-ID counts, the skipped-artefact list and relative-path
@@ -1242,19 +1453,19 @@ def write_markdown_report(
     fig_paths : dict
         ``{('sensor|key'): path}`` map from :func:`plot_comparisons`.
     out_dir : pathlib.Path
-        Routed QCReports directory.
+        Routed QAReports directory.
 
     Returns
     -------
     None
     """
     lines: List[str] = []
-    lines.append("# GCP run comparison (QA03)")
+    lines.append("# GCP run comparison (QA00)")
     lines.append("")
     lines.append(f"Generated by `{__title__}` {__version__} on "
                  f"{pd.Timestamp.now():%Y-%m-%d %H:%M}. Inputs are the "
                  "per-run artefacts written by "
-                 "`QA01_PointDistanceComparison.py`.")
+                 "`QC00_GCPCheck.py`.")
     lines.append("")
 
     # ========== Headline table per sensor ==========
@@ -1266,7 +1477,7 @@ def write_markdown_report(
         ("bias_magnitude_m", "Bias (m)"),
         ("bias_bearing_deg", "Bearing (deg)"),
         ("bias_fraction", "Bias fraction"), ("bias_class", "Bias class"),
-        ("status", "QA01 status"), ("stats_source", "Stats source"),
+        ("status", "QC00 status"), ("stats_source", "Stats source"),
     ]
     for sensor, sub in summary.groupby("sensor", dropna=False):
         lines.append(f"## Sensor: {sensor}")
@@ -1288,7 +1499,7 @@ def write_markdown_report(
             fails = ", ".join(
                 f"{r.run_label} ({r.product_label})"
                 for r in failing.itertuples())
-            lines.append(f"- QA01 FAILED run-layer(s): {fails}.")
+            lines.append(f"- QC00 FAILED run-layer(s): {fails}.")
         unmatched = sub[["n_only_groundtruth", "n_only_qc"]].sum(
             numeric_only=True)
         lines.append(
@@ -1347,7 +1558,8 @@ def end_of_run_summary(entries: List[Dict[str, Any]]) -> pd.DataFrame:
             "date": date.strftime("%Y-%m-%d") if pd.notna(date) else None,
             "run": e.get("run"), "product": e.get("product"),
             "n": None, "rmse_2d_m": None,
-            "status": ("skipped" if e.get("skip_reason") is not None
+            "status": ("excluded" if e.get("excluded")
+                       else "skipped" if e.get("skip_reason") is not None
                        else "reported"),
             "reason": e.get("skip_reason"),
         }
@@ -1385,6 +1597,10 @@ def _print_end_of_run(df: pd.DataFrame) -> None:
     disp["reason"] = disp["reason"].fillna("")
     reported = disp[disp["status"] == "reported"]
     skipped = disp[disp["status"] == "skipped"]
+    excluded = disp[disp["status"] == "excluded"]
+    if not excluded.empty:
+        print(f"\nEXCLUDED ({len(excluded)}):")
+        print(excluded.drop(columns=["n", "rmse_2d_m"]).to_string(index=False))
     if not skipped.empty:
         print(f"\nSKIPPED ({len(skipped)}):")
         print(skipped.drop(columns=["n", "rmse_2d_m"]).to_string(index=False))
@@ -1396,15 +1612,17 @@ def _print_end_of_run(df: pd.DataFrame) -> None:
 # ==================================================================================
 if __name__ == "__main__":
     # ========== Parse args ==========
-    parser = argparse.ArgumentParser(description="Compare QA01 GCP distance results across runs (multi-run GCP accuracy QC).")
-    parser.add_argument("--path", type=str, default=None, help="Node or project folder to crawl for QA01 distance tables. Defaults to the git repo root. Node folders save results to <Node>/Documents/QCReports/, project folders to <Project>/Documentation/QCReports/; any other level requires --output-dir.")
+    parser = argparse.ArgumentParser(description="Compare QC00 GCP distance results across runs (multi-run GCP accuracy QA).")
+    parser.add_argument("--path", type=str, default=None, help="Node or project folder to crawl for QC00 distance tables. Defaults to the git repo root. Node folders save results to <Node>/Documents/QAReports/, project folders to <Project>/Documentation/QAReports/; any other level requires --output-dir.")
     parser.add_argument("--output-dir", type=str, default=None, help="Explicit output directory (overrides the node/project routing; required for other path levels unless --no-save).")
     parser.add_argument("--no-save", default=False, action="store_true", help="Display the figures interactively instead of saving them. Nothing is written to disk.")
     parser.add_argument("--load-dir", type=str, default=None, help="Also load distance tables from this folder, searched recursively (e.g. a --save-dir container received from another node).")
-    parser.add_argument("--save-dir", type=str, default=None, help="Build a portable GCP-accuracy container in this directory: gathered tables (tables/), per-run QA01 reports (reports/) and displacement figures (figures/), and this script's comparison figures (comparison_figures/).")
+    parser.add_argument("--save-dir", type=str, default=None, help="Build a portable GCP-accuracy container in this directory: gathered tables (tables/), per-run QC00 reports (reports/) and displacement figures (figures/), and this script's comparison figures (comparison_figures/).")
     parser.add_argument("--start-date", type=str, default=None, help="Only include runs on or after this date (inclusive; e.g. 2026-08-01 or 20260801).")
     parser.add_argument("--end-date", type=str, default=None, help="Only include runs on or before this date (inclusive).")
     parser.add_argument("--exclude-dir", type=str, nargs="+", default=[], help="Directory names to exclude from the table search.")
+    parser.add_argument("--include-runs", type=str, default=None, choices=["untriaged", "degraded", "failed"], help="Cumulative severity ladder for runs flagged in RunOverview.csv. Default: clean runs only (no flags, Deviations only, or Issues with every ticket closed ok/fixed). untriaged also includes Issues runs with open TODO/wip tickets or no Issues.yaml yet; degraded adds confirmed caution/failed tickets (and unparseable yamls); failed adds RunFailed runs.")
+    parser.add_argument("--include-duplicates", default=False, action="store_true", help="Include runs flagged DuplicateRun in RunOverview.csv (reprocessings of another run's raw, e.g. BaseStation GNSS re-runs). Independent of --include-runs.")
     parser.add_argument("-f", "--force", default=False, action="store_true", help="Regenerate the comparison outputs even when they are newer than every gathered input.")
     parser.add_argument("-v", "--verbose", default=False, action="store_true", help="Enable verbose output.")
 

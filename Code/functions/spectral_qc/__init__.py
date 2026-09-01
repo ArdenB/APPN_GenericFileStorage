@@ -16,6 +16,9 @@ import pandas as pd
 
 # +++++ Palette tiers live in core_functions; re-exported for back-compat +++++
 from ..core_functions.run_palette import run_sort_key, resolve_run_palette
+from .panel_library import (panels_root, node_library_dir, gpro_panel_set,
+                            resolve_panel_set, load_panel_dhr)
+from .dhr_drift import within_day_drift
 
 
 # ==================================================================================
@@ -27,10 +30,14 @@ def default_bad_wavelengths() -> Dict[str, Dict[str, List[Tuple[float, float]]]]
     definition masks the equivalent region on every unit without
     band/wavelength alignment.
 
-    The CALVIS SWIR ranges are atmospheric water-vapour absorption
-    features (~940, ~1400, ~1900 nm) plus the detector tail beyond
-    ~2440 nm. VNIR bad regions are TBD pending characterisation of the
-    sensor limitations and are currently not masked.
+    The CALVIS SWIR ranges are the two atmospheric water-vapour
+    absorption features (~1400 and ~1900 nm) — the only operator-approved
+    bad bands (2026-08-26; the 890-950 edge and 2440-2600 detector-tail
+    ranges were removed the same day). VNIR bad regions are TBD pending
+    characterisation of the sensor limitations and are currently not
+    masked (the DT01 candidate ranges were reverted — VNIR has no
+    approved bad bands). Bad-band changes require explicit operator
+    sign-off.
 
     Returns
     -------
@@ -40,10 +47,8 @@ def default_bad_wavelengths() -> Dict[str, Dict[str, List[Tuple[float, float]]]]
     return ({
         "CALVIS": {
             "SWIR": [
-                (890.0, 950.0),    # 940 nm water vapour / VNIR overlap edge
                 (1345.0, 1435.0),  # 1400 nm water vapour
                 (1790.0, 1960.0),  # 1900 nm water vapour
-                (2440.0, 2600.0),  # detector tail / 2500 nm absorption
             ],
         },
     })
@@ -93,6 +98,28 @@ def reflectance_pct(values: pd.Series) -> pd.Series:
     if pd.api.types.is_integer_dtype(values):
         return values / 100.0
     return values * 100.0
+
+
+# ==================================================================================
+def zero_nodata_mask(values: pd.Series) -> pd.Series:
+    """True where a spectra-table value is the 0 = nodata sentinel.
+
+    In the extracted panel tables a value of exactly 0 is missing data
+    (e.g. SWIR gaps over a panel), not a real reflectance/radiance.
+    NaN values (raster-declared nodata that survived extraction) count
+    as nodata too.
+
+    Parameters
+    ----------
+    values : pd.Series
+        The ``value`` column of an extracted spectra table.
+
+    Returns
+    -------
+    pd.Series
+        Boolean mask, True on nodata samples.
+    """
+    return values.isna() | (values == 0)
 
 
 # ==================================================================================
@@ -146,6 +173,7 @@ def identify_panel_set(panel_refs) -> str:
 def snap_wavelengths(
         df: pd.DataFrame,
         unit_col: str = "node",
+        sensor_col: str = "sensor",
         verbose: bool = False,
     ) -> pd.DataFrame:
     """Snap wavelengths onto a shared reference grid per sensor/EM region.
@@ -173,6 +201,10 @@ def snap_wavelengths(
     unit_col : str, optional
         Column identifying the sensor unit. Default ``"node"`` (each
         node operates one unit per sensor platform).
+    sensor_col : str, optional
+        Column defining the sensor grouping. Default ``"sensor"``; pass
+        a pooled label (e.g. ``"sensor_group"``) to snap platforms that
+        share a physical sub-sensor onto one grid.
     verbose : bool, optional
         Print the chosen reference unit per region. Default False.
 
@@ -185,7 +217,7 @@ def snap_wavelengths(
     out = df.copy()
     out["raw_wavelength"] = out["wavelength"]
 
-    for (sensor, region), grp in out.groupby(["sensor", "EM_Region"]):
+    for (sensor, region), grp in out.groupby([sensor_col, "EM_Region"]):
         axis = (grp[[unit_col, "band", "wavelength"]]
                 .dropna()
                 .drop_duplicates([unit_col, "band"]))
@@ -223,3 +255,7 @@ def snap_wavelengths(
             print(f"[{sensor}/{region}] wavelength reference unit = {ref_unit} "
                   f"({len(ref_wls)} ref bands; mean |unit-median| nm: {score_str})")
     return out
+
+
+# ========== Late import: homogeneity needs bad_wavelength_mask (above) ==========
+from .homogeneity import panel_homogeneity  # noqa: E402  pylint: disable=wrong-import-position

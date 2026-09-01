@@ -1,0 +1,39 @@
+# QC03_RasterCheck advisory thresholds (plan §5/§5c).
+# NO empirical anchors yet: these are uncalibrated advisory defaults.
+# They are calibrated from the background rates QC03 itself accumulates
+# (via the reserved QA03_RasterComparison) before QC03 ever gates
+# DS03/DS05. Fractions are percentages of evaluated pixels.
+source: DS02 workshop advisory defaults (uncalibrated, 2026-08)
+
+# Reflectance = 0 inside the data footprint (background excluded).
+zeros_in_footprint_pct: {warn_above: 0.5, fail_above: 5.0}
+# Reflectance > 10000 (impossible; ELM extrapolation / specular / saturation).
+over_range_pct: {warn_above: 0.1, fail_above: 1.0}
+# Reflectance < 0 (signed dtypes only).
+negative_pct: {warn_above: 0.1, fail_above: 1.0}
+# NaN/Inf pixels (float products only): any occurrence warns.
+nan_inf_count: {warn_above: 0}
+
+# ===== All-bands-zero zone split (capture polygon + eroded ROI) =====
+# All-bands-zero share of the ROI: real dropout (scan-line skips, data holes)
+# that the footprint definition absorbs into "background".
+# UNCALIBRATED: run_01 SWIR of 2026_CongWhiteHeads/20260819 sits at 0.351 %;
+# warn is the operator's suggested ~0.1 % and there is no fail level until
+# this is calibrated on the VNIR control and more runs (see plan 5c).
+dropout_in_roi_pct: {warn_above: 0.1, fail_above: null}
+# Nonzero pixels outside the capture polygon, as a share of the grid, at 0.5 px
+# tolerance. Expected ~0 (pixel-centre rounding only): a material count means
+# the extent does not match the raster (wrong or stale file), not real data.
+data_outside_bbox_pct: {warn_above: 0.01}
+
+# Geometry of the zone split. The swath margin is the larger of the fieldbook
+# per-edge margin (10 % of the polygon short axis, Standard-Flight.md) and one
+# flight-line spacing (GOBI fieldbook step 2, from QC01's flight_lines.csv);
+# only inset_factor of it is eroded off each edge -- operator decision
+# 2026-08-26: the full margin absorbed real artefact into the advisory band.
+zero_zones:
+  short_axis_fraction: 0.10
+  inset_factor: 0.5
+
+# Physical range ceiling for reflectance x 10^4 products.
+reflectance_max: 10000

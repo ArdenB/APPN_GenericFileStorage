@@ -1,0 +1,13 @@
+# QC00_GCPCheck thresholds (ex QAConfig hardcoded values — plan §5).
+# Loaded by QC00_GCPCheck.py --spec; the (path, sha256) pair is embedded in
+# every contract detail JSON so verdicts are reproducible against this file.
+source: DS02 workshop defaults (ex QC00 QAConfig v1.03)
+
+# Pass/fail: every matched point's 2D distance must be <= this (metres).
+pass_threshold_2d_m: 0.10
+
+# Warning rules (non-fatal; grade `warning` in the contract report):
+# |mean(delta_height)| above this often indicates a height-datum issue.
+warn_height_delta_mean_m: 0.50
+# Planar 2D bias magnitude above this AND classified biased/mixed.
+warn_planar_bias_mean_m: 0.04

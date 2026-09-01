@@ -1,0 +1,67 @@
+# Within-spec thresholds and sensor hard limits for the DT00 spec check.
+# Transcribed from the GRYFN Flight Calculator v2025.2 (full extraction:
+# FlightCal.md in this folder) plus the APEx fieldbook mission targets.
+# Only sensors on the APEx rigs (GOBI / CALVIS) are included.
+# Regression fixture: tests/test_flightcal_spec.py reproduces the
+# FlightCal.md section-5 worked example from these numbers.
+source: GRYFN Flight Calculator v2025.2 + APEx fieldbook
+notes: >
+  DT00 swath/sidelap use 2*AGL*tan(width*IFOV/2) rather than the
+  calculator's flat pixels*GSD (differs by ~2 % at Headwall FOVs; the
+  tan form is kept as the more correct one). Line-scan optics (EFL,
+  pixel pitch, AOI width) come from the as-flown settings.txt; this
+  file only supplies frame-rate hard limits and classification
+  thresholds.
+
+linescan_sensors:        # keyed by sensor_id prefix (nHP-809 -> nHP)
+  nHP:                   # Headwall Nano-Hyperspec / Nano HP (VNIR)
+    calculator_name: Headwall nHP
+    spatial_pixels: 1020
+    pixel_size_um: 5.86
+    max_frame_rate_hz: 250
+    min_frame_period_ms: 4.00
+  uVS:                   # Headwall Micro-Hyperspec SWIR 640
+    calculator_name: Headwall uVS SWIR 640
+    spatial_pixels: 640
+    pixel_size_um: 15.0
+    max_frame_rate_hz: 236
+    min_frame_period_ms: 4.24
+
+lidar_sensors:           # keyed by GRYFN sensor_id (exact match)
+  VLP16:                 # Velodyne Puck Lite (CALVIS rigs)
+    calculator_name: Velodyne VLP-16
+    rotation_rate_hz: 10
+    hfov_deg: 60
+    channels: 16
+    pulses_per_s_per_channel: 18084   # single return, full 360 deg
+    workbook_gaps: >
+      The workbook leaves VFoV blank and horizontal resolution N/A for
+      the Velodynes, so its point-density formula returns garbage
+      (FlightCal.md section 6). The correction below is the vendor
+      datasheet value; points/s uses the pulses-per-channel path.
+    corrections:
+      vfov_deg: 30.0
+  OS1-128:               # Ouster OS1-070-128U-AX (GOBI rigs)
+    calculator_name: Ouster OS-1 rev7
+    rotation_rate_hz: 10
+    horizontal_resolution: 1024
+    hfov_deg: 60
+    vfov_deg: 42.4
+    channels: 128
+
+assumptions:
+  lidar_return_mode: 2   # dual assumed - not recorded in graw/gpro
+
+thresholds:
+  calculator:            # workbook conditional-formatting breakpoints
+    linescan_gsd_cm: {good_max: 2.0, warn_min: 8.0}
+    linescan_sidelap_pct: {good_min: 30.0, accept_min: 15.0, fail_below: 0.0}
+    lidar_sidelap_pct: {good_min: 30.0, accept_min: 15.0, fail_below: 0.0}
+    # frac = frame rate / sensor max; > 1 means the frame period is below
+    # the sensor minimum, i.e. physically unachievable (hard fail)
+    frame_rate_frac_of_max: {good_max: 0.5, warn_min: 0.8, fail_above: 1.0}
+  fieldbook:             # APEx fieldbook mission targets (stricter)
+    sidelap_pct:
+      VNIR: {good_min: 40.0, accept_min: 37.0, fail_below: 0.0}
+      SWIR: {good_min: 30.0, accept_min: 30.0, fail_below: 0.0}
+    oversampling_pct: {good_min: 30.0, accept_min: 20.0, fail_below: 0.0}

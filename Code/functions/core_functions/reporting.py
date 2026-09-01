@@ -1,6 +1,6 @@
 """Shared report-output helpers for the DS02 comparison scripts.
 
-Output-folder routing for the QCReports convention, preview-safe
+Output-folder routing for the QAReports convention, preview-safe
 filename components, and a dependency-free markdown table writer.
 """
 
@@ -12,16 +12,17 @@ import pandas as pd
 
 
 # ==================================================================================
-def resolve_qcreports_dir(
+def resolve_qareports_dir(
         path: pathlib.Path,
         output_dir: Optional[str],
         no_save: bool,
     ) -> Optional[pathlib.Path]:
-    """Resolve the output folder from the path level (node/project rules).
+    """Resolve the cross-run output folder from the path level.
 
-    Node folders save to ``<Node>/Documents/QCReports/``, project folders
-    to ``<Project>/Documentation/QCReports/``. Any other level requires
-    an explicit ``--output-dir`` (or ``--no-save``).
+    Node folders save to ``<Node>/Documents/QAReports/``, project
+    folders to ``<Project>/Documentation/QAReports/``, site folders to
+    ``<Site>/Documentation/QAReports/``. Any other level requires an
+    explicit ``--output-dir`` (or ``--no-save``).
 
     Parameters
     ----------
@@ -41,7 +42,7 @@ def resolve_qcreports_dir(
     Raises
     ------
     ValueError
-        If the path is neither node nor project level and no
+        If the path is not node, project, or site level and no
         ``--output-dir`` was given (and ``--no-save`` is not set).
     """
     from .parse_APPN_dataset_path import parse_APPN_dataset_path
@@ -57,18 +58,44 @@ def resolve_qcreports_dir(
         # pattern in the name), so detect node level via its markers.
         is_node = ((path / "Documents").is_dir()
                    or any(path.glob("*_ProjectsSummary.csv")))
-        if level == "project":
-            out = path / "Documentation" / "QCReports"
+        if level in ("project", "site"):
+            out = path / "Documentation" / "QAReports"
         elif is_node:
-            out = path / "Documents" / "QCReports"
+            out = path / "Documents" / "QAReports"
         else:
             raise ValueError(
-                f"{path} parses as level '{level}', not a node or project "
-                "folder. Provide --output-dir to choose where the comparison "
-                "outputs are saved (or --no-save to only display them).")
+                f"{path} parses as level '{level}', not a node, project, or "
+                "site folder. Provide --output-dir to choose where the "
+                "comparison outputs are saved (or --no-save to only "
+                "display them).")
     out.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {out}")
     return out
+
+
+# ==================================================================================
+def scope_label(path: pathlib.Path) -> str:
+    """Build the filename scope label for a QA crawl root (plan §4).
+
+    Cross-run report filenames carry the crawl scope so comparisons at
+    different scopes never clobber each other.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        The crawl root passed on the command line.
+
+    Returns
+    -------
+    str
+        Preview-safe label from the parsed APPN levels (node, project,
+        site, sensor — whichever apply), falling back to the folder name.
+    """
+    from .parse_APPN_dataset_path import parse_APPN_dataset_path
+    parsed = parse_APPN_dataset_path(path)
+    parts = [str(parsed[key]) for key in ("node", "project", "site", "sensor")
+             if parsed.get(key)]
+    return safe_filename_component("-".join(parts) or path.name)
 
 
 # ==================================================================================

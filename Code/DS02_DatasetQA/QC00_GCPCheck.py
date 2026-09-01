@@ -1,4 +1,4 @@
-"""Compare validation point locations against QC GCP points.
+"""GCP geometric-accuracy check (QC00) — compare validation point locations against QC GCP points.
 
 Crawls the dataset directory tree for pairs of point files following
 the APPN naming convention:
@@ -22,7 +22,9 @@ reported.
 
 Output
 ------
-For each matched pair, a table is written next to the QC file as
+Per-pair artefacts live in each run's ``QC_data/QC00_GCPCheck/``
+(pre-contract loose copies at the top of ``QC_data/`` are migrated in
+on first touch): a distance table per matched pair as
 ``QC_GCP_distances.<csv|parquet>`` (controlled by ``--type``), with
 one row per matched ID:
 
@@ -37,6 +39,13 @@ e.g. ``QC_GCP_VNIR_distances.csv``), and any extra-info suffix on the
 QC file is appended (``QC_GCP_distances_{extraInfo}``). These names
 are constant across runs so it is easy to check whether a flight has
 already been processed.
+
+Each run also gets the dual-file QC report contract
+(``QC_PIPELINE_PLAN.md`` §2): ``QC_data/QC00_GCPCheck_summary.yaml``
+plus ``QC_data/QC00_GCPCheck/QC00_GCPCheck_detail.json`` grading one
+``gcp_2d[_{product}]`` check (the QC00 gate) and
+``height_bias``/``planar_bias`` warning checks per pair, with the
+threshold-spec provenance (``--spec`` path + sha256) embedded.
 
 The report includes a ``bias`` section that decomposes the signed
 errors into a systematic component (mean offset) and a random
@@ -71,20 +80,24 @@ Command-line Arguments
     Output table format. Defaults to ``csv``.
 --exclude-dir NAME [NAME ...]
     Directory names to exclude from the search.
+--spec PATH
+    GCP threshold spec YAML (default
+    ``reference/thresholds/gcp_limits.yml``; built-in defaults with a
+    warning if missing).
 --plot
     After saving, also display the per-pair displacement plot
     interactively. Plots are always written to
-    ``<QC_data>/QC_plots/QC_GCP_distances_displacements.png`` whenever
-    the JSON report is (re)generated.
+    ``<QC_data>/QC00_GCPCheck/QC_plots/QC_GCP_distances_displacements.png``
+    whenever the JSON report is (re)generated.
 --verbose
     Print extra diagnostic information.
 """
 
 # ==============================================================================
 
-__title__ = "Point distance comparison"
+__title__ = "GCP check"
 __author__ = "Arden Burrell"
-__version__ = "v1.1(13.08.2026)"
+__version__ = "v2.0(25.08.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -123,10 +136,75 @@ except git_exc.InvalidGitRepositoryError:
 
 import Code.functions.core_functions as cf
 import Code.functions.gcp_qc as gq
+import Code.functions.qc_report as qr
 
 
 # +++++ DSM filename pattern: <stem>_LiDAR_DSM_<cm>cm.tif +++++
 _DSM_RE = re.compile(r"_LiDAR_DSM_(\d+)cm\.tif$", re.IGNORECASE)
+
+
+# ==================================================================================
+def main(args: argparse.Namespace, path: pathlib.Path) -> pd.DataFrame:
+    """Run the point-distance comparison across all groundtruth/QC pairs.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed command-line arguments.
+    path : pathlib.Path
+        Root directory to crawl for groundtruth/QC pairs.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per pair with columns ``project, sensor, date, run,
+        product, n, mean_m, max_m, status, reason``. Callers may
+        persist this for later inspection.
+    """
+    print(f"Starting search for groundtruth/QC pairs under {path} at: {pd.Timestamp.now()}")
+    cfg, spec_snapshot = load_config(pathlib.Path(args.spec))
+    pairs = locate_point_pairs(path, args.exclude_dir, args.verbose)
+    if not pairs:
+        raise ValueError(
+            f"No QC_GCP_groundtruth_points / QC_GCP_points pairs "
+            f"(.geojson, or legacy .shp) found under {path}."
+        )
+
+    print(f"Found {len(pairs)} groundtruth/QC pair(s).")
+    rows: List[Dict[str, Any]] = []
+    run_reports: Dict[pathlib.Path, List[Dict[str, Any]]] = {}
+    pbar = tqdm(pairs, desc="Comparing pairs", unit="pair")
+    for pair in pbar:
+        vali = pair["vali"]
+        pbar.set_postfix_str(str(vali.relative_to(path)))
+        meta = {**_summary_metadata(pair["run_dir"]),
+                "product": pair.get("product")}
+        try:
+            report = _process_pair(pair, args, cfg)
+        except (FileNotFoundError, ValueError) as exc:
+            rows.append({**meta, "status": "skipped", "reason": str(exc)})
+            continue
+        run_reports.setdefault(pair["run_dir"], []).append(report)
+        d2d = report["statistics_metres"]["distance_2d"]
+        rows.append({
+            **meta,
+            "n": d2d.get("n", 0),
+            "mean_m": d2d.get("mean"),
+            "max_m": d2d.get("max"),
+            "status": report["status"]["result"],
+            "warning": bool(report.get("warnings", {}).get("triggered", False)),
+            "cached": bool(report.get("cached", False)),
+        })
+
+    # ========== Per-run contract reports (plan §2/§4) ==========
+    for run_dir, reports in run_reports.items():
+        write_contract_report(run_dir, reports, cfg, spec_snapshot,
+                              args.type, force=args.force,
+                              verbose=args.verbose)
+
+    summary = _summary_dataframe(rows)
+    _print_summary_tables(summary)
+    return summary
 
 
 # ==================================================================================
@@ -179,60 +257,39 @@ def default_config() -> QAConfig:
     return QAConfig()
 
 
-# ==================================================================================
-def main(args: argparse.Namespace, path: pathlib.Path) -> pd.DataFrame:
-    """Run the point-distance comparison across all groundtruth/QC pairs.
+def load_config(
+        spec_path: pathlib.Path,
+    ) -> Tuple[QAConfig, Optional[Dict[str, Any]]]:
+    """Build the run config from the threshold spec YAML (plan §5).
 
     Parameters
     ----------
-    args : argparse.Namespace
-        Parsed command-line arguments.
-    path : pathlib.Path
-        Root directory to crawl for groundtruth/QC pairs.
+    spec_path : pathlib.Path
+        Path to ``gcp_limits.yml`` (repo-relative by default).
 
     Returns
     -------
-    pandas.DataFrame
-        One row per pair with columns ``project, sensor, date, run,
-        product, n, mean_m, max_m, status, reason``. Callers may
-        persist this for later inspection.
+    tuple
+        ``(cfg, snapshot)`` — the config with spec-file thresholds
+        applied, plus the ``{"path", "sha256"}`` provenance snapshot
+        for the contract detail JSON. Falls back to the dataclass
+        defaults (snapshot None, with a warning) when the file is
+        missing.
     """
-    print(f"Starting search for groundtruth/QC pairs under {path} at: {pd.Timestamp.now()}")
-    cfg = default_config()
-    pairs = locate_point_pairs(path, args.exclude_dir, args.verbose)
-    if not pairs:
-        raise ValueError(
-            f"No QC_GCP_groundtruth_points / QC_GCP_points pairs "
-            f"(.geojson, or legacy .shp) found under {path}."
-        )
+    if not spec_path.is_file():
+        warnings.warn(
+            f"GCP threshold spec {spec_path} missing - using built-in "
+            "defaults (contract config snapshot will be empty).")
+        return QAConfig(), None
+    loaded = qr.load_thresholds(spec_path.name, thresholds_dir=spec_path.parent)
+    spec = loaded["spec"]
+    cfg = QAConfig(
+        pass_threshold_2d_m=float(spec["pass_threshold_2d_m"]),
+        warn_height_delta_mean_m=float(spec["warn_height_delta_mean_m"]),
+        warn_planar_bias_mean_m=float(spec["warn_planar_bias_mean_m"]),
+    )
+    return cfg, {"path": loaded["path"], "sha256": loaded["sha256"]}
 
-    print(f"Found {len(pairs)} groundtruth/QC pair(s).")
-    rows: List[Dict[str, Any]] = []
-    pbar = tqdm(pairs, desc="Comparing pairs", unit="pair")
-    for pair in pbar:
-        vali = pair["vali"]
-        pbar.set_postfix_str(str(vali.relative_to(path)))
-        meta = {**_summary_metadata(pair["run_dir"]),
-                "product": pair.get("product")}
-        try:
-            report = _process_pair(pair, args, cfg)
-        except (FileNotFoundError, ValueError) as exc:
-            rows.append({**meta, "status": "skipped", "reason": str(exc)})
-            continue
-        d2d = report["statistics_metres"]["distance_2d"]
-        rows.append({
-            **meta,
-            "n": d2d.get("n", 0),
-            "mean_m": d2d.get("mean"),
-            "max_m": d2d.get("max"),
-            "status": report["status"]["result"],
-            "warning": bool(report.get("warnings", {}).get("triggered", False)),
-            "cached": bool(report.get("cached", False)),
-        })
-
-    summary = _summary_dataframe(rows)
-    _print_summary_tables(summary)
-    return summary
 
 # ==================================================================================
 def _summary_metadata(run_dir: pathlib.Path) -> Dict[str, Any]:
@@ -367,10 +424,15 @@ def _process_pair(
     extra = pair.get("extra")
     out_stem = ("QC_GCP_" + (f"{product}_" if product else "")
                 + "distances" + (f"_{extra}" if extra else ""))
-    out_path = file_b.parent / f"{out_stem}.{args.type}"
-    report_path = file_b.parent / f"{out_stem}_report.json"
-    plots_dir = file_b.parent / "QC_plots"
+    # §4 layout: per-pair artefacts live in the script's subfolder;
+    # legacy loose copies at the QC_data top level migrate on first touch.
+    script_dir = file_b.parent / "QC00_GCPCheck"
+    out_path = script_dir / f"{out_stem}.{args.type}"
+    report_path = script_dir / f"{out_stem}_report.json"
+    plots_dir = script_dir / "QC_plots"
     plot_path = plots_dir / f"{out_stem}_displacements.png"
+    _migrate_legacy_outputs(file_b.parent, out_stem, args.type,
+                            verbose=args.verbose)
 
     # +++++ Skip work when outputs already exist and are up to date +++++
     inputs_for_cache = [file_a, file_b]
@@ -473,6 +535,174 @@ def _process_pair(
         print(f"  wrote displacement plot to {plot_path}")
 
     return report
+
+
+# ==================================================================================
+def _migrate_legacy_outputs(
+        qc_data_dir: pathlib.Path,
+        out_stem: str,
+        file_type: str,
+        verbose: bool = False,
+    ) -> None:
+    """Move pre-contract loose outputs into the script subfolder (§4).
+
+    Legacy runs hold ``QC_GCP*distances*`` tables/reports at the top of
+    ``QC_data/`` and plots in ``QC_data/QC_plots/``. Each is renamed
+    into ``QC_data/QC00_GCPCheck/`` so the mtime cache can reuse it and
+    crawls never see duplicates.
+
+    Parameters
+    ----------
+    qc_data_dir : pathlib.Path
+        The run's ``T1_proc/QC_data/`` folder.
+    out_stem : str
+        Output stem for this pair (``QC_GCP[_{Product}]_distances[_x]``).
+    file_type : str
+        Active ``--type`` (both csv and parquet legacies are moved).
+    verbose : bool, optional
+        Print each migration. Default False.
+
+    Returns
+    -------
+    None
+    """
+    script_dir = qc_data_dir / "QC00_GCPCheck"
+    moves = [(qc_data_dir / f"{out_stem}_report.json",
+              script_dir / f"{out_stem}_report.json")]
+    for ext in {"csv", "parquet", file_type}:
+        moves.append((qc_data_dir / f"{out_stem}.{ext}",
+                      script_dir / f"{out_stem}.{ext}"))
+    moves.append((qc_data_dir / "QC_plots" / f"{out_stem}_displacements.png",
+                  script_dir / "QC_plots" / f"{out_stem}_displacements.png"))
+    for src, dst in moves:
+        if src.is_file() and not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            src.rename(dst)
+            if verbose:
+                print(f"  migrated legacy {src.name} -> {dst.parent.name}/")
+
+
+# ==================================================================================
+def write_contract_report(
+        run_dir: pathlib.Path,
+        reports: List[Dict[str, Any]],
+        cfg: QAConfig,
+        spec_snapshot: Optional[Dict[str, Any]],
+        file_type: str,
+        force: bool = False,
+        verbose: bool = False,
+    ) -> None:
+    """Write the run-level §2 contract report from the per-pair reports.
+
+    One report per run: each groundtruth/QC pair contributes a
+    ``gcp_2d[_{product}]`` check (the pass/fail gate) plus
+    ``height_bias``/``planar_bias`` warning checks. The full per-pair
+    reports are embedded in the detail JSON; the per-pair JSON files
+    stay on disk for QA00_GCPComparison.
+
+    Parameters
+    ----------
+    run_dir : pathlib.Path
+        The ``<run>`` directory.
+    reports : list of dict
+        Per-pair reports from :func:`_process_pair` (non-skipped only).
+    cfg : QAConfig
+        Active thresholds.
+    spec_snapshot : dict or None
+        Threshold-spec provenance (``path`` + ``sha256``).
+    file_type : str
+        Active ``--type`` (names the table artifacts).
+    force : bool, optional
+        Rewrite even when the contract files are newer than every
+        per-pair report. Default False.
+    verbose : bool, optional
+        Print the write. Default False.
+
+    Returns
+    -------
+    None
+    """
+    qc_data = run_dir / "T1_proc" / "QC_data"
+    script_dir = qc_data / "QC00_GCPCheck"
+    summary_path, detail_path = qr.report_paths(qc_data, "QC00_GCPCheck")
+    pair_jsons = [pathlib.Path(script_dir / f"{_pair_stem(r)}_report.json")
+                  for r in reports]
+    if not force and cf.outputs_up_to_date(
+            [summary_path, detail_path], pair_jsons):
+        return
+
+    parsed = cf.parse_APPN_dataset_path(run_dir)
+    run_meta = {key: parsed.get(key)
+                for key in ("node", "project", "site", "sensor", "run")}
+    run_meta["date"] = parsed.get("date")
+    report = qr.new_report("QC00_GCPCheck", __version__, run=run_meta)
+
+    artifacts: List[str] = []
+    for rep in reports:
+        stem = _pair_stem(rep)
+        tag = "_".join(p for p in (rep.get("product"), rep.get("extra")) if p)
+        suffix = f"_{tag}" if tag else ""
+        status_blk = rep["status"]
+        d2d = rep["statistics_metres"]["distance_2d"]
+        result = {"pass": "good", "fail": "fail"}.get(
+            status_blk["result"], "not_checked")
+        worst = status_blk.get("worst_distance_2d_m")
+        qr.add_check(
+            report, f"gcp_2d{suffix}", result,
+            value=(f"max {worst:.3f} m (n={d2d.get('n', 0)})"
+                   if worst is not None else None),
+            threshold=f"<= {status_blk['threshold_m']} m on all points",
+            note=(f"{status_blk['n_failing']} failing point(s)"
+                  if status_blk["n_failing"] else None))
+        reasons = rep.get("warnings", {}).get("reasons", [])
+        h_reason = next((s for s in reasons if "delta_height" in s), None)
+        p_reason = next((s for s in reasons if "planar" in s), None)
+        h_mean = rep["statistics_metres"]["delta_height"].get("mean")
+        qr.add_check(
+            report, f"height_bias{suffix}",
+            "warning" if h_reason else "good",
+            value=(f"mean {h_mean:.3f} m" if h_mean is not None else None),
+            threshold=f"|mean| <= {cfg.warn_height_delta_mean_m} m",
+            note=h_reason)
+        p_mag = rep.get("bias", {}).get("planar_2d", {}).get("bias_magnitude_m")
+        qr.add_check(
+            report, f"planar_bias{suffix}",
+            "warning" if p_reason else "good",
+            value=(f"{p_mag:.3f} m" if p_mag is not None else None),
+            threshold=(f"<= {cfg.warn_planar_bias_mean_m} m when "
+                       "classified biased/mixed"),
+            note=p_reason)
+        artifacts += [f"QC00_GCPCheck/{stem}.{file_type}",
+                      f"QC00_GCPCheck/{stem}_report.json",
+                      f"QC00_GCPCheck/QC_plots/{stem}_displacements.png"]
+
+    report["pairs"] = {_pair_stem(r): r for r in reports}
+    report["config"] = spec_snapshot or {"path": None, "sha256": None}
+    report["artifacts"] = artifacts
+    qr.write_report(qc_data, report)
+    if verbose:
+        print(f"  wrote contract report {summary_path.name} "
+              f"({report['status']})")
+
+
+# ==================================================================================
+def _pair_stem(report: Dict[str, Any]) -> str:
+    """Rebuild a pair's output stem from its report fields.
+
+    Parameters
+    ----------
+    report : dict
+        Per-pair report (``product``/``extra`` keys).
+
+    Returns
+    -------
+    str
+        ``QC_GCP[_{Product}]_distances[_{extra}]``.
+    """
+    product = report.get("product")
+    extra = report.get("extra")
+    return ("QC_GCP_" + (f"{product}_" if product else "")
+            + "distances" + (f"_{extra}" if extra else ""))
 
 
 # ==================================================================================
@@ -1484,6 +1714,10 @@ if __name__ == "__main__":
     parser.add_argument("--type", type=str, default="csv",
                         choices=["csv", "parquet"],
                         help="Output table format. Default: csv.")
+    parser.add_argument("--spec", type=str,
+                        default="reference/thresholds/gcp_limits.yml",
+                        help=("GCP threshold spec YAML relative to the repo "
+                              "root (built-in defaults used if missing)."))
     parser.add_argument("--exclude-dir", type=str, nargs="+", default=[],
                         help=("One or more directory names to exclude from "
                               "the search."))
