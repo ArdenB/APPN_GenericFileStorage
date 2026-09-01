@@ -1,9 +1,10 @@
 # DS02 QC Pipeline Plan
 
-Version: v1.20 (26.08.2026)
+Version: v1.21 (01.09.2026)
 Status: **in implementation** (2026-08-25) — Phases 1–3 complete; Phase 5
 core (PS00 registry move + dual rules) landed, leftovers listed in §7;
-Phase 4 (README/docs + copy sync) is the remaining block. Completion
+Phase 4 copy sync: APPN_GenericFileStorage ✅ (2026-09-01), APEX-data
+still deferred. Completion
 markers in §7. Store re-QC in progress — paused before the CaliWeek QC03
 batch pending the §7 revision pass.
 Scope: unify per-run QC and cross-run QA scripts under one naming scheme, one
@@ -12,6 +13,13 @@ are run manually in numbered order.
 
 Changelog:
 
+- v1.21 — APPN_GenericFileStorage copy sync done (Phase 4, 2026-09-01,
+  generic commit dbba284): renames + all seven contract scripts,
+  `qc_report`/`issue_yaml` packages, spectral_qc/core_functions updates,
+  `reference/thresholds` and — **operator decision overriding the §5d
+  split** — `reference/panels` with the real DHR curves (fine to share);
+  `reference/sensor_pipelines` stays master-only (no PS00 in the generic
+  repo). 259 tests pass there. APEX-data sync still deferred.
 - v1.20 — QC03 masking audit closed (§7 revision item 2, §5c rewritten,
   2026-08-26): the all-bands-zero mask is no longer all "background".
   The gpro capture polygon (`extents/hyper_extent.geojson`) is the
@@ -491,10 +499,12 @@ Decisions:
   spec is a repo file. The wiki gets a one-way *documentation export*
   (panel-set signature/manufacture-date table à la
   `AU_panel_set_differences`), never a runtime source.
-- **Generic repo split**: APPN_GenericFileStorage ships the structure and
-  loader only — folder convention, `_schema.json`, README, one anonymised
-  example set for tests. AU's real curves and registry are node hardware
-  identity and stay in this repo.
+- **Generic repo split** (revised v1.21): APPN_GenericFileStorage ships
+  `reference/thresholds` and the full `reference/panels` DHR library —
+  the real curves are operator-approved to share (2026-09-01; supersedes
+  the earlier anonymised-example-only rule). Only the
+  `reference/sensor_pipelines` PS00 registry stays master-only (the
+  generic repo has no PS00 consumer).
 - **The `sensor_platform_paths/` move is a live-path change**: PS00's
   registry loader, README cross-links, and the scheduled scans on WS +
   mint all point at the old path. One commit (loader path + files + docs),
@@ -649,9 +659,16 @@ New package alongside `core_functions` / `spectral_qc` / `gcp_qc`:
    dependency table, contract + output locations, `reference/` files,
    per-script prerequisites; stale QC02 facts fixed (parquet default,
    nm-range bad bands, DHR/homogeneity in scope).
-   ⏳ DEFERRED — the copy sync (APEX-data + APPN_GenericFileStorage)
-   waits until the pipeline has been tested more thoroughly on real
-   data (operator decision, 2026-08-25).
+   ✅ APPN_GenericFileStorage sync done (2026-09-01, generic commit
+   dbba284, pushed): rename sequence applied with `git mv`, all seven
+   scripts + README + plan docs + tests, `qc_report`/`issue_yaml`
+   packages, spectral_qc/core_functions/plot_extracts updates
+   (`resolve_qareports_dir` rename included), `reference/thresholds` +
+   `reference/panels` with real curves (§5d revision). 259 tests pass;
+   all seven CLIs smoke-tested.
+   ⏳ DEFERRED — the APEX-data copy sync waits until the pipeline has
+   been tested more thoroughly on real data (operator decision,
+   2026-08-25).
 5. **Phase 5 — downstream consumers (§8)**: PS00 pipeline-registry update
    (dual rules, then legacy retirement), the `reference/` folder creation +
    `sensor_platform_paths/` → `reference/sensor_pipelines/` move (§5d,
