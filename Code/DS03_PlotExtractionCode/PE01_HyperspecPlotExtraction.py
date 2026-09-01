@@ -680,28 +680,42 @@ def _clip_plot(
     pandas.DataFrame or None
         Long-format rows (``plot_id``, ``band``, ``value``; wavelengths
         live in the dataset sidecar); None when the clip failed.
+
+    Notes
+    -----
+    Builds the long table directly from the clipped numpy block instead
+    of ``DataArray.to_dataframe`` (which materialises a band x y x x
+    MultiIndex product before the NaN drop) — profiled at ~60 % of the
+    extraction inner loop on the 16 GB GOBI bench ortho.
     """
     try:
         sub = window.rio.clip([prow.geometry], crs, drop=True)
     except Exception as er:  # rioxarray raises several types here
         warn.warn(f"Could not clip plot {prow['plot_id']}: {er}. Skipping plot.")
         return None
-    df = sub.to_dataframe(name="value").reset_index()
-    df = df.dropna(subset=["value"])
-    if df.empty:
+    # +++++ (band, y*x) block; row order matches the old band/y/x stack +++++
+    flat = np.asarray(sub.values).reshape(sub.sizes["band"], -1)
+    valid = ~np.isnan(flat)  # matches the old dropna: NaN out, +-Inf kept
+    if not valid.any():
         return None
-    df = df.drop(columns=["spatial_ref"], errors="ignore")
-    if not keep_xy:
-        df = df.drop(columns=["x", "y"], errors="ignore")
+    values = flat[valid]
     # +++++ Restore the native dtype (masked read promotes to float) +++++
+    # Float sources deliberately stay float64 on disk (historical schema;
+    # changing it would mix parquet schemas with pre-existing parts).
     if np.issubdtype(np_dtype, np.integer):
-        df["value"] = df["value"].round().astype(np_dtype)
-    df["band"] = df["band"].astype(np.int16)
-    df["plot_id"] = prow["plot_id"]
-    cols = ["plot_id", "band", "value"]
+        values = np.rint(values).astype(np_dtype)
+    bands = np.repeat(sub["band"].to_numpy().astype(np.int16),
+                      valid.sum(axis=1))
+    cols = {"plot_id": prow["plot_id"], "band": bands, "value": values}
     if keep_xy:
-        cols += ["x", "y"]
-    return df[cols]
+        xs = sub["x"].to_numpy()
+        ys = sub["y"].to_numpy()
+        grid_x = np.tile(xs, ys.size)
+        grid_y = np.repeat(ys, xs.size)
+        vmask = valid.reshape(-1)
+        cols["x"] = np.tile(grid_x, sub.sizes["band"])[vmask]
+        cols["y"] = np.tile(grid_y, sub.sizes["band"])[vmask]
+    return pd.DataFrame(cols)
 
 
 # ==================================================================================
