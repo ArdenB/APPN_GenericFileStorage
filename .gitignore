@@ -15,6 +15,7 @@
 !*.md
 !/FolderStructureInfo.txt
 !/NodeSummary.yaml
+!/environment.yml
 
 # ---- data-tree depth rules ----
 # Ignore FILES at every depth inside top-level folders (this also catches

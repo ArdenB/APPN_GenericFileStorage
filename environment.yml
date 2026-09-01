@@ -1,0 +1,64 @@
+# Shared conda environment for the APPNdatastorage repo (git-synced).
+# Single source of truth for ALL hosts — do not keep per-machine copies.
+#
+# NAS container (installs into the container's base env):
+#   ssh dnas 'cd /volume2/DataStorage && /usr/local/bin/docker compose build'
+# Workstation / laptop (named env):
+#   conda env update -n datastorage -f environment.yml --prune   # update existing
+#   conda env create -f environment.yml                          # first-time create
+name: datastorage
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+
+  # ========== Core data stack ==========
+  - numpy
+  - pandas
+  - scipy
+  - pyarrow      # pandas parquet ledgers
+  - openpyxl     # PS00 xlsx reports
+
+  # ========== Geospatial ==========
+  - geopandas
+  - shapely
+  - pyproj
+  - rasterio
+  - xarray
+  - rioxarray
+  - laspy        # PE00 LiDAR extraction
+  - lazrs-python # laspy .laz decompression backend (GRYFN clouds ship as .laz)
+  - spyndex      # DS05 spectral index calculation
+  - dask         # DS05 chunked index computation on 16 GB orthos
+  - h5netcdf     # DS05 compressed NetCDF index-map output
+  - psutil       # DS05 memory-budgeted index chunking
+  - pvlib-python # QC01 solar geometry + clear-sky irradiance (SPA/Ineichen)
+
+  # ========== Plotting ==========
+  - matplotlib
+  - seaborn
+  - palettable
+  - colorcet    # glasbey_dark palette for >20-run QA02 figures
+
+  # ========== Config / metadata ==========
+  - pyyaml
+  - ruamel.yaml
+  - jsonschema   # PS00 registry validation
+  - anytree      # folder-tree rendering
+
+  # ========== Repo / sync tooling ==========
+  - gitpython
+  - paramiko
+  - tqdm
+
+  # ========== Dev / QA ==========
+  - pytest
+  - ipdb
+
+  # ========== CLI tools ==========
+  - gh           # GitHub CLI
+  - eza          # modern ls (used by lsa alias)
+
+  - pip
+  - pip:
+      - sysrsync
