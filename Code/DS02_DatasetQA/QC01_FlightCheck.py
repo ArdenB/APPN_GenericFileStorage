@@ -81,7 +81,7 @@ Command-line Arguments
 
 __title__ = "Flight check"
 __author__ = "Arden Burrell"
-__version__ = "v2.0(25.08.2026)"
+__version__ = "v2.1(01.09.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -174,8 +174,15 @@ def find_run_dirs(
     -------
     list of pathlib.Path
         Sorted unique run directories.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``path`` does not exist.
     """
     print(f"Scanning {path} for processed runs. {pd.Timestamp.now()}")
+    if not path.is_dir():
+        raise FileNotFoundError(f"Search path does not exist: {path}")
     exclude_set = set(exclude_dirs or [])
 
     def _excluded(p: pathlib.Path) -> bool:
@@ -187,6 +194,12 @@ def find_run_dirs(
         if g.parent.name == "T1_proc" and g.is_dir() and not _excluded(g)
     })
     print(f"Found {len(run_dirs)} run(s) with a .gpro bundle.")
+    if not run_dirs:
+        parsed = cf.parse_APPN_dataset_path(path)
+        if not parsed["valid"]:
+            warn.warn(
+                f"{path} is not a valid APPN dataset path: "
+                + " ".join(parsed["errors"]))
     return run_dirs
 
 
@@ -220,6 +233,12 @@ def process_run(
            for key in ("project", "site", "sensor", "run")}
     row["date"] = parsed.get("date")
     row.update({"status": "skipped", "reason": None})
+
+    # ========== Malformed APPN trees: report why, never grade ==========
+    if not parsed["valid"]:
+        row["reason"] = ("invalid APPN folder structure: "
+                         + " ".join(parsed["errors"]))
+        return row
 
     # ========== Locate bundles ==========
     try:

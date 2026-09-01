@@ -97,7 +97,7 @@ Command-line Arguments
 
 __title__ = "GCP check"
 __author__ = "Arden Burrell"
-__version__ = "v2.0(25.08.2026)"
+__version__ = "v2.1(01.09.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -298,6 +298,9 @@ def _summary_metadata(run_dir: pathlib.Path) -> Dict[str, Any]:
     Falls back to ``None`` for any field the parser cannot resolve.
     """
     parsed = cf.parse_APPN_dataset_path(run_dir)
+    if not parsed["valid"]:
+        warnings.warn(f"{run_dir}: invalid APPN folder structure - "
+                      + " ".join(parsed["errors"]))
     date = parsed.get("date")
     return {
         "project": parsed.get("project"),

@@ -75,7 +75,7 @@ Multi-run comparison (figures across runs/sites/nodes, --load-dir /
 
 __title__ = "Spectral check"
 __author__ = "Arden Burrell"
-__version__ = "v3.3(26.08.2026)"
+__version__ = "v3.4(01.09.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 
@@ -1897,6 +1897,11 @@ def locate_qc_panels(
 
         # ========== Parse the APPN folder structure for metadata ==========
         parsed = cf.parse_APPN_dataset_path(panel)
+        if not parsed["valid"]:
+            warn.warn(
+                f"Skipping {panel}: invalid APPN folder structure - "
+                + " ".join(parsed["errors"]))
+            continue
         sensor = parsed["sensor"]
         if sensor not in valid_sensors:
             if verbose:
