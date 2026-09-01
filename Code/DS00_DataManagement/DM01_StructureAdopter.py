@@ -369,9 +369,18 @@ def crawl_sensor(sensor_dir: pathlib.Path,
         ``{date_str: {"runs": [int], "run_folders": [str]}}``.
     """
     date_regex = re.compile(r"^\d{8}$")
+    doc_dirs = {"Documentation", "Documents", "Code", "code"}
     dates: Dict[str, Any] = {}
     for child in sorted(sensor_dir.iterdir()):
         if not child.is_dir() or _ignored(child.name):
+            continue
+        if child.name in doc_dirs:
+            # Not adoptable, but not a naming failure -- spec puts these at
+            # site/project level, so flag as misplaced rather than blocking.
+            _add(findings, "warn", "misplaced_folder", child,
+                 f"Folder {child.name} at date level -- the spec puts "
+                 f"Documentation/Code folders at the site or project "
+                 f"level. Move it.")
             continue
         if (not date_regex.match(child.name)
                 or pd.isna(pd.to_datetime(child.name, format="%Y%m%d",
@@ -989,11 +998,12 @@ def _ignored(name: str) -> bool:
     Returns
     -------
     bool
-        True when the entry is hidden or a known OS/sync artefact.
+        True when the entry is hidden or a known OS/NAS/sync artefact.
     """
     return (name.startswith(".")
             or name in {"__pycache__", "sync.ffs_db", "Thumbs.db",
-                        "desktop.ini"})
+                        "desktop.ini", "@eaDir", "#recycle",
+                        "$RECYCLE.BIN", "System Volume Information"})
 
 
 # ==================================================================================
