@@ -7,32 +7,46 @@
 # ============================================================================
 *.*
 
-# ---- repo plumbing ----
+# ---- repo plumbing + top-level code/docs ----
 !.gitignore
 !.gitattributes
-!.github/
-!.github/**
-
-# ---- code + docs (any depth) ----
 !*.py
 !*.sh
 !*.md
-
-# ---- repo-shipped reference + template files ----
-!Code/**
-!reference/**
 !/FolderStructureInfo.txt
 !/NodeSummary.yaml
 
-# ---- ProjectBuilder-maintained metadata (any depth) ----
+# ---- data-tree depth rules ----
+# Ignore FILES at every depth inside top-level folders (this also catches
+# extension-less sensor files that *.* cannot match), while re-including
+# the DIRECTORIES so git can keep walking to the metadata files below.
+# Depth 7+ (tier folders and deeper) is pruned entirely.
+/*/*
+!/*/*/
+/*/*/*
+!/*/*/*/
+/*/*/*/*
+!/*/*/*/*/
+/*/*/*/*/*
+!/*/*/*/*/*/
+/*/*/*/*/*/*
+!/*/*/*/*/*/*/
+/*/*/*/*/*/*/*
+
+# ---- re-includes (must come after the depth rules) ----
+!.github/
+!.github/**
+!Code/**
+!reference/**
 !*FieldLog.csv
 !*ProjectsSummary.csv
 !*RunOverview.csv
 !*ProjectSummary.yaml
 !*_Issues.yaml
+!*/**/Documentation/**/README.md
 
 # ============================================================================
-# Ignores for extension-less / directory entries (*.* cannot catch these)
+# Ignores for extension-less / directory entries
 # ============================================================================
 __pycache__/
 .vscode/

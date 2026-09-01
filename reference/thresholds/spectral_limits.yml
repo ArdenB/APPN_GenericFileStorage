@@ -22,7 +22,7 @@ within_day_drift:
   min_runs: 3
   range_warn_above_pp: 3.0
 
-# QC02 panel-homogeneity thresholds (QC02_HomogeneityCheck_PLAN.md step 1;
+# QC02 panel-homogeneity thresholds (QC_PIPELINE_PLAN.md §5/§7 Phase 3;
 # calibrated 25.08.2026 over all 119 extracted spectra tables on the node
 # store = 448 panel instances; clean reference population =
 # 2026_APExCaliWeek, 160 panel instances per EM region). A band flags when

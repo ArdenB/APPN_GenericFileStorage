@@ -1,6 +1,6 @@
 # DS02 QC Pipeline Plan
 
-Version: v1.21 (01.09.2026)
+Version: v1.22 (01.09.2026)
 Status: **in implementation** (2026-08-25) — Phases 1–3 complete; Phase 5
 core (PS00 registry move + dual rules) landed, leftovers listed in §7;
 Phase 4 copy sync: APPN_GenericFileStorage ✅ (2026-09-01), APEX-data
@@ -13,6 +13,17 @@ are run manually in numbered order.
 
 Changelog:
 
+- v1.22 — new PARKED design item (§5e, 2026-09-01): lax-path mode for
+  non-compliant trees, motivated by the `2026_York_F` support case (an
+  invalid site-folder name made QC01/QC02 find nothing; QC00 v2.1 /
+  QC01 v2.1 / QC02 v3.4 / QC03 v1.4 now skip loudly with the parse
+  errors — this item is the deferred opt-in to process anyway).
+  Side-doc retirement (operator): `QC03_ZeroClass_BACKPORT.md` and
+  `QC02_HomogeneityCheck_PLAN.md` deleted — fully absorbed into §5c /
+  §7 Phase 3 + the `spectral_limits.yml` provenance comments (the
+  backport doc's ~100 %-zero-band note is promoted to §7 revision
+  item 5); recoverable via git history; in-code references repointed
+  to this plan.
 - v1.21 — APPN_GenericFileStorage copy sync done (Phase 4, 2026-09-01,
   generic commit dbba284): renames + all seven contract scripts,
   `qc_report`/`issue_yaml` packages, spectral_qc/core_functions updates,
@@ -282,7 +293,8 @@ following the `flightcal_spec.yml` pattern
   Provenance: APEx_Analysis `results/00.DataProcessing/DT01_GryfnPanelComparison/`
   — ✅ `spectral_limits.yml` (be4c0ec; within-day drift block d39a2cf)
 - QC02 panel-homogeneity thresholds (`skew`, `l_kurt`, mean–median
-  divergence — calibrated per `QC02_HomogeneityCheck_PLAN.md` step 1;
+  divergence — calibrated per `QC02_HomogeneityCheck_PLAN.md` step 1
+  (doc retired 2026-09-01, in git history);
   recorded here, not in the `QAConfig` docstring) — ✅ per-EM-region
   `homogeneity` block in `spectral_limits.yml` (ec44954; anchors +
   verification in the YAML comments)
@@ -579,6 +591,41 @@ Open questions, nothing decided:
   — same one-place-for-waivers principle as the intent-aware item
   above.
 
+### Lax-path mode for non-compliant trees
+
+Idea (2026-09-01): an opt-in to run the per-run QC scripts on trees
+that fail `parse_APPN_dataset_path` validation — a mis-named folder
+(the motivating support case: a site folder named `2026_York_F`, where
+the underscore after the year makes it parse as a project folder) or a
+date/run folder passed without its parent folders (data copied to
+scratch/USB, a share mounted at date level). Since QC00 v2.1 / QC01
+v2.1 / QC02 v3.4 / QC03 v1.4 (2026-09-01) the scripts skip such trees
+loudly with the parse errors as the reason — the right default; this
+item is the deliberate opt-out.
+
+Sketch agreed 2026-09-01, nothing built:
+
+- `parse_APPN_dataset_path` gains a `clear_on_invalid=True` kwarg —
+  lax callers receive best-effort fields (whatever parsed cleanly)
+  plus `valid=False` + `errors`, instead of today's all-None wipe on
+  validation failure.
+- QC00/QC01/QC03 gain `--lax-paths`: warn with the errors and process
+  anyway. Their checks are bundle-driven (gpro/graw/product contents),
+  so only the report's `run` identity block degrades (salvaged fields,
+  None elsewhere).
+- QC02 is only viable with explicit overrides — `--sensor` for the
+  ortho region set (VNIR vs VNIR+SWIR) and `--node` for the §5b panel
+  library resolution (no cross-node fallback) — else the DHR checks
+  grade `not_checked`.
+- DS03/DS05 stay strict, not part of this item: extracts without
+  site/plot identity are data pollution, and PE01 cannot locate
+  `{YYYYSite}_plots.geojson` without a site folder anyway.
+
+Open question: reports written with null/partial run identity vs PS00
+and the QA scripts — likely harmless (both crawl the compliant store,
+which a lax-path tree is by definition outside of), but unverified;
+strict stays the default regardless.
+
 ## 6. Shared helper (`functions/qc_report/`) — ✅ DONE (cf4a98d)
 
 New package alongside `core_functions` / `spectral_qc` / `gcp_qc`:
@@ -609,7 +656,8 @@ New package alongside `core_functions` / `spectral_qc` / `gcp_qc`:
    QC02 retrofit (1f717a0); QA00/QA02 contract outputs + scoped subfolders
    (91c6af8); QA01 anomaly rules landed as checks in the Phase 2 port.
    Includes the QC02
-   panel-homogeneity wire-in (`QC02_HomogeneityCheck_PLAN.md` step 4):
+   panel-homogeneity wire-in (`QC02_HomogeneityCheck_PLAN.md` step 4 —
+   doc retired 2026-09-01, in git history):
    `homogeneity` block + `median_residual_pct` enter as contract checks
    (advisory — `suspect → warning`, excluded from `worst()` while run
    status stays `not_evaluated`); its steps 1–3 (threshold calibration,
