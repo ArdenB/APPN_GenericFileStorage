@@ -1034,7 +1034,8 @@ def plot_comparison_spectra(
                     spectra collapse onto one line)
     - ``accuracy``  observed - expected DHR (pp, symlog); skipped when
                     no run in the group resolved a DHR
-    - ``precision`` residual vs the cross-run mean (% refl, symlog)
+    - ``precision`` residual vs the cross-run mean (% refl, symlog);
+                    skipped when the group has fewer than two runs
 
     Pooled platforms are told apart by line style (``style="sensor"``)
     and the run label. Symlog y-axes keep small systematic offsets
@@ -1107,6 +1108,13 @@ def plot_comparison_spectra(
                  "precision")]:
             if var == "dhr_delta_pct" and not sub[var].notna().any():
                 continue  # no run in this group resolved a DHR
+            if suffix == "precision" and sub["run_label"].nunique() < 2:
+                # single-run precision is meaningless; still register the
+                # glob so a stale figure from a previous scope is removed
+                patterns.add("*_" + "_".join(
+                    cf.safe_filename_component(v)
+                    for v in (str(group), str(region), suffix)) + ".png")
+                continue
             _make_comparison_figure(
                 sub, str(sensor), str(group), str(region), var, label,
                 suffix=suffix, palette=palette, plot_dir=plot_dir, show=show,
@@ -1216,7 +1224,10 @@ def _make_comparison_figure(
     g.figure.suptitle(
         f"Sensor: {sensor}, Target: {target}, EM range: {region}",
         y=0.98, fontweight="bold")
-    g.figure.subplots_adjust(top=0.92)
+    # Single-row grids are short, so the suptitle needs proportionally
+    # more headroom or it collides with the facet titles.
+    n_rows = int(np.ceil(len(list(g.axes.flat)) / 2))
+    g.figure.subplots_adjust(top=(0.85 if n_rows == 1 else 0.92))
 
     if is_symlog:
         # Symlog keeps small systematic offsets readable next to spikes
@@ -1340,7 +1351,9 @@ def _overlay_expected_dhr(
     -------
     None
     """
-    linestyles = ["--", ":", "-."]
+    # Dotted-first: the pooled-platform style dimension already renders
+    # CALVIS runs dashed, so a "--" reference would be indistinguishable.
+    linestyles = [(0, (1, 1)), "-.", (0, (3, 1, 1, 1))]
     for ref, ax in g.axes_dict.items():
         pdf = sub[(sub["Panel_ref"] == ref) & sub["exp_pct"].notna()]
         if pdf.empty:
@@ -1360,8 +1373,8 @@ def _overlay_expected_dhr(
         for i, (serials, curve) in enumerate(curves.values()):
             line, = ax.plot(
                 curve["wavelength"], curve["exp_pct"],
-                color="k", ls=linestyles[i % len(linestyles)], lw=1.3,
-                zorder=1, label="DHR " + "/".join(sorted(serials)))
+                color="k", ls=linestyles[i % len(linestyles)], lw=1.5,
+                zorder=10, label="DHR " + "/".join(sorted(serials)))
             handles.append(line)
         ax.legend(handles=handles, loc="best", fontsize=7, frameon=False)
 
