@@ -18,7 +18,10 @@ via line style and the run key table; ``--split-platforms`` restores
 per-platform figures. Legend entries stay compact (node code on
 multi-node scopes + date + run number); the full identity of every
 legend entry is written to ``run_key.csv``/``run_key.md`` next to the
-figures. Multi-node scopes additionally get node colour families and a
+figures. Runs that only enter the comparison through an ``--include-*``
+opt-in flag are non-APPN-compliant and carry a superscript ``\u02e3``
+mark in their label; the reason lives in the run key.
+Multi-node scopes additionally get node colour families and a
 node-grouped legend where they resolve (see
 :func:`Code.functions.core_functions.resolve_node_run_palette`).
 The expected DHR comes from the per-run
@@ -318,11 +321,16 @@ def _write_run_key(
     None
     """
     cols = [c for c in ["run_label", "node", "project", "site", "sensor",
-                        "date", "run", "gpro_nu"] if c in df.columns]
+                        "date", "run", "gpro_nu", "run_flag_reason"]
+            if c in df.columns]
     key = df[cols].drop_duplicates().copy()
     key["date"] = pd.to_datetime(key["date"], errors="coerce").dt.strftime(
         "%Y-%m-%d").fillna(key["date"].astype(str))
     key = key.sort_values(cols[1:]).reset_index(drop=True)
+    note = ""
+    if key.get("run_flag_reason", pd.Series(dtype=str)).ne("").any():
+        note = ("\n\u02e3 = non-APPN-compliant run included via an "
+                "--include-* opt-in flag; see run_flag_reason.\n")
     for dest in (out_dir, copy_dir):
         if dest is None:
             continue
@@ -330,7 +338,7 @@ def _write_run_key(
         key.to_csv(dest / "run_key.csv", index=False)
         (dest / "run_key.md").write_text(
             "# QA02 run key\n\nLegend label -> full run identity.\n\n"
-            + cf.markdown_table(key) + "\n")
+            + cf.markdown_table(key) + "\n" + note)
     print(f"Wrote run_key.csv/.md ({len(key)} legend entr"
           f"{'y' if len(key) == 1 else 'ies'}) to {out_dir}")
 
@@ -351,7 +359,9 @@ def gather_spectra_tables(
     ``QC_Spectral_Tables`` folders (the QC02 output convention) and
     loads the ones that pass schema validation. Runs flagged in their
     date folder's ``RunOverview.csv`` are excluded unless opted in
-    (see :func:`Code.functions.issue_yaml.run_exclusion`).
+    (see :func:`Code.functions.issue_yaml.run_exclusion`); opted-in
+    runs gain a non-empty ``run_flag_reason`` column that
+    :func:`_mark_noncompliant_labels` renders as a superscript mark.
 
     Parameters
     ----------
@@ -383,14 +393,16 @@ def gather_spectra_tables(
         exclude_set = set(exclude_dirs)
         files = [f for f in files
                  if not (set(p.name for p in f.parents) & exclude_set)]
-    files = _exclude_flagged_runs(files, include_runs, include_duplicates,
-                                  include_flight_deviations)
+    files, flagged = _exclude_flagged_runs(files, include_runs,
+                                           include_duplicates,
+                                           include_flight_deviations)
     print(f"Found {len(files)} spectra table(s).")
 
     tables: List[pd.DataFrame] = []
     for fpath in tqdm(files, desc="Loading spectra tables"):
         df = _load_and_validate_table(fpath, file_type, verbose=verbose)
         if df is not None:
+            df["run_flag_reason"] = flagged.get(fpath.parents[3], "")
             tables.append(df)
     return tables
 
@@ -401,13 +413,15 @@ def _exclude_flagged_runs(
         include_runs: Optional[str],
         include_duplicates: bool,
         include_flight_deviations: bool = False,
-    ) -> List[pathlib.Path]:
+    ) -> Tuple[List[pathlib.Path], Dict[pathlib.Path, str]]:
     """Drop artifacts whose run is excluded by its RunOverview.csv flags.
 
     Both QC02 artifact families sit at
     ``<date>/<run>/T1_proc/QC_data/<subdir>/<file>``, so the run folder
     is always ``parents[3]``. One line per excluded run is printed with
-    the flag that re-includes it.
+    the flag that re-includes it. Kept runs that the default (clean-only)
+    policy would have excluded are returned as *flagged* so their labels
+    can carry the non-compliance mark.
 
     Parameters
     ----------
@@ -423,11 +437,15 @@ def _exclude_flagged_runs(
 
     Returns
     -------
-    list of pathlib.Path
-        The paths whose runs are included.
+    tuple of (list of pathlib.Path, dict of pathlib.Path to str)
+        The paths whose runs are included, and a ``{run_dir: reason}``
+        map for kept runs only included via an ``--include-*`` opt-in.
     """
     kept: List[pathlib.Path] = []
     excluded: Dict[pathlib.Path, str] = {}
+    flagged: Dict[pathlib.Path, str] = {}
+    opted_in = (include_runs is not None or include_duplicates
+                or include_flight_deviations)
     for fpath in files:
         run_dir = fpath.parents[3]
         if run_dir in excluded:
@@ -439,11 +457,15 @@ def _exclude_flagged_runs(
             include_flight_deviations=include_flight_deviations)
         if reason is None:
             kept.append(fpath)
+            if opted_in and run_dir not in flagged:
+                default_reason = iy.run_exclusion(run_dir.parent, run_dir.name)
+                if default_reason is not None:
+                    flagged[run_dir] = default_reason
         else:
             excluded[run_dir] = reason
     for run_dir, reason in sorted(excluded.items()):
         print(f"  EXCLUDED {run_dir}: {reason}")
-    return kept
+    return kept, flagged
 
 
 # ==================================================================================
@@ -839,6 +861,7 @@ def prepare_comparison_frame(
     df = cf.build_run_labels(df, date_col="date_label", run_col="run",
                              extra_cols=extra)
     df = df.drop(columns=["date_label"] + extra)
+    _mark_noncompliant_labels(df)
 
     # ========== Split duplicate same-set targets flown in one run ==========
     df = _split_duplicate_targets(df)
@@ -854,6 +877,33 @@ def prepare_comparison_frame(
     df["residual_pct"] = df["refl_pct"] - df["_xrun_ref"]
     df = df.drop(columns="_xrun_ref")
     return df
+
+
+# ==================================================================================
+def _mark_noncompliant_labels(df: pd.DataFrame) -> None:
+    """Append a superscript mark to non-APPN-compliant runs' labels.
+
+    A run is non-compliant when it only entered the comparison through
+    an ``--include-*`` opt-in flag (non-empty ``run_flag_reason``, see
+    :func:`_exclude_flagged_runs`). Its ``run_label`` gains a trailing
+    ``\u02e3`` (superscript x) so the legend shows the run is off-spec;
+    the reason itself lives in the run_key table. Frames without the
+    column (e.g. external ``--load-dir`` tables) are left untouched.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Frame with ``run_label`` (modified in place).
+
+    Returns
+    -------
+    None
+    """
+    if "run_flag_reason" not in df.columns:
+        df["run_flag_reason"] = ""
+    df["run_flag_reason"] = df["run_flag_reason"].fillna("").astype(str)
+    flagged = df["run_flag_reason"].ne("")
+    df.loc[flagged, "run_label"] = df.loc[flagged, "run_label"] + "\u02e3"
 
 
 # ==================================================================================
@@ -1556,8 +1606,9 @@ def _gather_dhr_tables(
         exclude_set = set(exclude_dirs)
         files = [f for f in files
                  if not (set(p.name for p in f.parents) & exclude_set)]
-    files = _exclude_flagged_runs(files, include_runs, include_duplicates,
-                                  include_flight_deviations)
+    files, flagged = _exclude_flagged_runs(files, include_runs,
+                                           include_duplicates,
+                                           include_flight_deviations)
     comp_parts: List[pd.DataFrame] = []
     stats_parts: List[pd.DataFrame] = []
     for fpath in tqdm(files, desc="Loading DHR artifacts"):
@@ -1578,6 +1629,7 @@ def _gather_dhr_tables(
             "site": str(meta["site"]), "sensor": str(meta["sensor"]),
             "date": pd.Timestamp(meta["date"]).strftime("%Y%m%d"),
             "run_number": int(meta["run"]), "run_dir": str(run_dir),
+            "run_flag_reason": flagged.get(run_dir, ""),
         }
         comp = pd.read_parquet(fpath)
         region = str(comp["EM_Region"].iloc[0])
@@ -1625,6 +1677,7 @@ def _apply_dhr_run_labels(
     for df in (comp, stats):
         merged = df.merge(union, on=ident_cols, how="left")
         df["run_label"] = merged["run_label"].to_numpy()
+        _mark_noncompliant_labels(df)
 
 
 # ==================================================================================
