@@ -2,7 +2,8 @@
 
 Manufacturer DHR (directional-hemispherical reflectance) JSONs for every
 APPN reflectance-panel set. These are the QC02 *expected* reference
-curves (QC pipeline plan §5b). One folder per node, one subfolder per
+curves (retired QC pipeline plan §5b, in this repo's git history). One
+folder per node, one subfolder per
 physical set (plain serial, e.g. `UF200-24008/`); physical sticker
 labels live in the table below, not in folder names.
 

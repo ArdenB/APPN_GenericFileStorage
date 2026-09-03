@@ -20,8 +20,8 @@ signature: Gryfn4P, Gryfn2P, or unknown) and a boolean ``Valid_Range`` QC
 flag. Tables are named
 ``QC_{ELM|VAL}[_{id}]_spectra_{VNIR|SWIR}[_gproN][_{extra}].{parquet|csv}``.
 
-For every run the dual-file QC report contract (``QC_PIPELINE_PLAN.md``
-§2) is written: ``QC_data/QC02_SpectralCheck_summary.yaml`` plus
+For every run the dual-file QC report contract (``README.md`` "Reporting
+contract") is written: ``QC_data/QC02_SpectralCheck_summary.yaml`` plus
 ``QC_data/QC02_SpectralCheck/QC02_SpectralCheck_detail.json`` (the
 descriptive statistics embed under ``spectral_report``), and per
 target x EM region the DHR overlay and delta figures
@@ -75,7 +75,7 @@ Multi-run comparison (figures across runs/sites/nodes, --load-dir /
 
 __title__ = "Spectral check"
 __author__ = "Arden Burrell"
-__version__ = "v3.4(01.09.2026)"
+__version__ = "v3.6(03.09.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 
@@ -98,6 +98,8 @@ import rioxarray
 import geopandas as gpd
 from tqdm import tqdm
 import warnings as warn
+import matplotlib
+matplotlib.use("Agg")  # headless; avoids GUI-backend freetype clash (mpl #32208)
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import seaborn as sns
@@ -416,11 +418,17 @@ def _target_region_stats(
     """Descriptive residual statistics for one target x EM-region table.
 
     Residuals are per-band mean (and median) reflectance (percent) minus
-    the nominal ``Panel_ref`` value, computed over the good bands only
+    the nominal ``Panel_ref`` value — i.e. **reflectance percentage
+    points (pp)**. Units convention (2026-09-03): reflectance *levels*
+    report as ``%``, reflectance *differences* (residual/bias/RMSE/MAE/
+    delta/drift) as ``pp``; the detail-JSON ``*_pct`` key names are kept
+    for schema stability (QA02 and historical reports consume them).
+    Computed over the good bands only
     (bands whose wavelength falls outside the known-bad ranges) with the
     0 = nodata sentinel masked out. Both aggregations are always
     reported: their divergence is itself a contamination signal
-    (design record: ``QC_PIPELINE_PLAN.md`` §7 Phase 3). Each panel also carries the
+    (design record: the retired QC pipeline plan §7, in this repo's git
+    history). Each panel also carries the
     ``homogeneity`` distribution-shape block from
     :func:`Code.functions.spectral_qc.panel_homogeneity` plus its
     ``nodata_zero_fraction``; a panel whose good-band samples are all
@@ -618,6 +626,7 @@ def _write_contract_report(
         contract["config"]["spectral_limits"] = dhr["config"]
         contract["artifacts"] += dhr["artifacts"]
     summary_path, _ = qr.write_report(qc_dir, contract)
+    qr.update_qc_report(qc_dir, contract)
     if verbose:
         tqdm.write(f"Saved contract report: {summary_path}")
 
@@ -970,7 +979,7 @@ def build_dhr_comparison(
             continue
         worst_idx = full["bias_pct"].abs().idxmax()
         worst = full.loc[worst_idx]
-        limit = (spec.get("bias_abs_pct", {}).get(str(region), {})
+        limit = (spec.get("bias_abs_pp", {}).get(str(region), {})
                  .get("warn_above"))
         status = "not_checked" if limit is None else (
             "warning" if abs(float(worst["bias_pct"])) > float(limit)
@@ -1020,10 +1029,10 @@ def build_dhr_comparison(
             note_parts.append(f"skipped {skipped_note}")
         out["checks"].append((name, status, {
             "advisory": True,
-            "value": f"worst |bias| {abs(worst_g['bias']):.2f} % "
+            "value": f"worst |bias| {abs(worst_g['bias']):.2f} pp "
                      f"({worst_g['label']} panel {worst_g['panel']}, "
                      f"{worst_g['serial']})",
-            "threshold": (f"|bias| <= {limit} % per panel, bad bands masked"
+            "threshold": (f"|bias| <= {limit} pp per panel, bad bands masked"
                           if limit is not None else None),
             "note": "; ".join(note_parts),
         }))
@@ -2030,4 +2039,5 @@ if __name__ == '__main__':
     os.chdir(path)
 
     # ========== Parse Args to main function ==========
+    cf.check_environment(_git_root)
     main(args, path)

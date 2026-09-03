@@ -67,6 +67,34 @@ def write_issues_yaml(date_dir: pathlib.Path, run: str,
 
 
 # ==================================================================================
+def write_compliance_yaml(date_dir: pathlib.Path, run: str,
+                          compliant: list, note: str = "") -> None:
+    """Write a minimal parseable issue YAML with a flight_compliance list.
+
+    Parameters
+    ----------
+    date_dir : pathlib.Path
+        Date folder to write into.
+    run : str
+        Run folder name (file becomes ``<run>_Issues.yaml``).
+    compliant : list of str
+        Kept ``flight_compliance`` entries (deleted entries = declared
+        deviations).
+    note : str
+        The ``design_note`` value.
+
+    Returns
+    -------
+    None
+    """
+    lines = [f"run: {run}", "triggers: [Deviations]",
+             f"flight_compliance: [{', '.join(compliant)}]",
+             f'design_note: "{note}"']
+    (date_dir / f"{run}_Issues.yaml").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8")
+
+
+# ==================================================================================
 class TestClassifyRun:
     """Severity ladder classification from flags + ticket states."""
 
@@ -202,6 +230,120 @@ class TestRunExclusion:
         write_overview(tmp_path)
         with pytest.raises(ValueError, match="include_runs"):
             iy.run_exclusion(tmp_path, "run_00", include_runs="everything")
+
+
+# ==================================================================================
+class TestFlightDeviations:
+    """flight_compliance delete-down list, exclusion axis, template + patcher."""
+
+    def test_no_yaml_reads_compliant(self, tmp_path):
+        assert iy.run_flight_deviations(tmp_path, "run_00") == []
+
+    def test_missing_key_reads_compliant(self, tmp_path):
+        write_issues_yaml(tmp_path, "run_00", ["ok"])
+        assert iy.run_flight_deviations(tmp_path, "run_00") == []
+
+    def test_deleted_entry_is_the_declared_deviation(self, tmp_path):
+        write_compliance_yaml(tmp_path, "run_00",
+                              ["flight_pattern", "sensor_config"])
+        assert iy.run_flight_deviations(tmp_path, "run_00") == \
+            ["solar_window"]
+
+    def test_full_list_reads_compliant(self, tmp_path):
+        # untouched template = fully compliant, declares nothing
+        write_compliance_yaml(tmp_path, "run_00",
+                              list(iy.flight_deviation_vocab()))
+        assert iy.run_flight_deviations(tmp_path, "run_00") == []
+
+    def test_empty_list_is_all_deviations(self, tmp_path):
+        write_compliance_yaml(tmp_path, "run_00", [])
+        assert iy.run_flight_deviations(tmp_path, "run_00") == \
+            list(iy.flight_deviation_vocab())
+
+    def test_unknown_entry_warns_and_is_ignored(self, tmp_path):
+        write_compliance_yaml(tmp_path, "run_00",
+                              ["solar_window", "flight_pattern",
+                               "sensor_config", "night_flight"])
+        with pytest.warns(UserWarning, match="unknown"):
+            devs = iy.run_flight_deviations(tmp_path, "run_00")
+        assert devs == []          # typo never subtracts from compliance
+
+    def test_deviation_excluded_by_default(self, tmp_path):
+        write_overview(tmp_path, Deviations=True)
+        write_compliance_yaml(tmp_path, "run_00",
+                              ["flight_pattern", "sensor_config"])
+        reason = iy.run_exclusion(tmp_path, "run_00")
+        assert reason is not None
+        assert "--include-flight-deviations" in reason
+        assert "solar_window" in reason
+
+    def test_deviation_opt_in(self, tmp_path):
+        write_overview(tmp_path, Deviations=True)
+        write_compliance_yaml(tmp_path, "run_00",
+                              ["flight_pattern", "sensor_config"])
+        assert iy.run_exclusion(tmp_path, "run_00",
+                                include_flight_deviations=True) is None
+
+    def test_fully_compliant_run_included(self, tmp_path):
+        # untouched full list: run was compliant after all
+        write_overview(tmp_path, Deviations=True)
+        write_compliance_yaml(tmp_path, "run_00",
+                              list(iy.flight_deviation_vocab()))
+        assert iy.run_exclusion(tmp_path, "run_00") is None
+
+    def test_deviation_axis_is_orthogonal(self, tmp_path):
+        # include-runs failed alone must NOT pull in a deviation run
+        write_overview(tmp_path, Deviations=True, RunFailed=True)
+        write_compliance_yaml(tmp_path, "run_00",
+                              ["solar_window", "sensor_config"])
+        assert iy.run_exclusion(tmp_path, "run_00",
+                                include_runs="failed") is not None
+        assert iy.run_exclusion(tmp_path, "run_00",
+                                include_flight_deviations=True) is not None
+        assert iy.run_exclusion(tmp_path, "run_00", include_runs="failed",
+                                include_flight_deviations=True) is None
+
+    def test_template_deviations_emit_block(self, tmp_path):
+        text = iy.render_issue_template(
+            "run_00", "GOBI",
+            {"Deviations": True, "Issues": False, "RunFailed": False},
+            pipeline=None)
+        assert ("flight_compliance: "
+                "[solar_window, flight_pattern, sensor_config]") in text
+        assert 'design_note: ""' in text
+        assert "payload_outcomes" not in text
+
+    def test_template_no_deviations_no_block(self, tmp_path):
+        text = iy.render_issue_template(
+            "run_00", "GOBI",
+            {"Deviations": False, "Issues": True, "RunFailed": False},
+            pipeline=None)
+        assert "flight_compliance" not in text
+
+    def test_patch_appends_block_once(self, tmp_path):
+        write_issues_yaml(tmp_path, "run_00", ["ok"])
+        fpath = tmp_path / "run_00_Issues.yaml"
+        triggers = {"Deviations": True, "Issues": True, "RunFailed": False}
+        actions = iy.patch_issue_yaml(fpath, triggers, pipeline=None,
+                                      write_enabled=True)
+        assert any("flight_compliance" in a for a in actions)
+        # freshly patched full list = compliant, declares nothing
+        assert iy.run_flight_deviations(tmp_path, "run_00") == []
+        # second pass is a no-op for the block
+        actions = iy.patch_issue_yaml(fpath, triggers, pipeline=None,
+                                      write_enabled=True)
+        assert not any("flight_compliance" in a for a in actions)
+
+    def test_patch_never_rewrites_operator_edits(self, tmp_path):
+        write_overview(tmp_path, Deviations=True)
+        write_compliance_yaml(tmp_path, "run_00",
+                              ["flight_pattern", "sensor_config"], "sweep")
+        fpath = tmp_path / "run_00_Issues.yaml"
+        triggers = {"Deviations": True, "Issues": False, "RunFailed": False}
+        iy.patch_issue_yaml(fpath, triggers, pipeline=None,
+                            write_enabled=True)
+        assert iy.run_flight_deviations(tmp_path, "run_00") == \
+            ["solar_window"]
 
 
 # ==================================================================================

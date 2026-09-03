@@ -2,9 +2,8 @@
 
 Per-run **QC** scripts and cross-run **QA** scripts sharing one naming
 scheme, one reporting contract, and one threshold-config pattern. Design
-rationale and completion history live in
-[QC_PIPELINE_PLAN.md](QC_PIPELINE_PLAN.md); this README is the operator
-reference.
+rationale and completion history live in the retired QC pipeline plan
+(this repo's git history); this README is the operator reference.
 
 ## Script set and run order
 
@@ -71,7 +70,7 @@ into scope-labelled subfolders/filenames.
   compares against (gpro-pinned physical set resolution; no cross-node
   fallback).
 - `reference/sensor_pipelines/` — the PS00 processing-status registry
-  (consumes these reports; see plan §8).
+  (consumes these reports; see the retired plan §8, git history).
 
 ## Prerequisites
 
@@ -108,11 +107,20 @@ flags and grade everything they can. Re-inclusion is opt-in
 | failed | `RunFailed` | `--include-runs failed` |
 
 `--include-runs` is cumulative (each level includes the ones below);
-`--include-duplicates` re-includes `DuplicateRun` re-runs and is
-independent of the ladder. Excluded runs are always listed (QA00 also
-carries them in its end-of-run summary as `status=excluded`), and the
-resolution path back to the default set is closing the run's Issues
-tickets — never unflipping the RunOverview bools.
+`--include-duplicates` re-includes `DuplicateRun` re-runs and
+`--include-flight-deviations` re-includes runs with declared flight
+deviations — axes deleted from the delete-down `flight_compliance`
+list in their Issues.yaml (deliberately off-spec flights, e.g. a
+solar-window sweep; QC01 still grades them, annotates the covered
+checks, and waives a covered `fail` so it contributes `warn` to the run
+status instead of failing it) — both are independent of the ladder.
+Only the acquisition-spec `flight_compliance` list feeds the flag:
+deployable/payload intent (panels not placed, raw not kept) is
+irrelevant to QA inclusion and never excludes a run. Excluded runs are always
+listed (QA00 also carries them in its end-of-run summary as
+`status=excluded`), and the resolution path back to the default set is
+closing the run's Issues tickets — never unflipping the RunOverview
+bools.
 
 ## Per-script notes (QC00, QC01, QC03, QA01)
 

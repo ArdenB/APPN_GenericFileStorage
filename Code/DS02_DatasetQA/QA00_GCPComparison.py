@@ -62,6 +62,10 @@ Command-line Arguments
 --include-duplicates : flag
     Include runs flagged ``DuplicateRun`` (orthogonal to
     --include-runs).
+--include-flight-deviations : flag
+    Include runs with declared flight deviations (axes deleted from
+    the ``flight_compliance`` list in their Issues.yaml; orthogonal to
+    --include-runs).
 --force : flag
     Regenerate outputs even when they are newer than every input.
 --verbose : flag
@@ -72,7 +76,7 @@ Command-line Arguments
 
 __title__ = "GCP run comparison"
 __author__ = "Arden Burrell"
-__version__ = "v1.1(26.08.2026)"
+__version__ = "v1.2(03.09.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -93,6 +97,8 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 import warnings as warn
+import matplotlib
+matplotlib.use("Agg")  # headless; avoids GUI-backend freetype clash (mpl #32208)
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -151,6 +157,7 @@ def main(
         path, exclude_dirs=args.exclude_dir,
         include_runs=args.include_runs,
         include_duplicates=args.include_duplicates,
+        include_flight_deviations=args.include_flight_deviations,
         verbose=args.verbose)
     if args.load_dir is not None:
         entries.extend(load_external_artefacts(
@@ -165,8 +172,8 @@ def main(
             + (" within the requested date window"
                if (args.start_date or args.end_date) else "")
             + ". Run QC00_GCPCheck.py first to create them, or widen "
-            "--include-runs / --include-duplicates if runs were excluded "
-            "above.")
+            "--include-runs / --include-duplicates / "
+            "--include-flight-deviations if runs were excluded above.")
 
     # ========== Save copies to --save-dir if provided ==========
     save_dir = pathlib.Path(args.save_dir) if args.save_dir is not None else None
@@ -394,6 +401,7 @@ def gather_distance_artefacts(
         exclude_dirs: Optional[List[str]] = None,
         include_runs: Optional[str] = None,
         include_duplicates: bool = False,
+        include_flight_deviations: bool = False,
         verbose: bool = False,
     ) -> List[Dict[str, Any]]:
     """Find every QC00 distance table (+ sibling report) under *path*.
@@ -418,6 +426,8 @@ def gather_distance_artefacts(
         ``--include-runs`` severity ladder level (None = clean only).
     include_duplicates : bool, optional
         Include runs flagged ``DuplicateRun``. Default False.
+    include_flight_deviations : bool, optional
+        Include runs with declared flight deviations. Default False.
     verbose : bool, optional
         Print per-file diagnostics. Default False.
 
@@ -457,9 +467,11 @@ def gather_distance_artefacts(
         # <run>/T1_proc/QC_data[/QC00_GCPCheck]/<table>
         depth = 3 if fpath.parent.name == "QC00_GCPCheck" else 2
         run_dir = fpath.parents[depth]
-        exclusion = iy.run_exclusion(run_dir.parent, run_dir.name,
-                                     include_runs=include_runs,
-                                     include_duplicates=include_duplicates)
+        exclusion = iy.run_exclusion(
+            run_dir.parent, run_dir.name,
+            include_runs=include_runs,
+            include_duplicates=include_duplicates,
+            include_flight_deviations=include_flight_deviations)
         entries.append(_load_entry(fpath, run_dir=run_dir,
                                    verbose=verbose, exclusion=exclusion))
     n_excl = sum(1 for e in entries if e.get("excluded"))
@@ -1623,6 +1635,7 @@ if __name__ == "__main__":
     parser.add_argument("--exclude-dir", type=str, nargs="+", default=[], help="Directory names to exclude from the table search.")
     parser.add_argument("--include-runs", type=str, default=None, choices=["untriaged", "degraded", "failed"], help="Cumulative severity ladder for runs flagged in RunOverview.csv. Default: clean runs only (no flags, Deviations only, or Issues with every ticket closed ok/fixed). untriaged also includes Issues runs with open TODO/wip tickets or no Issues.yaml yet; degraded adds confirmed caution/failed tickets (and unparseable yamls); failed adds RunFailed runs.")
     parser.add_argument("--include-duplicates", default=False, action="store_true", help="Include runs flagged DuplicateRun in RunOverview.csv (reprocessings of another run's raw, e.g. BaseStation GNSS re-runs). Independent of --include-runs.")
+    parser.add_argument("--include-flight-deviations", default=False, action="store_true", help="Include runs with declared flight deviations (axes deleted from the flight_compliance list in their Issues.yaml, e.g. a solar-window sweep). Independent of --include-runs.")
     parser.add_argument("-f", "--force", default=False, action="store_true", help="Regenerate the comparison outputs even when they are newer than every gathered input.")
     parser.add_argument("-v", "--verbose", default=False, action="store_true", help="Enable verbose output.")
 
@@ -1649,4 +1662,5 @@ if __name__ == "__main__":
     os.chdir(path)
 
     # ========== Parse Args to main function ==========
+    cf.check_environment(_git_root)
     main(args, path)

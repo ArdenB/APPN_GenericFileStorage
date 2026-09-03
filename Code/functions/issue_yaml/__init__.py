@@ -17,8 +17,18 @@ sync that delivers the template.
 
 Generator contract (plan §3.1): create when absent; when bools flip on an
 existing file append only what is missing (``run_failure`` block, tickets
-for payloads with no record, ``triggers`` list sync); never modify
-existing content; skip + warn on unparseable files, never "repair".
+for payloads with no record, ``flight_compliance`` block when Deviations
+flips on, ``triggers`` list sync); never modify existing content; skip +
+warn on unparseable files, never "repair".
+
+The ``flight_compliance`` list is the Deviations trigger's intent-axis
+payload. Like every intent list it is authored delete-down: the template
+emits the fully compliant state and the operator DELETES the axis the
+flight deliberately broke (e.g. ``solar_window`` for a solar-window
+sweep) — missing entries are the declared deviations. Declared
+deviations open no tickets and leave the run ``clean``, but exclude it
+from QA cross-run baselines by default (``--include-flight-deviations``
+re-adds) and let QC01 annotate/waive the covered checks.
 """
 
 import json
@@ -35,6 +45,8 @@ __all__ = [
     "read_triggers",
     "read_duplicate",
     "load_issue_yaml",
+    "flight_deviation_vocab",
+    "run_flight_deviations",
     "classify_run",
     "run_exclusion",
     "load_sensor_pipeline",
@@ -146,6 +158,84 @@ def load_issue_yaml(date_dir: pathlib.Path,
 
 
 # ==================================================================================
+def flight_deviation_vocab() -> Dict[str, Tuple[str, ...]]:
+    """Vocabulary of deliberate flight deviations -> QC01 check prefixes.
+
+    The keys are the full ``flight_compliance`` list emitted into the
+    issue-YAML template (operators DELETE the axis the flight
+    deliberately broke; missing entries are the declared deviations);
+    the values are the QC01 check-name prefixes each entry covers, so
+    QC01 can annotate the matching checks as "declared flight
+    deviation".
+
+    Returns
+    -------
+    dict of str -> tuple of str
+        ``entry -> check-name prefixes``:
+
+        - ``solar_window``  — flights deliberately outside the solar
+          window (``time_to_solar_noon``);
+        - ``flight_pattern`` — line geometry / overlap flown off the
+          normal plan (``sidelap_*``);
+        - ``sensor_config`` — anything configured on the sensor or
+          platform (altitude/GSD, frame rate, speed, exposure/gain;
+          ``design_note`` says which).
+    """
+    return {
+        "solar_window": ("time_to_solar_noon",),
+        "flight_pattern": ("sidelap_",),
+        "sensor_config": ("gsd_", "frame_rate_", "oversampling_"),
+    }
+
+
+# ==================================================================================
+def run_flight_deviations(date_dir: pathlib.Path,
+                          run_name: str) -> List[str]:
+    """Derive one run's declared flight deviations from its issue YAML.
+
+    The ``flight_compliance`` list is delete-down: the operator removes
+    the axis the flight deliberately broke, so the declared deviations
+    are the vocabulary entries *missing* from the kept list. An absent
+    or unparseable yaml, or a missing ``flight_compliance`` key, reads
+    as fully compliant (no deviations) — an untouched template never
+    declares anything. Entries outside
+    :func:`flight_deviation_vocab` are ignored with a warning (typo
+    guard); they never subtract from compliance.
+
+    Parameters
+    ----------
+    date_dir : pathlib.Path
+        Date folder holding ``<run>_Issues.yaml``.
+    run_name : str
+        Run folder name.
+
+    Returns
+    -------
+    list of str
+        The declared deviations in vocabulary order (empty = compliant
+        or nothing declared).
+    """
+    yaml_data, yaml_state = load_issue_yaml(date_dir, run_name)
+    if yaml_state != "parsed":
+        return []
+    raw = yaml_data.get("flight_compliance")
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple, CommentedSeq)):
+        warn.warn(f"{run_name}_Issues.yaml in {date_dir}: flight_compliance "
+                  f"is not a list ({raw!r}); ignoring it.")
+        return []
+    kept = [str(e) for e in raw]
+    vocab = flight_deviation_vocab()
+    unknown = [e for e in kept if e not in vocab]
+    if unknown:
+        warn.warn(f"{run_name}_Issues.yaml in {date_dir}: unknown "
+                  f"flight_compliance entries {unknown} (vocabulary: "
+                  f"{sorted(vocab)}).")
+    return [e for e in vocab if e not in kept]
+
+
+# ==================================================================================
 def classify_run(date_dir: pathlib.Path, run_name: str) -> Tuple[str, str]:
     """Classify one run's severity from its RunOverview flags + tickets.
 
@@ -201,7 +291,8 @@ def classify_run(date_dir: pathlib.Path, run_name: str) -> Tuple[str, str]:
 # ==================================================================================
 def run_exclusion(date_dir: pathlib.Path, run_name: str,
                   include_runs: Optional[str] = None,
-                  include_duplicates: bool = False) -> Optional[str]:
+                  include_duplicates: bool = False,
+                  include_flight_deviations: bool = False) -> Optional[str]:
     """Decide whether a QA crawl should exclude this run.
 
     Parameters
@@ -216,6 +307,12 @@ def run_exclusion(date_dir: pathlib.Path, run_name: str,
         Each level also includes everything below it.
     include_duplicates : bool
         Include runs flagged ``DuplicateRun`` (orthogonal axis).
+    include_flight_deviations : bool
+        Include runs with declared flight deviations (entries deleted
+        from the ``flight_compliance`` list in their issue YAML) —
+        deliberately off-spec flights that would otherwise pollute
+        cross-run baselines (orthogonal axis). Deployable/payload
+        intent (panels, gcps) never feeds this flag.
 
     Returns
     -------
@@ -235,6 +332,12 @@ def run_exclusion(date_dir: pathlib.Path, run_name: str,
                          f"{sorted(rank)[1:]} or None, got '{include_runs}'")
     if not include_duplicates and read_duplicate(date_dir, run_name):
         return "DuplicateRun flagged (use --include-duplicates)"
+    if not include_flight_deviations:
+        deviations = run_flight_deviations(date_dir, run_name)
+        if deviations:
+            return (f"flight deviation(s) declared: "
+                    f"{', '.join(deviations)} "
+                    "(use --include-flight-deviations)")
     severity, detail = classify_run(date_dir, run_name)
     if rank[severity] > rank[level]:
         return f"{severity}: {detail} (use --include-runs {severity})"
@@ -308,6 +411,21 @@ def render_issue_template(run: str, sensor: str, triggers: Dict[str, bool],
         f"intended_payloads: [{', '.join(payloads)}]",
         f"deployables_placed: [{', '.join(deploys)}]",
     ]
+    # +++++ flight-compliance axis: Deviations declares deliberate
+    # departures by DELETING the broken axis - delete-down, never tickets +++++
+    if triggers.get("Deviations"):
+        lines += [
+            "",
+            "# ---- flight compliance (DELETE the entries this run deliberately deviated from) ----",
+            "# Same delete-down grammar as the intent lists above: what remains declares",
+            "# compliance, what you delete declares a deliberate deviation (design intent,",
+            "# not a problem - no tickets, the run stays 'clean'). QA crawls exclude runs",
+            "# with declared deviations from cross-run baselines",
+            "# (--include-flight-deviations re-adds). 'design_note' says why - required",
+            "# when anything is deleted, especially sensor_config.",
+            f"flight_compliance: [{', '.join(flight_deviation_vocab())}]",
+            'design_note: ""',
+        ]
     # +++++ outcome axis: only Issues/RunFailed need tickets - a
     # Deviations-only run is an intent-axis event (edit the lists above)
     # and must not spawn open TODO tickets that nag forever +++++
@@ -420,6 +538,26 @@ def patch_issue_yaml(fpath: pathlib.Path, triggers: Dict[str, bool],
         new_trig = CommentedSeq(trig)
         new_trig.fa.set_flow_style()
         data["triggers"] = new_trig
+    # +++++ add flight_compliance block when Deviations flips on +++++
+    if triggers.get("Deviations") and "flight_compliance" not in data:
+        actions.append("add flight_compliance block")
+        devs = CommentedSeq(list(flight_deviation_vocab()))
+        devs.fa.set_flow_style()
+        data["flight_compliance"] = devs
+        data.yaml_set_comment_before_after_key(
+            "flight_compliance",
+            before="---- flight compliance (DELETE the entries this run"
+                   " deliberately deviated from) ----\n"
+                   "What remains declares compliance, what you delete"
+                   " declares a deliberate\n"
+                   "deviation (design intent, not a problem - no tickets,"
+                   " the run stays 'clean').\n"
+                   "QA crawls exclude runs with declared deviations"
+                   " (--include-flight-deviations\n"
+                   "re-adds). 'design_note' says why - required when"
+                   " anything is deleted.")
+        if "design_note" not in data:
+            data["design_note"] = ""
     # +++++ add run_failure block when RunFailed flips on +++++
     if triggers.get("RunFailed") and "run_failure" not in data:
         actions.append("add run_failure block")

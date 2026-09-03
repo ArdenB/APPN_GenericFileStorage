@@ -1141,4 +1141,5 @@ if __name__ == '__main__':
     os.chdir(path)
 
     # ========== Parse Args to main function ==========
+    cf.check_environment(_git_root)
     main(args, path)

@@ -1,11 +1,12 @@
 """Threshold-config loader for the DS02 QC/QA scripts.
 
-Implements section 5 of ``Code/DS02_DatasetQA/QC_PIPELINE_PLAN.md``: all
-thresholds live in spec YAMLs under ``reference/thresholds/`` (repo-shipped,
-never wiki-fetched — section 5d). The loader returns the parsed spec plus
-the provenance snapshot (path + sha256) that the section-2 reporting
-contract embeds in every detail JSON, so a report is only reproducible
-against the exact spec file it was graded with.
+Implements the DS02 threshold pattern (design record: retired QC
+pipeline plan §5, git history): all thresholds live
+in spec YAMLs under ``reference/thresholds/`` (repo-shipped, never
+wiki-fetched — §5d). The loader returns the parsed spec plus the
+provenance snapshot (path + sha256) that the reporting contract embeds
+in every detail JSON, so a report is only reproducible against the
+exact spec file it was graded with.
 """
 
 import hashlib

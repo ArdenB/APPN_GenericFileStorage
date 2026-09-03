@@ -6,7 +6,7 @@ line geometry, and DTM-based flight altitude (AGL), computes solar geometry
 (altitude/azimuth, time to solar noon, sun-flight-line angle) and clear-sky
 irradiance via pvlib, re-runs the GRYFN Flight Calculator equations on the
 as-flown values, and grades bundle integrity — then writes the dual-file
-QC report contract (``QC_PIPELINE_PLAN.md`` §2) into each run's
+QC report contract (``README.md`` "Reporting contract") into each run's
 ``T1_proc/QC_data/``.
 
 Design rules (ported from APEx_Analysis DT00, decision 2026-08-18):
@@ -33,6 +33,10 @@ Outputs (per run, §4 layout):
 - ``QC_data/QC01_FlightCheck/exposure_segments.csv`` - per raw capture
   segment VNIR/SWIR exposure.
 - ``QC_data/QC01_FlightCheck/run_summary.csv`` - one row per run.
+- ``QC_data/QC01_FlightCheck/QC01_sun_geometry.png`` - flight-axis vs
+  solar-geometry polar figure (BRDF risk band).
+- ``QC_data/QC01_FlightCheck/QC01_agl_profiles.png`` - along-line AGL
+  profiles on a common ground axis.
 
 Within-spec check: as-flown values (AGL, ground speed, line spacing,
 settings.txt optics) are re-run through the GRYFN Flight Calculator's
@@ -49,6 +53,22 @@ dark-reference presence, reflectance-panel presence, and the per-region
 reflectance orthomosaic products (a hyperspec sensor that flew but has no
 ``*_{VNIR|SWIR}_Orthomosaic.bin``, or a radiance-tagged header, is the
 ELM-failed tell).
+
+Declared flight deviations: axes deleted from the ``flight_compliance``
+list in the run's ``run_XX_Issues.yaml`` (deliberate departures from
+normal ops, e.g. a solar-window sweep) annotate the covered checks with a
+"declared flight deviation" note; a covered check that measured ``fail``
+is additionally waived — its measured status is preserved but the shared
+roll-up caps its run-status contribution at ``warn``, so a deliberately
+out-of-spec flight flags rather than fails the run. The issue YAML joins
+the mtime cache inputs so editing it invalidates the cached report.
+APPN solar-window compliance (``time_to_solar_noon``, pass/fail at the
+spec's 120 min bound) gates the run status and is the primary waivable
+check. Orthogonally, the ``appn_compliant`` advisory check is the hard
+acquisition-spec verdict: True only when every evaluated FlightCal/
+fieldbook spec check measured good/acceptable. Intent never touches it
+— declared deviations soften the run status, never the bool — so
+upstream failure counting always sees the measurement.
 
 Note on heights: flight-line KML heights and the LiDAR DTM share the
 GNSS trajectory's vertical frame, so their difference (AGL) is internally
@@ -81,7 +101,7 @@ Command-line Arguments
 
 __title__ = "Flight check"
 __author__ = "Arden Burrell"
-__version__ = "v2.1(01.09.2026)"
+__version__ = "v2.8(03.09.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -99,6 +119,10 @@ import git
 from git import exc as git_exc
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # headless; avoids GUI-backend freetype clash (mpl #32208)
+import matplotlib.pyplot as plt
+import palettable
 import pvlib
 import pyproj
 import rasterio
@@ -122,6 +146,7 @@ if _git_root not in sys.path:
 
 # ========== Import custom packages ==========
 import Code.functions.core_functions as cf
+import Code.functions.issue_yaml as iy
 import Code.functions.qc_report as qr
 
 
@@ -254,10 +279,18 @@ def process_run(
     if spec_snapshot is not None:
         inputs.append(pathlib.Path(spec_snapshot["path"]))
     inputs.extend(sorted((gpro / "pipelines").glob("*.yml")))
+    issues_yaml = run_dir.parent / f"{run_dir.name}_Issues.yaml"
+    if issues_yaml.is_file():
+        inputs.append(issues_yaml)
     if not args.force and cf.outputs_up_to_date(
             [summary_path, detail_path], inputs):
-        row.update({"status": "cached", "reason": "outputs up to date"})
-        return row
+        version_ok, version_reason = qr.report_is_current(
+            qc_data, "QC01_FlightCheck", __version__)
+        if version_ok:
+            row.update({"status": "cached", "reason": "outputs up to date"})
+            return row
+        if args.verbose:
+            tqdm.write(f"{run_dir}: {version_reason}; re-running")
 
     # ========== Scrape the bundles (ex-DT00 pipeline) ==========
     mission = load_mission(gpro)
@@ -288,10 +321,15 @@ def process_run(
     out_dir = qc_data / "QC01_FlightCheck"
     acq_report = write_outputs(out_dir, gpro, graw, mission, df, panels,
                                exposure, run_id, trigger, lever, spec_report)
+    make_sun_geometry_plot(df, out_dir, spec)
+    make_agl_profile_plot(df, gpro, out_dir)
     report = build_contract_report(
         parsed, gpro, graw, mission, df, panels, exposure,
         spec_report, spec_snapshot, acq_report)
+    annotate_flight_deviations(
+        report, iy.run_flight_deviations(run_dir.parent, run_dir.name))
     qr.write_report(qc_data, report)
+    qr.update_qc_report(qc_data, report)
     row.update({"status": report["status"], "reason": None})
     if args.verbose:
         tqdm.write(f"{run_dir}: {report['status']}")
@@ -359,6 +397,9 @@ def build_contract_report(
     # ========== FlightCal spec checks ==========
     add_spec_contract_checks(report, mission, spec_report)
 
+    # ========== Hard APPN acquisition-spec compliance bool ==========
+    add_appn_compliance_check(report)
+
     # ========== Detail-only payload ==========
     report["acquisition_report"] = acq_report
     report["config"] = spec_snapshot or {"path": None, "sha256": None}
@@ -369,7 +410,9 @@ def build_contract_report(
     }
     report["artifacts"] = [
         f"QC01_FlightCheck/{name}" for name in
-        ("flight_lines.csv", "exposure_segments.csv", "run_summary.csv")
+        ("QC01_sun_geometry.png", "QC01_agl_profiles.png",
+         "flight_lines.csv",
+         "exposure_segments.csv", "run_summary.csv")
         if (pathlib.Path(gpro).parent.parent / "T1_proc" / "QC_data"
             / "QC01_FlightCheck" / name).is_file()
     ]
@@ -549,6 +592,7 @@ def add_spec_contract_checks(
                      value=_rng(rec.get("gsd_cm_range"), "cm"))
         qr.add_check(report, f"frame_rate_{tag}",
                      rec["achieved_frame_rate_status"],
+                     value=_rng(rec.get("frame_rate_hz_range"), "Hz"),
                      note=f"configured: {rec['configured_frame_rate_status']}")
         qr.add_check(report, f"sidelap_{tag}_calculator",
                      rec["sidelap_status_calculator"],
@@ -557,11 +601,103 @@ def add_spec_contract_checks(
                      rec["sidelap_status_fieldbook"],
                      value=_rng(rec.get("sidelap_pct_range"), "%"))
         qr.add_check(report, f"oversampling_{tag}_fieldbook",
-                     rec["oversampling_status_fieldbook"])
+                     rec["oversampling_status_fieldbook"],
+                     value=_rng(rec.get("oversampling_pct_range"), "%"))
+    noon = spec_report.get("solar_noon") or {}
+    if noon.get("status"):
+        qr.add_check(report, "time_to_solar_noon", noon["status"],
+                     value=_rng(noon.get("abs_time_to_solar_noon_min_range"),
+                                "min"),
+                     note="APPN solar-window compliance - a fail is "
+                          "waivable by a declared solar_window flight "
+                          "deviation")
     lidar = spec_report.get("lidar") or {}
     if lidar.get("sidelap_status"):
         qr.add_check(report, "sidelap_lidar", lidar["sidelap_status"],
                      value=_rng(lidar.get("sidelap_pct_range"), "%"))
+
+
+# ==================================================================================
+def add_appn_compliance_check(report: Dict[str, Any]) -> None:
+    """Add the hard ``appn_compliant`` bool (advisory check).
+
+    True only when every evaluated FlightCal/fieldbook spec check
+    (``gsd_*``, ``frame_rate_*``, ``sidelap_*``, ``oversampling_*``,
+    ``time_to_solar_noon``) measured ``good``/``acceptable`` — a hard
+    test of the acquisition spec where intent doesn't matter: declared
+    flight deviations waive the run status, never this bool. Advisory,
+    so it never double-counts into the run status; bundle-integrity
+    checks (graw/panels/products) are data completeness, not spec, and
+    are excluded. ``not_checked`` when no spec check was evaluated.
+
+    Parameters
+    ----------
+    report : dict
+        Contract report dict (mutated in place); must already hold the
+        spec checks.
+
+    Returns
+    -------
+    None
+    """
+    spec_prefixes = ("gsd_", "frame_rate_", "sidelap_", "oversampling_",
+                     "time_to_solar_noon")
+    evaluated = [chk["status"] for name, chk in report["checks"].items()
+                 if name.startswith(spec_prefixes)
+                 and chk["status"] != "not_checked"]
+    if not evaluated:
+        qr.add_check(report, "appn_compliant", "not_checked", advisory=True,
+                     note="no spec checks evaluated")
+        return
+    compliant = all(s in ("good", "acceptable") for s in evaluated)
+    qr.add_check(report, "appn_compliant",
+                 "good" if compliant else "fail",
+                 value=bool(compliant), advisory=True,
+                 note="hard APPN acquisition-spec verdict (measured only - "
+                      "never waived by declared flight deviations; excluded "
+                      "from run status)")
+
+
+# ==================================================================================
+def annotate_flight_deviations(
+    report: Dict[str, Any],
+    deviations: List[str],
+) -> None:
+    """Annotate and waive the checks covered by declared flight deviations.
+
+    Deliberate departures from normal ops (axes deleted from the
+    ``flight_compliance`` list in the run's Issues.yaml) are stamped
+    onto the matching checks so "out of spec, by design" reads
+    differently from "out of spec, nobody meant it". A covered check
+    that measured ``fail`` also gains a ``waived`` reason: the measured
+    status is preserved, but ``qr.derive_status`` caps its run-status
+    contribution at ``warn``. Checks not covered by a declared
+    deviation are never touched, and the derived list is recorded in
+    the detail JSON either way.
+
+    Parameters
+    ----------
+    report : dict
+        Contract report dict (mutated in place).
+    deviations : list of str
+        Declared deviations for this run (from
+        :func:`Code.functions.issue_yaml.run_flight_deviations`).
+
+    Returns
+    -------
+    None
+    """
+    report["flight_deviations"] = list(deviations)
+    vocab = iy.flight_deviation_vocab()
+    for entry in deviations:
+        prefixes = vocab.get(entry, ())
+        for name, check in report["checks"].items():
+            if any(name.startswith(p) for p in prefixes):
+                extra = f"declared flight deviation: {entry}"
+                check["note"] = (f"{check['note']}; {extra}"
+                                 if check.get("note") else extra)
+                if check["status"] == "fail":
+                    check["waived"] = extra
 
 
 # ==================================================================================
@@ -739,20 +875,24 @@ def extract_flight_lines(gpro: pathlib.Path, mission: dict) -> pd.DataFrame:
                      and j not in used]
             if match:
                 used.add(match[0])
-                geom = line_geometry(kml_coords[match[0]])
+                chosen = kml_coords[match[0]]
             elif rec["line"] < len(kml_coords) and kml_coords[rec["line"]] is not None:
                 warn.warn(
                     f"{acq['sensor_id']} line {rec['line']}: no KML with "
                     f"{rec['n_frames']} points - falling back to index pairing."
                 )
-                geom = line_geometry(kml_coords[rec["line"]])
+                chosen = kml_coords[rec["line"]]
             else:
                 warn.warn(
                     f"{acq['sensor_id']} line {rec['line']}: no epoch KML - "
                     "line geometry reported missing."
                 )
-                geom = line_geometry(None)
-            rows.append({"sensor_id": acq["sensor_id"], **rec, **geom})
+                chosen = None
+            geom = line_geometry(chosen)
+            # per-vertex coords kept for the AGL-profile figure; dropped
+            # before flight_lines.csv is written
+            rows.append({"sensor_id": acq["sensor_id"], **rec, **geom,
+                         "_kml_coords": chosen})
     if not rows:
         raise FileNotFoundError(
             f"No flight-line products found in {gpro} - gpro incomplete."
@@ -1445,7 +1585,7 @@ def add_spec_check(
     df["lidar_sidelap_pct"] = np.nan
     status_cols = ("gsd_status", "frame_rate_status", "sidelap_status_calc",
                    "sidelap_status_fieldbook", "oversampling_status_fieldbook",
-                   "lidar_sidelap_status")
+                   "solar_noon_status", "lidar_sidelap_status")
     for col in status_cols:
         df[col] = "not_checked"
     if spec is None:
@@ -1519,6 +1659,7 @@ def add_spec_check(
                           ov.get("fail_below"))
             for v in df.loc[mask, "oversampling_actual_pct"]]
         sub = df.loc[mask]
+        fp = sub["achieved_frame_period_ms"].replace(0, np.nan)
         report["linescan"][sid] = {
             "calculator_name": ls.get("calculator_name"),
             "gsd_cm_range": [_nanfloat(sub["gsd_cm"].min()),
@@ -1529,12 +1670,17 @@ def add_spec_check(
             "max_frame_rate_hz": ls["max_frame_rate_hz"],
             "configured_frame_rate_status": cfg_status,
             "achieved_frame_rate_status": _worst(sub["frame_rate_status"]),
+            "frame_rate_hz_range": [_nanfloat(1000.0 / fp.max()),
+                                    _nanfloat(1000.0 / fp.min())],
             "sidelap_pct_range": [_nanfloat(sub["est_sidelap_pct"].min()),
                                   _nanfloat(sub["est_sidelap_pct"].max())],
             "sidelap_status_calculator": _worst(sub["sidelap_status_calc"]),
             "sidelap_status_fieldbook": _worst(sub["sidelap_status_fieldbook"]),
             "oversampling_status_fieldbook": _worst(
                 sub["oversampling_status_fieldbook"]),
+            "oversampling_pct_range": [
+                _nanfloat(sub["oversampling_actual_pct"].min()),
+                _nanfloat(sub["oversampling_actual_pct"].max())],
         }
     # ========== LiDAR (hyperspec line spacing/AGL; one flight pattern) =====
     lid = next((a for a in mission.get("acquisitions", [])
@@ -1588,6 +1734,23 @@ def add_spec_check(
         "note": "take-off/landing/stub captures (AGL below --rogue-agl-frac "
                 "x sensor median, or length below --rogue-len-frac x median); "
                 "excluded from line-spacing estimation and spec verdicts",
+    }
+    # ========== time to solar noon (fieldbook target, pass/fail) ==========
+    tn = thr_f.get("time_to_solar_noon_min")
+    live = ~df["rogue_line"]
+    if tn:
+        df.loc[live, "solar_noon_status"] = [
+            classify_low(v, tn["good_max"], tn["warn_min"],
+                         tn.get("fail_above"))
+            for v in df.loc[live, "time_to_solar_noon_min"].abs()]
+    noon = df.loc[live, "time_to_solar_noon_min"].abs()
+    report["solar_noon"] = {
+        "abs_time_to_solar_noon_min_range": [_nanfloat(noon.min()),
+                                             _nanfloat(noon.max())],
+        "status": _worst(df["solar_noon_status"]),
+        "note": ("gates the run status via the time_to_solar_noon check; "
+                 "excluded from the calculator/fieldbook verdicts"
+                 if tn else "time_to_solar_noon_min threshold missing"),
     }
     # ========== verdicts: worst line wins, configured frame status included ==
     calc_vals = (list(df["gsd_status"]) + list(df["frame_rate_status"])
@@ -2154,6 +2317,222 @@ def panel_presence(gpro: pathlib.Path) -> dict:
 
 
 # ==================================================================================
+def make_sun_geometry_plot(
+    df: pd.DataFrame,
+    out_dir: pathlib.Path,
+    spec: Optional[dict],
+) -> Optional[pathlib.Path]:
+    """Render the flight-axis vs solar-geometry polar figure.
+
+    Compass-style polar plot (north up, clockwise): one faint chord per
+    non-rogue flight line (headings folded mod 180), a heavy chord for
+    the circular-mean flight axis, the sun's azimuth trail on an outer
+    annulus (coloured by solar elevation) and the BRDF risk band - the
+    flight axes perpendicular to the sun (+- tolerance) swept over the
+    flight window, where the pushbroom swath lies in the solar principal
+    plane. The band renders red when the minimum solar elevation is
+    below the low-sun threshold, amber otherwise. Both tunables come
+    from the FlightCal spec ``thresholds.sun_geometry`` block.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Flight-line table after :func:`add_solar_geometry` (needs
+        heading_deg, solar_azimuth_deg, solar_elevation_deg,
+        time_to_solar_noon_min, sun_line_angle_deg, rogue_line, mid_utc).
+    out_dir : pathlib.Path
+        ``QC_data/QC01_FlightCheck`` output folder.
+    spec : dict or None
+        Parsed FlightCal spec; None falls back to the inline defaults
+        (25 deg heading tolerance, 30 deg low-sun elevation).
+
+    Returns
+    -------
+    Optional[pathlib.Path]
+        Path of the written PNG, or None when no usable lines exist.
+    """
+    thr = (spec or {}).get("thresholds", {}).get("sun_geometry") or {}
+    tol = float(thr.get("brdf_heading_tol_deg", 25.0))
+    low_elev = float(thr.get("low_sun_elevation_deg", 30.0))
+    sub = df.loc[~df["rogue_line"].astype(bool)].dropna(
+        subset=["heading_deg", "solar_azimuth_deg", "solar_elevation_deg"])
+    if sub.empty:
+        return None
+    sub = sub.sort_values("mid_utc")
+
+    fig = plt.figure(figsize=(7.5, 7))
+    ax = fig.add_subplot(projection="polar")
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)
+    ax.set_ylim(0, 1.18)
+    ax.set_yticklabels([])
+    ax.set_xticks(np.deg2rad(np.arange(0, 360, 45)))
+    ax.set_xticklabels(["N", "45\u00b0", "E", "135\u00b0", "S", "225\u00b0",
+                        "W", "315\u00b0"])
+    ax.grid(alpha=0.3)
+
+    # +++++ BRDF risk band: flight axes perpendicular to the sun +++++
+    start, end = _azimuth_arc(sub["solar_azimuth_deg"])
+    extent = (end - start) % 360.0
+    band = np.deg2rad(start + 90.0 - tol
+                      + np.linspace(0.0, extent + 2.0 * tol, 90))
+    min_elev = float(sub["solar_elevation_deg"].min())
+    band_col = "#d62728" if min_elev < low_elev else "#ff9800"
+    for off in (0.0, np.pi):  # flight axes are mod-180 symmetric
+        ax.fill_between(band + off, 0, 1.0, color=band_col, alpha=0.18,
+                        zorder=0)
+    ax.plot([], [], color=band_col, alpha=0.4, lw=8,
+            label=f"BRDF risk axis (sun \u00b190\u00b0, "
+                  f"tol \u00b1{tol:.0f}\u00b0)")
+
+    # +++++ per-line chords (mod 180) + mean flight axis +++++
+    for hdg in sub["heading_deg"]:
+        th = np.deg2rad(hdg)
+        ax.plot([th, th + np.pi], [0.85, 0.85], color="0.55", lw=0.8,
+                alpha=0.7, zorder=2)
+    ax.plot([], [], color="0.55", lw=0.8, label="flight lines")
+    h2 = np.deg2rad(sub["heading_deg"].to_numpy() * 2.0)
+    axis_deg = float(np.rad2deg(0.5 * np.arctan2(
+        np.nanmean(np.sin(h2)), np.nanmean(np.cos(h2)))) % 180.0)
+    th = np.deg2rad(axis_deg)
+    ax.plot([th, th + np.pi], [0.98, 0.98], color="k", lw=2.5, zorder=3,
+            label=(f"mean flight axis {axis_deg:.0f}\u00b0/"
+                   f"{axis_deg + 180.0:.0f}\u00b0"))
+
+    # +++++ sun azimuth trail on the outer annulus +++++
+    sc = ax.scatter(np.deg2rad(sub["solar_azimuth_deg"]),
+                    np.full(len(sub), 1.08),
+                    c=sub["solar_elevation_deg"],
+                    cmap=matplotlib.colors.ListedColormap(
+                        palettable.scientific.diverging.Vik_18.mpl_colors),  # pyright: ignore[reportAttributeAccessIssue]
+                    vmin=0, vmax=90, s=55, marker="o", edgecolors="k",
+                    linewidths=0.5, zorder=4)
+    first, last = sub.iloc[0], sub.iloc[-1]
+    if extent < 5.0:  # sun barely moved - one label instead of two
+        mid_az = (start + extent / 2.0) % 360.0
+        ax.annotate(f"\u2609 {first['solar_elevation_deg']:.0f}\u00b0\u2192"
+                    f"{last['solar_elevation_deg']:.0f}\u00b0",
+                    (np.deg2rad(mid_az), 1.08),
+                    textcoords="offset points", xytext=(16, 8), fontsize=9)
+    else:
+        for rec, lab in ((first, "start"), (last, "end")):
+            ax.annotate(f"{lab} \u2609 {rec['solar_elevation_deg']:.0f}\u00b0",
+                        (np.deg2rad(rec["solar_azimuth_deg"]), 1.08),
+                        textcoords="offset points", xytext=(16, 8),
+                        fontsize=8)
+    cbar = fig.colorbar(sc, ax=ax, shrink=0.55, pad=0.08)
+    cbar.set_label("solar elevation (deg)")
+
+    # +++++ summary text + legend +++++
+    worst = float(sub["sun_line_angle_deg"].apply(
+        lambda a: min(a % 180.0, 180.0 - a % 180.0)).max())
+    noon = sub["time_to_solar_noon_min"].abs()
+    fig.text(0.01, 0.01,
+             f"sun-line angle \u2264 {worst:.0f}\u00b0 "
+             f"(0\u00b0 = into sun, good)\n"
+             f"solar elevation {min_elev:.0f}\u2013"
+             f"{sub['solar_elevation_deg'].max():.0f}\u00b0 "
+             f"(low-sun threshold {low_elev:.0f}\u00b0)\n"
+             f"\u0394t to solar noon {noon.min():.0f}\u2013"
+             f"{noon.max():.0f} min",
+             fontsize=8, va="bottom")
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.06), ncol=3,
+              fontsize=8, frameon=False)
+    ax.set_title("Flight axis vs solar geometry", pad=22)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "QC01_sun_geometry.png"
+    fig.savefig(out_path.as_posix(), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+# ==================================================================================
+def make_agl_profile_plot(
+    df: pd.DataFrame,
+    gpro: pathlib.Path,
+    out_dir: pathlib.Path,
+) -> Optional[pathlib.Path]:
+    """Render along-line AGL profiles on a common ground axis.
+
+    One panel per sensor: per-vertex height above ground (epoch-KML
+    vertex height minus a DTM sample at that vertex, both in the
+    trajectory's vertical frame) against distance along the mean flight
+    axis. All lines are projected onto that axis, so reverse-flown lines
+    align spatially: terrain-driven wiggles line up vertically across
+    lines while platform-driven drift does not. Rogue lines are
+    excluded; the dashed line marks the panel median AGL.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Flight-line table carrying the ``_kml_coords`` object column
+        from :func:`extract_flight_lines`.
+    gpro : pathlib.Path
+        Path to the `.gpro` bundle (LiDAR DTM product).
+    out_dir : pathlib.Path
+        ``QC_data/QC01_FlightCheck`` output folder.
+
+    Returns
+    -------
+    Optional[pathlib.Path]
+        Path of the written PNG, or None when the DTM product or the
+        line geometry is missing (AGL underivable - no graw fallback).
+    """
+    dtms = sorted((gpro / "products").glob("*_DTM_*.tif"))
+    if not dtms or "_kml_coords" not in df.columns:
+        return None
+    sub = df.loc[~df["rogue_line"].astype(bool)]
+    sub = sub.loc[[c is not None for c in sub["_kml_coords"]]]
+    if sub.empty:
+        return None
+
+    sensors = list(dict.fromkeys(sub["sensor_id"]))
+    fig, axes = plt.subplots(len(sensors), 1,
+                             figsize=(8, 3.2 * len(sensors) + 0.8),
+                             sharex=True, sharey=True, squeeze=False)
+    with rasterio.open(dtms[0]) as src:
+        for ax, sid in zip(axes.ravel(), sensors):
+            rows = sub[sub["sensor_id"] == sid]
+            # +++++ common ground axis: circular-mean flight axis +++++
+            h2 = np.deg2rad(rows["heading_deg"].to_numpy() * 2.0)
+            axis_rad = 0.5 * np.arctan2(np.nanmean(np.sin(h2)),
+                                        np.nanmean(np.cos(h2)))
+            profiles = []
+            for _, r in rows.iterrows():
+                c = r["_kml_coords"]
+                xs, ys = rasterio.warp.transform(
+                    "EPSG:4326", src.crs,
+                    c[:, 0].tolist(), c[:, 1].tolist())
+                ground = np.array([v[0] for v in src.sample(zip(xs, ys))],
+                                  dtype=float)
+                if src.nodata is not None:
+                    ground[np.isclose(ground, src.nodata)] = np.nan
+                s = (np.asarray(xs) * np.sin(axis_rad)
+                     + np.asarray(ys) * np.cos(axis_rad))
+                profiles.append((int(r["line"]), s, c[:, 2] - ground))
+            s0 = min(p[1].min() for p in profiles)
+            cmap = plt.get_cmap("viridis", max(len(profiles), 2))
+            for k, (line, s, agl) in enumerate(profiles):
+                ax.plot(s - s0, agl, color=cmap(k), lw=1.1,
+                        label=f"line {line}")
+            med = np.nanmedian(np.concatenate([p[2] for p in profiles]))
+            ax.axhline(med, color="0.4", lw=0.8, ls="--")
+            ax.set_ylabel("AGL (m)")
+            ax.set_title(sid, fontsize=9)
+            ax.grid(alpha=0.3)
+            ax.legend(fontsize=7, ncol=4, frameon=False)
+    axes.ravel()[-1].set_xlabel("distance along mean flight axis (m)")
+    fig.suptitle("Along-line AGL profiles (common ground axis; "
+                 "dashed = median)", fontsize=11)
+    fig.tight_layout()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "QC01_agl_profiles.png"
+    fig.savefig(out_path.as_posix(), dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+# ==================================================================================
 def write_outputs(
     out_dir: pathlib.Path,
     gpro: pathlib.Path,
@@ -2205,7 +2584,8 @@ def write_outputs(
     """
     run_id = run_id or gpro.stem
     out_dir.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out_dir / "flight_lines.csv", index=False)
+    df.drop(columns=["_kml_coords"], errors="ignore").to_csv(
+        out_dir / "flight_lines.csv", index=False)
     # run-level aggregates exclude rogue take-off/landing lines
     good = df[~df["rogue_line"]] if df["rogue_line"].any() else df
     seg_frames = [s["segments"] for s in exposure["sensors"].values()
@@ -2506,5 +2886,6 @@ if __name__ == "__main__":
         help="Enable verbose output.",
     )
     args = parser.parse_args()
+    cf.check_environment(_git_root)
 
     main(args)

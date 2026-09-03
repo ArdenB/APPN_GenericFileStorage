@@ -41,7 +41,7 @@ are constant across runs so it is easy to check whether a flight has
 already been processed.
 
 Each run also gets the dual-file QC report contract
-(``QC_PIPELINE_PLAN.md`` §2): ``QC_data/QC00_GCPCheck_summary.yaml``
+(``README.md`` "Reporting contract"): ``QC_data/QC00_GCPCheck_summary.yaml``
 plus ``QC_data/QC00_GCPCheck/QC00_GCPCheck_detail.json`` grading one
 ``gcp_2d[_{product}]`` check (the QC00 gate) and
 ``height_bias``/``planar_bias`` warning checks per pair, with the
@@ -97,7 +97,7 @@ Command-line Arguments
 
 __title__ = "GCP check"
 __author__ = "Arden Burrell"
-__version__ = "v2.1(01.09.2026)"
+__version__ = "v2.3(03.09.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -116,6 +116,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+import matplotlib
+matplotlib.use("Agg")  # headless; avoids GUI-backend freetype clash (mpl #32208)
 import matplotlib.pyplot as plt
 import palettable
 import rasterio
@@ -447,15 +449,19 @@ def _process_pair(
         with report_path.open("r", encoding="utf-8") as fh:
             report = json.load(fh)
         cached_version = report.get("schema_version")
-        if cached_version == cfg.schema_version:
+        tool_version = report.get("tool", {}).get("version")
+        if (cached_version == cfg.schema_version
+                and qr.version_key(tool_version)
+                == qr.version_key(__version__)):
             report["cached"] = True
             if args.verbose:
                 print(f"  up to date, reusing {report_path.name}")
             return report
         if args.verbose:
             print(
-                f"  schema_version {cached_version!r} != {cfg.schema_version!r}, "
-                f"regenerating {report_path.name}"
+                f"  cached report stale (schema {cached_version!r} vs "
+                f"{cfg.schema_version!r}, script {tool_version!r} vs "
+                f"{__version__!r}), regenerating {report_path.name}"
             )
 
     gdf_a = gpd.read_file(file_a)
@@ -630,8 +636,10 @@ def write_contract_report(
     summary_path, detail_path = qr.report_paths(qc_data, "QC00_GCPCheck")
     pair_jsons = [pathlib.Path(script_dir / f"{_pair_stem(r)}_report.json")
                   for r in reports]
-    if not force and cf.outputs_up_to_date(
-            [summary_path, detail_path], pair_jsons):
+    if (not force and cf.outputs_up_to_date(
+            [summary_path, detail_path], pair_jsons)
+            and qr.report_is_current(
+                qc_data, "QC00_GCPCheck", __version__)[0]):
         return
 
     parsed = cf.parse_APPN_dataset_path(run_dir)
@@ -683,6 +691,7 @@ def write_contract_report(
     report["config"] = spec_snapshot or {"path": None, "sha256": None}
     report["artifacts"] = artifacts
     qr.write_report(qc_data, report)
+    qr.update_qc_report(qc_data, report)
     if verbose:
         print(f"  wrote contract report {summary_path.name} "
               f"({report['status']})")
@@ -1759,6 +1768,7 @@ if __name__ == "__main__":
         print(f"Error: search path is not a directory: {root}", file=sys.stderr)
         sys.exit(1)
 
+    cf.check_environment(_git_root)
     try:
         main(args, root)
     except (FileNotFoundError, ValueError) as exc:

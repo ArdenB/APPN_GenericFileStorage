@@ -1,4 +1,4 @@
-# QC00_GCPCheck thresholds (ex QAConfig hardcoded values — plan §5).
+# QC00_GCPCheck thresholds (ex QAConfig hardcoded values — retired plan §5).
 # Loaded by QC00_GCPCheck.py --spec; the (path, sha256) pair is embedded in
 # every contract detail JSON so verdicts are reproducible against this file.
 source: DS02 workshop defaults (ex QC00 QAConfig v1.03)

@@ -1,6 +1,7 @@
 """Shared QC/QA status vocabulary and worst-wins collapse.
 
-Implements section 3 of ``Code/DS02_DatasetQA/QC_PIPELINE_PLAN.md``:
+Implements the DS02 status vocabulary (``Code/DS02_DatasetQA/README.md``;
+design record: retired QC pipeline plan §3, git history):
 
 - Check level: ``good | acceptable | warning | fail | not_checked``
 - Script/run level: ``pass | warn | fail | not_evaluated``
@@ -114,14 +115,18 @@ def derive_status(checks: Mapping[str, Mapping[str, Any]]) -> str:
     """Derive a script-level status from a report's ``checks`` mapping.
 
     Checks flagged ``advisory: true`` are excluded from the collapse
-    (they are recorded but never gate the run status — see the plan's
-    Phase 3 homogeneity wire-in).
+    (they are recorded but never gate the run status — see the retired
+    plan's §7 Phase 3 homogeneity wire-in). A check carrying a
+    truthy ``waived`` reason (e.g. a declared flight deviation) keeps
+    its measured status but contributes at most ``warn`` — a waived
+    fail flags the run instead of failing it.
 
     Parameters
     ----------
     checks : mapping of str to mapping
         Check name to check object. Each check object must carry a
-        ``status`` key; an optional truthy ``advisory`` key excludes it.
+        ``status`` key; an optional truthy ``advisory`` key excludes it;
+        an optional truthy ``waived`` key caps its contribution at warn.
 
     Returns
     -------
@@ -135,6 +140,12 @@ def derive_status(checks: Mapping[str, Mapping[str, Any]]) -> str:
     ValueError
         If a status is not in either vocabulary.
     """
-    gating = [chk["status"] for chk in checks.values()
-              if not chk.get("advisory", False)]
+    gating = []
+    for chk in checks.values():
+        if chk.get("advisory", False):
+            continue
+        status = chk["status"]
+        if chk.get("waived") and collapse(status) == "fail":
+            status = "warning"
+        gating.append(status)
     return worst(gating)

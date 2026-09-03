@@ -153,3 +153,91 @@ def test_flag_rogue_lines(qc01):
     df2 = pd.DataFrame({"sensor_id": ["s"], "line": [0], "agl_m": [11.0],
                         "line_length_m": [2.0]})
     assert not qc01.flag_rogue_lines(df2, frac=0, len_frac=0)["rogue_line"].any()
+
+
+# ==================================================================================
+def test_annotate_flight_deviations(qc01):
+    """Declared deviations note covered checks and waive covered fails."""
+    report = {"checks": {
+        "time_to_solar_noon": {"status": "fail",
+                               "note": "APPN solar-window compliance"},
+        "sidelap_vnir_fieldbook": {"status": "fail"},   # not covered
+        "gsd_vnir": {"status": "good"},
+    }}
+    qc01.annotate_flight_deviations(report, ["solar_window"])
+    noon = report["checks"]["time_to_solar_noon"]
+    assert noon["status"] == "fail"                  # measured status kept
+    assert "declared flight deviation: solar_window" in noon["waived"]
+    assert "APPN solar-window compliance" in noon["note"]  # note preserved
+    # an uncovered fail is never waived; a good check is never touched
+    assert "waived" not in report["checks"]["sidelap_vnir_fieldbook"]
+    assert "note" not in report["checks"]["gsd_vnir"]
+    assert report["flight_deviations"] == ["solar_window"]
+
+    # covered but passing: note added, no waiver
+    report2 = {"checks": {"time_to_solar_noon": {"status": "good"}}}
+    qc01.annotate_flight_deviations(report2, ["solar_window"])
+    assert "waived" not in report2["checks"]["time_to_solar_noon"]
+    assert "declared" in report2["checks"]["time_to_solar_noon"]["note"]
+
+    # empty list still records the (empty) axis in the detail JSON
+    report3 = {"checks": {"gsd_vnir": {"status": "good"}}}
+    qc01.annotate_flight_deviations(report3, [])
+    assert report3["flight_deviations"] == []
+    assert "note" not in report3["checks"]["gsd_vnir"]
+
+
+# ==================================================================================
+def test_solar_noon_pass_fail_at_120(qc01, cal_spec):
+    """APPN solar-window compliance: <=120 min good, >120 fail, no bands."""
+    tn = cal_spec["thresholds"]["fieldbook"]["time_to_solar_noon_min"]
+
+    def cls(v):
+        return qc01.classify_low(v, tn["good_max"], tn["warn_min"],
+                                 tn.get("fail_above"))
+
+    assert cls(0.0) == "good"
+    assert cls(120.0) == "good"
+    assert cls(120.1) == "fail"
+    assert cls(165.5) == "fail"          # GOBI 20260805 run_01 range
+    assert cls(float("nan")) == "not_checked"
+
+
+# ==================================================================================
+def test_add_appn_compliance_check(qc01):
+    """Hard spec bool: measured only, spec-family only, never waived."""
+    # a waived noon fail must still read non-compliant
+    report = {"checks": {
+        "gsd_vnir": {"status": "good"},
+        "time_to_solar_noon": {"status": "fail",
+                               "waived": "declared flight deviation"},
+        "graw_present": {"status": "warning"},   # integrity: excluded
+    }}
+    qc01.add_appn_compliance_check(report)
+    chk = report["checks"]["appn_compliant"]
+    assert chk["status"] == "fail"
+    assert chk["value"] is False
+    assert chk["advisory"] is True
+    assert "waived" not in chk
+
+    # all spec checks good/acceptable -> compliant
+    report2 = {"checks": {
+        "gsd_vnir": {"status": "good"},
+        "sidelap_lidar": {"status": "acceptable"},
+        "reflectance_product_vnir": {"status": "fail"},  # integrity: excluded
+    }}
+    qc01.add_appn_compliance_check(report2)
+    assert report2["checks"]["appn_compliant"]["value"] is True
+    assert report2["checks"]["appn_compliant"]["status"] == "good"
+
+    # a spec warning (missed fieldbook target) is non-compliant
+    report3 = {"checks": {"sidelap_vnir_fieldbook": {"status": "warning"}}}
+    qc01.add_appn_compliance_check(report3)
+    assert report3["checks"]["appn_compliant"]["value"] is False
+
+    # nothing evaluated -> not_checked, no bool claimed
+    report4 = {"checks": {"flightcal_spec": {"status": "not_checked"},
+                          "graw_present": {"status": "good"}}}
+    qc01.add_appn_compliance_check(report4)
+    assert report4["checks"]["appn_compliant"]["status"] == "not_checked"
+    assert "value" not in report4["checks"]["appn_compliant"]

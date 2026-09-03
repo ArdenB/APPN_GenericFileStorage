@@ -1,7 +1,7 @@
 """QC report reader, tolerant of legacy filenames and schemas.
 
-Implements the reader half of section 6 of
-``Code/DS02_DatasetQA/QC_PIPELINE_PLAN.md``: pre-migration JSON reports in
+Implements the reader half of the shared-helper design (retired QC
+pipeline plan §6, in this repo's git history): pre-migration JSON reports in
 existing ``QC_data/`` folders (``QC_GCP*distances*_report.json``,
 ``QC_spectra_report.json`` — ``status.result`` schema) remain readable next
 to contract ``<script>/<script>_detail.json`` reports, and legacy files are
@@ -10,11 +10,17 @@ into their script's subfolder (section 4 transition rule).
 
 Every read normalises to one shape: the raw report plus a script-level
 ``status`` in the shared vocabulary (``pass | warn | fail | not_evaluated``).
+
+Also home to version-aware cache invalidation (:func:`report_is_current`):
+the detail JSON records the producing script's version, so a numeric
+version bump automatically marks the run's report stale — the scripts
+re-do exactly the runs written by older versions, no ``--force`` needed.
 """
 
 import json
 import pathlib
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 from Code.functions.qc_report.status import script_levels
 from Code.functions.qc_report.report import report_paths
@@ -99,6 +105,79 @@ def read_report(
         "schema_version": report.get("schema_version"),
         "report": report,
     }
+
+
+# ==================================================================================
+def version_key(version: Any) -> Optional[Tuple[int, int]]:
+    """Extract the numeric ``(major, minor)`` from a script version string.
+
+    DS02 versions look like ``"v2.2(03.09.2026)"``; only the numeric part
+    identifies an output-affecting change — the date suffix is free to
+    move on doc-only touches without invalidating cached reports.
+
+    Parameters
+    ----------
+    version : Any
+        Version string (or None/unexpected type).
+
+    Returns
+    -------
+    tuple of (int, int) or None
+        ``(major, minor)``, or None when nothing parseable is found.
+    """
+    match = re.search(r"v?(\d+)\.(\d+)", str(version or ""))
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+# ==================================================================================
+def report_is_current(
+        qc_data_dir: pathlib.Path,
+        script_name: str,
+        current_version: str,
+        scope: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str]]:
+    """Check whether a run's contract report was written by the current
+    script version.
+
+    Complements the mtime-based ``outputs_up_to_date`` caching: inputs
+    unchanged but script numerically newer ⇒ the report is stale and the
+    run should be re-done (no ``--force`` needed). Compared via
+    :func:`version_key`, so date-only version-string changes do not
+    invalidate.
+
+    Parameters
+    ----------
+    qc_data_dir : pathlib.Path
+        The run's ``T1_proc/QC_data/`` folder (or routed ``QAReports/``).
+    script_name : str
+        Contract script name, e.g. ``"QC01_FlightCheck"``.
+    current_version : str
+        The running script's ``__version__``.
+    scope : str, optional
+        Scope label for cross-run (QA) reports (see ``report_paths``).
+
+    Returns
+    -------
+    tuple of (bool, str or None)
+        ``(True, None)`` when the recorded version matches, else
+        ``(False, reason)``.
+    """
+    _, detail_path = report_paths(
+        pathlib.Path(qc_data_dir), script_name, scope=scope)
+    if not detail_path.is_file():
+        return False, "no contract report"
+    try:
+        report = _load_json(detail_path)
+    except (OSError, json.JSONDecodeError) as err:
+        return False, f"unreadable contract report ({err})"
+    recorded = report.get("script", {}).get("version")
+    if version_key(recorded) is None:
+        return False, (f"no parseable script version in "
+                       f"{detail_path.name} ({recorded!r})")
+    if version_key(recorded) != version_key(current_version):
+        return False, (f"report written by {recorded}, "
+                       f"current script is {current_version}")
+    return True, None
 
 
 # ==================================================================================

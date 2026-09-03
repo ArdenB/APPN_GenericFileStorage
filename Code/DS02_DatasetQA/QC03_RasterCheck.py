@@ -4,7 +4,8 @@ Crawls the APPN dataset tree for processed runs (``<run>/T1_proc/*.gpro``)
 and scans the **ortho reflectance products only** (VNIR + SWIR ENVI
 ``.bin``/``.hdr`` pairs under ``gpro/products/``) — radiance and
 intermediates are out of scope. Values are reflectance x 10^4, so the
-physical range is 0-10000 (``QC_PIPELINE_PLAN.md`` §5c).
+physical range is 0-10000 (design record: the retired QC pipeline plan
+§5c, in this repo's git history).
 
 Check set (per product, per band + whole-cube):
 
@@ -91,7 +92,7 @@ Command-line Arguments
 
 __title__ = "Raster check"
 __author__ = "Arden Burrell"
-__version__ = "v1.4(01.09.2026)"
+__version__ = "v1.6(03.09.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -319,8 +320,13 @@ def process_run(
         inputs.append(pathlib.Path(spec_snapshot["path"]))
     if not args.force and cf.outputs_up_to_date(
             [summary_path, detail_path], inputs):
-        row.update({"status": "cached", "reason": "outputs up to date"})
-        return row
+        version_ok, version_reason = qr.report_is_current(
+            qc_data, "QC03_RasterCheck", __version__)
+        if version_ok:
+            row.update({"status": "cached", "reason": "outputs up to date"})
+            return row
+        if args.verbose:
+            tqdm.write(f"{run_dir}: {version_reason}; re-running")
 
     # ========== Scan each product + assemble the contract report ==========
     run_meta = {key: parsed.get(key)
@@ -347,6 +353,7 @@ def process_run(
                          tz="UTC").isoformat()}
         for p in products}
     qr.write_report(qc_data, report)
+    qr.update_qc_report(qc_data, report)
     row.update({"status": report["status"], "reason": None})
     if args.verbose:
         tqdm.write(f"{run_dir}: {report['status']}")
@@ -1635,5 +1642,6 @@ if __name__ == "__main__":
                         action="store_true",
                         help="Enable verbose output.")
     args = parser.parse_args()
+    cf.check_environment(_git_root)
 
     main(args)

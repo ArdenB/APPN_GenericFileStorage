@@ -41,22 +41,20 @@ cd <repository-name>
 
 ### 2. Create the builder environment
 
-The folder builder requires only Python, NumPy, pandas, PyYAML, GitPython, and
-Git:
+The repo-tracked [environment.yml](environment.yml) is the single source of
+truth for dependencies (folder builder + all QC/extraction pipelines) — do not
+install packages manually:
 
 ```bash
-conda create -n datastorage -c conda-forge \
-      python=3.12 numpy pandas pyyaml gitpython git
+conda env create -f environment.yml
 conda activate datastorage
 ```
 
-The processing and analysis scripts require additional geospatial and
-scientific packages. Install those when you need to run a pipeline:
+After pulling repo updates, re-sync the environment (`--prune` removes
+packages no longer in the file, e.g. manual one-off installs):
 
 ```bash
-conda install -n datastorage -c conda-forge \
-      geopandas rioxarray rasterio pyarrow laspy lazrs-python tqdm \
-      matplotlib seaborn spyndex
+conda env update -n datastorage -f environment.yml --prune
 ```
 
 ### 3. Configure the node

@@ -15,7 +15,8 @@ import numpy as np
 import pandas as pd
 
 # +++++ Palette tiers live in core_functions; re-exported for back-compat +++++
-from ..core_functions.run_palette import run_sort_key, resolve_run_palette
+from ..core_functions.run_palette import (run_sort_key, resolve_run_palette,
+                                          resolve_node_run_palette)
 from .panel_library import (panels_root, node_library_dir, gpro_panel_set,
                             resolve_panel_set, load_panel_dhr)
 from .dhr_drift import within_day_drift

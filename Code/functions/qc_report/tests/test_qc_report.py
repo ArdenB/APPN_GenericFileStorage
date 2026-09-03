@@ -75,6 +75,29 @@ def test_derive_status_all_advisory_is_not_evaluated():
     assert qr.derive_status(checks) == "not_evaluated"
 
 
+def test_derive_status_waived_fail_caps_at_warn():
+    checks = {
+        "gate": {"status": "good"},
+        "time_to_solar_noon": {
+            "status": "fail",
+            "waived": "declared flight deviation: solar_window"},
+    }
+    assert qr.derive_status(checks) == "warn"
+
+
+def test_derive_status_unwaived_fail_still_fails():
+    checks = {
+        "waived_ok": {"status": "fail", "waived": "declared"},
+        "broken": {"status": "fail"},
+    }
+    assert qr.derive_status(checks) == "fail"
+
+
+def test_derive_status_falsy_waived_ignored():
+    checks = {"noon": {"status": "fail", "waived": ""}}
+    assert qr.derive_status(checks) == "fail"
+
+
 # ===========================================================================
 # 2.  Report build + write + summary projection
 # ===========================================================================
@@ -105,6 +128,18 @@ def test_add_check_rejects_script_level_status():
     report = _example_report()
     with pytest.raises(ValueError, match="not in"):
         qr.add_check(report, "bad", "pass")
+
+
+def test_waived_check_round_trips_to_summary(tmp_path):
+    report = _example_report()
+    qr.add_check(report, "time_to_solar_noon", "fail", value="150-160 min",
+                 waived="declared flight deviation: solar_window")
+    summary_path, _ = qr.write_report(tmp_path, report)
+    summary = yaml.safe_load(summary_path.read_text(encoding="utf-8"))
+    noon = summary["checks"]["time_to_solar_noon"]
+    assert noon["status"] == "fail"                 # measured status kept
+    assert noon["waived"].startswith("declared")
+    assert summary["status"] == "warn"              # waived fail = warn
 
 
 def test_write_report_layout_and_derived_status(tmp_path):
@@ -313,3 +348,54 @@ def test_default_thresholds_dir_points_into_repo():
     folder = qr.default_thresholds_dir()
     assert folder.parts[-2:] == ("reference", "thresholds")
     assert pathlib.Path(_REPO_ROOT) in folder.parents
+
+
+# ===========================================================================
+# 5.  Version-aware cache invalidation
+# ===========================================================================
+@pytest.mark.parametrize("version, key", [
+    ("v2.2(03.09.2026)", (2, 2)),
+    ("v10.0(01.01.2026)", (10, 0)),
+    ("3.14", (3, 14)),
+    ("no digits here", None),
+    (None, None),
+])
+def test_version_key(version, key):
+    assert qr.version_key(version) == key
+
+
+def _write_versioned_report(tmp_path, version):
+    report = qr.new_report("QC01_FlightCheck", version)
+    qr.add_check(report, "graw_present", "good")
+    qr.write_report(tmp_path, report)
+
+
+def test_report_is_current_matches_numeric_version(tmp_path):
+    _write_versioned_report(tmp_path, "v2.3(03.09.2026)")
+    # same numbers, different date -> still current (doc-only touch)
+    current, reason = qr.report_is_current(
+        tmp_path, "QC01_FlightCheck", "v2.3(31.12.2026)")
+    assert current and reason is None
+
+
+def test_report_is_current_stale_on_version_bump(tmp_path):
+    _write_versioned_report(tmp_path, "v2.2(03.09.2026)")
+    current, reason = qr.report_is_current(
+        tmp_path, "QC01_FlightCheck", "v2.3(03.09.2026)")
+    assert not current
+    assert "written by v2.2(03.09.2026)" in reason
+
+
+def test_report_is_current_missing_report(tmp_path):
+    current, reason = qr.report_is_current(
+        tmp_path, "QC01_FlightCheck", "v2.3(03.09.2026)")
+    assert not current
+    assert reason == "no contract report"
+
+
+def test_report_is_current_unparseable_recorded_version(tmp_path):
+    _write_versioned_report(tmp_path, "dev-build")
+    current, reason = qr.report_is_current(
+        tmp_path, "QC01_FlightCheck", "v2.3(03.09.2026)")
+    assert not current
+    assert "no parseable script version" in reason

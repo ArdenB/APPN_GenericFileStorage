@@ -1,20 +1,23 @@
-# QC02_SpectralCheck DHR-comparison limits (plan §5, DT01 empirical anchors).
+# QC02_SpectralCheck DHR-comparison limits (retired plan §5, DT01 empirical anchors).
 # ADVISORY: these grade `warning` on the advisory dhr_bias checks but the
 # QC02 run status stays not_evaluated until the ET00/ET03 equivalence test
-# and its reference set land. Bias = mean(observed_median − expected_DHR)
-# in reflectance %, bad bands masked before the roll-up.
+# and its reference set land. Bias = mean(observed_median − expected_DHR),
+# both in reflectance %, so the bias is in reflectance percentage points
+# (pp); bad bands masked before the roll-up. Units convention: reflectance
+# levels report as %, reflectance differences as pp (the delta_stats
+# *_pct JSON keys keep their names for schema stability).
 # Anchors (DT01, 60+ tables, correct set pinned): VNIR |bias| reached
-# ±0.6 % on the CaliWeek reference days → ~1.5–2 % is a realistic limit;
-# SWIR masked biases were mostly ±2 %.
+# ±0.6 pp on the CaliWeek reference days → ~1.5–2 pp is a realistic limit;
+# SWIR masked biases were mostly ±2 pp.
 source: DT01_GryfnPanelComparison empirical anchors (APEx_Analysis, 2026-08)
 
-bias_abs_pct:
+bias_abs_pp:
   VNIR: {warn_above: 2.0}
   SWIR: {warn_above: 2.0}
 
 # Within-day drift of the full-region DHR bias across runs (QA02,
 # advisory). Anchors: the CaliWeek reference days held VNIR |bias|
-# within ±0.6 % (≈1.2 pp day-to-day spread); the Narrabri 20260805
+# within ±0.6 pp (≈1.2 pp day-to-day spread); the Narrabri 20260805
 # failure walked panel 82 monotonically by 22 pp over runs 01→09
 # (brightness-dependent). Uncalibrated between those extremes — revisit
 # once QA02 has accumulated background rates.
@@ -22,8 +25,9 @@ within_day_drift:
   min_runs: 3
   range_warn_above_pp: 3.0
 
-# QC02 panel-homogeneity thresholds (QC_PIPELINE_PLAN.md §5/§7 Phase 3;
-# calibrated 25.08.2026 over all 119 extracted spectra tables on the node
+# QC02 panel-homogeneity thresholds (retired plan §5/§7;
+# calibrated 25.08.2026 over all 119
+# extracted spectra tables on the node
 # store = 448 panel instances; clean reference population =
 # 2026_APExCaliWeek, 160 panel instances per EM region). A band flags when
 # |skew|, l_kurt (low tail) or |mean-median| crosses its limit; the panel

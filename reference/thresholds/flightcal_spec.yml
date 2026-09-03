@@ -65,3 +65,13 @@ thresholds:
       VNIR: {good_min: 40.0, accept_min: 37.0, fail_below: 0.0}
       SWIR: {good_min: 30.0, accept_min: 30.0, fail_below: 0.0}
     oversampling_pct: {good_min: 30.0, accept_min: 20.0, fail_below: 0.0}
+    # fieldbook: fly within +-120 min of solar noon (abs minutes, lower is
+    # better; no intermediate band). Pass/fail in QC01 - a fail is waivable
+    # by a declared solar_window flight deviation (run_XX_Issues.yaml),
+    # which caps its run-status contribution at warn
+    time_to_solar_noon_min: {good_max: 120.0, warn_min: 120.0, fail_above: 120.0}
+  sun_geometry:          # QC01 sun-geometry figure (BRDF risk shading)
+    # risk-wedge half-width: flight axes within tol of (solar azimuth +- 90)
+    brdf_heading_tol_deg: 25.0
+    # wedge renders red (vs amber) when min solar elevation is below this
+    low_sun_elevation_deg: 30.0

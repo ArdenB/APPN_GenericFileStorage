@@ -1,4 +1,4 @@
-# QC03_RasterCheck advisory thresholds (plan §5/§5c).
+# QC03_RasterCheck advisory thresholds (retired plan §5/§5c).
 # NO empirical anchors yet: these are uncalibrated advisory defaults.
 # They are calibrated from the background rates QC03 itself accumulates
 # (via the reserved QA03_RasterComparison) before QC03 ever gates

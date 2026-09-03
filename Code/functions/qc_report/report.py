@@ -1,6 +1,7 @@
 """JSON-first QC report writer and YAML-summary projector.
 
-Implements section 2 of ``Code/DS02_DatasetQA/QC_PIPELINE_PLAN.md``: every
+Implements the DS02 reporting contract (``Code/DS02_DatasetQA/README.md``;
+design record: retired QC pipeline plan §2, git history): every
 DS02 script writes a dual-file report per invocation —
 
 - ``<script>_detail.json`` — everything (full check objects, per-item data,
@@ -98,6 +99,7 @@ def add_check(
         value: Any = None,
         note: Optional[str] = None,
         advisory: bool = False,
+        waived: Optional[str] = None,
         **extra: Any,
     ) -> Dict[str, Any]:
     """Add a check object to a report's ``checks`` mapping.
@@ -118,6 +120,10 @@ def add_check(
     advisory : bool, optional
         When True the check is recorded but excluded from the worst-wins
         run status. Default False.
+    waived : str, optional
+        Waiver reason (e.g. a declared flight deviation). The measured
+        status is kept but a waived fail contributes at most ``warn``
+        to the run status.
     **extra : Any
         Detail-only fields (``threshold``, ``units``, ``evidence``, ...).
 
@@ -141,6 +147,8 @@ def add_check(
         check["note"] = note
     if advisory:
         check["advisory"] = True
+    if waived:
+        check["waived"] = waived
     check.update(extra)
     report["checks"][name] = check
     return check
@@ -207,6 +215,8 @@ def summarize(report: Dict[str, Any]) -> Dict[str, Any]:
                 line[key] = check[key]
         if check.get("advisory", False):
             line["advisory"] = True
+        if check.get("waived"):
+            line["waived"] = check["waived"]
         checks_summary[name] = line
     summary = {
         "schema_version": report["schema_version"],

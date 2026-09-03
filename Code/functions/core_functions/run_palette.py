@@ -63,3 +63,51 @@ def resolve_run_palette(labels: List[str]) -> Dict[str, Any]:
         colours = list(itertools.islice(
             itertools.cycle(colorcet.glasbey_dark), n))
     return dict(zip(ordered, colours))
+
+
+# ==================================================================================
+def resolve_node_run_palette(
+        node_by_label: Dict[str, str],
+        max_family_runs: int = 6,
+    ) -> Dict[str, Any]:
+    """Adaptive run palette: node colour families on multi-node scopes.
+
+    Single-node scopes (and scopes the family scheme cannot resolve)
+    fall through to :func:`resolve_run_palette` unchanged. Multi-node
+    scopes with at most *max_family_runs* runs per node and at most six
+    nodes assign each node a sequential-colormap family (blues,
+    oranges, ...) with one shade per run, so node membership is
+    readable off the lines themselves. Beyond those limits shades stop
+    resolving, so the qualitative tiers take over again.
+
+    Parameters
+    ----------
+    node_by_label : dict of str to str
+        ``{run label: node}`` for every label appearing in the figures.
+    max_family_runs : int, optional
+        Most runs a node may hold before the family scheme is
+        abandoned. Default 6.
+
+    Returns
+    -------
+    dict of str to colour
+        Mapping usable as the seaborn ``palette=`` argument, ordered
+        node-by-node then by :func:`run_sort_key`.
+    """
+    families = ["Blues", "Oranges", "Greens", "Purples", "Reds", "Greys"]
+    nodes = sorted({str(v) for v in node_by_label.values()})
+    by_node = {node: sorted((str(l) for l, v in node_by_label.items()
+                             if str(v) == node), key=run_sort_key)
+               for node in nodes}
+    if (len(nodes) <= 1 or len(nodes) > len(families)
+            or max(len(v) for v in by_node.values()) > max_family_runs):
+        return resolve_run_palette(list(node_by_label))
+    import numpy as np
+    from matplotlib import pyplot as plt
+    palette: Dict[str, Any] = {}
+    for fam, node in zip(families, nodes):
+        cmap = plt.get_cmap(fam)
+        shades = np.linspace(0.9, 0.45, max(len(by_node[node]), 2))
+        for label, v in zip(by_node[node], shades):
+            palette[label] = cmap(float(v))
+    return palette
