@@ -1233,9 +1233,10 @@ def _make_comparison_figure(
         Column mapped to line style (``"sensor"`` when platforms are
         pooled). Default None.
     node_by_label : dict of str to str, optional
-        ``{run_label: node}``; multi-node maps (without a style
-        dimension) switch the legend to node-grouped sections. Default
-        None (flat legend).
+        ``{run_label: node}``; multi-node maps switch the legend to
+        node-grouped sections (pooled-platform figures keep their
+        sensor/linestyle key as an extra section). Default None
+        (flat legend).
     copy_dir : pathlib.Path, optional
         Extra directory to also save the figure into (--save-dir
         container). Default None.
@@ -1264,8 +1265,9 @@ def _make_comparison_figure(
     multi_node = (node_by_label is not None
                   and len(set(node_by_label.values())) > 1)
     if g.legend is not None:
-        if multi_node and style_col is None:
-            _grouped_run_legend(g, hue_order, node_by_label, palette)
+        if multi_node:
+            _grouped_run_legend(g, hue_order, node_by_label, palette,
+                                style_col=style_col)
         else:
             g.legend.set_frame_on(False)
             if style_col is None:
@@ -1322,13 +1324,16 @@ def _grouped_run_legend(
         hue_order: List[str],
         node_by_label: Dict[str, str],
         palette: Dict[str, Any],
+        style_col: Optional[str] = None,
     ) -> None:
     """Replace the flat FacetGrid legend with node-grouped sections.
 
     Bold node-name header rows with that node's runs indented beneath,
-    each entry stripped of its now-redundant node-code prefix. Only
-    used on multi-node scopes without a style dimension (rebuilding
-    would drop seaborn's style entries).
+    each entry stripped of its now-redundant node-code prefix. On
+    pooled-platform figures (*style_col* set) seaborn's style entries
+    (the sensor <-> linestyle key) are carried over from the flat
+    legend into a final bold-headed section, so rebuilding the legend
+    does not drop them.
 
     Parameters
     ----------
@@ -1341,6 +1346,9 @@ def _grouped_run_legend(
         ``{run_label: node}`` map.
     palette : dict
         Shared ``{run_label: colour}`` map.
+    style_col : str, optional
+        Style column of the plot (``"sensor"`` when platforms are
+        pooled); its legend entries are preserved. Default None.
 
     Returns
     -------
@@ -1362,6 +1370,17 @@ def _grouped_run_legend(
             handles.append(Line2D([], [], color=palette[lab], lw=1.6))
             labels.append("  " + (lab[len(prefix):]
                                   if lab.startswith(prefix) else lab))
+    # +++++ Carry over seaborn's style (sensor <-> linestyle) key +++++
+    old_labels = [t.get_text() for t in g.legend.texts]
+    if style_col is not None and style_col in old_labels:
+        start = old_labels.index(style_col) + 1
+        header_idx.append(len(labels))
+        handles.append(Line2D([], [], color="none"))
+        labels.append(style_col.capitalize())
+        for hdl, lab in zip(g.legend.legend_handles[start:],
+                            old_labels[start:]):
+            handles.append(hdl)
+            labels.append("  " + lab)
     g.legend.remove()
     # reclaim the space seaborn reserved for its (wider) flat legend;
     # g.tight_layout() would keep excluding the old legend rect
