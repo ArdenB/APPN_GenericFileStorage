@@ -16,7 +16,9 @@ outputs -- there is exactly one implementation of every writer. Existing
 metadata files are merged append-only and never overwritten; tree/metadata
 disagreements become report findings.
 
-See ``DM01_ADOPTER_PLAN.md`` (this folder) for the full design.
+See the retired ``DM01_ADOPTER_PLAN.md`` (this repo's git history) for the
+full design; the user workflow is documented in the root README
+("Adopting an Existing Data Store").
 
 Command-line Arguments
 ----------------------
@@ -1027,6 +1029,7 @@ if __name__ == "__main__":
                         default="./NodeSummary.yaml",
                         help="The node yaml file with the sensors.")
     cli_args = parser.parse_args()
+    cf.check_environment(_git_root)
 
     result = main(cli_args)
     if not result.empty and (result["severity"] == "fail").any():

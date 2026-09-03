@@ -1,4 +1,5 @@
-"""Tests for DM01_StructureAdopter (see DM01_ADOPTER_PLAN.md §9).
+"""Tests for DM01_StructureAdopter (test plan: retired DM01_ADOPTER_PLAN.md
+§9, in this repo's git history).
 
 Synthetic ``tmp_path`` trees only -- machine-independent, same pattern as
 the parse_APPN_dataset_path tests.
