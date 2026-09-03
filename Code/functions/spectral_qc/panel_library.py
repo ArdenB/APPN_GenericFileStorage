@@ -1,8 +1,8 @@
 """Panel DHR reference library access + physical-set identification (§5b).
 
 Resolves the manufacturer DHR curves in ``reference/panels/<NODE>/`` for
-the QC02 observed-vs-expected comparison, implementing the
-``QC_PIPELINE_PLAN.md`` §5b rules:
+the QC02 observed-vs-expected comparison, implementing the §5b rules
+(design record: retired QC pipeline plan, git history):
 
 1. The gpro pipeline YAML is the primary pin for ELM tables — nominal
    ``Panel_ref`` signatures cannot identify hardware (24005 and 25005
@@ -89,7 +89,8 @@ def gpro_panel_set(t1_proc: pathlib.Path) -> Tuple[Optional[str], List[str]]:
     """Read the panel-set serial prefix ELM actually used from the gpro.
 
     Scans ``<T1_proc>/*.gpro/pipelines/*.yml`` for panel target-file
-    references (``.../UF200-24005-11.json``) and extracts the set prefix
+    references (``.../UF200-24005-11.json``, including suffixed variants
+    like ``UF200-25005-11_new.json``) and extracts the set prefix
     (``UF200-24005``).
 
     Parameters
@@ -108,7 +109,7 @@ def gpro_panel_set(t1_proc: pathlib.Path) -> Tuple[Optional[str], List[str]]:
     prefixes: Set[str] = set()
     for pipe in sorted(t1_proc.glob("*.gpro/pipelines/*.yml")):
         text = pipe.read_text(encoding="utf-8", errors="replace")
-        for m in re.finditer(r"([A-Z]+\d*-\d+)-\d+\.json", text):
+        for m in re.finditer(r"([A-Z]+\d*-\d+)-\d+[\w ]*\.json", text):
             prefixes.add(m.group(1))
     found = sorted(prefixes)
     return (found[0] if len(found) == 1 else None), found
