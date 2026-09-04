@@ -33,7 +33,7 @@ re-adds) and let QC01 annotate/waive the covered checks.
 
 import json
 import pathlib
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 import warnings as warn
 
 import pandas as pd
@@ -48,7 +48,11 @@ __all__ = [
     "load_issue_yaml",
     "flight_deviation_vocab",
     "run_flight_deviations",
+    "finding_states",
+    "ensure_finding_tickets",
     "classify_run",
+    "RunDecision",
+    "run_decision",
     "run_exclusion",
     "load_sensor_pipeline",
     "render_issue_template",
@@ -369,11 +373,317 @@ def run_flight_deviations(date_dir: pathlib.Path,
 
 
 # ==================================================================================
-def classify_run(date_dir: pathlib.Path, run_name: str) -> Tuple[str, str]:
-    """Classify one run's severity from its RunOverview flags + tickets.
+def finding_states() -> Dict[str, Tuple[str, ...]]:
+    """State vocabulary for machine-authored ``qc_findings`` entries.
 
-    The severity ladder (worst-wins) drives the QA scripts'
-    ``--include-runs`` filtering; per-run QC scripts ignore it.
+    Deliberately split from the payload-ticket vocabulary (QC findings
+    plan, development-master repo): a finding can never be ``ok`` — the
+    measurement happened, so there is no false-alarm closure (a
+    miscalibrated threshold is fixed in the spec yml, and the
+    config-sha/version re-run closes the finding) — and ``fixed`` can
+    never be hand-set: it is written only by a QC re-run that measures
+    every member check good/acceptable.
+
+    Returns
+    -------
+    dict of str -> tuple of str
+        ``open`` (machine-created ``TODO``, human ``wip``),
+        ``human_closures`` (``accepted`` — note required — ``caution``,
+        ``failed``) and ``machine_closures`` (``fixed``).
+    """
+    return {
+        "open": ("TODO", "wip"),
+        "human_closures": ("accepted", "caution", "failed"),
+        "machine_closures": ("fixed",),
+    }
+
+
+# ==================================================================================
+def _live_findings(yaml_data: Dict[str, Any],
+                   ) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """Resolve the live ``qc_findings`` entry per ``(script, finding)``.
+
+    Entries are append-only history; the *last* entry per identity is
+    the live one (a fixed-then-refailed finding gets a fresh appended
+    entry, so later always supersedes earlier).
+
+    Parameters
+    ----------
+    yaml_data : dict
+        Parsed issue-YAML mapping.
+
+    Returns
+    -------
+    dict
+        ``(script, finding) -> entry`` for the live entries. Non-mapping
+        list items are ignored.
+    """
+    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    entries = yaml_data.get("qc_findings")
+    if not isinstance(entries, (list, tuple, CommentedSeq)):
+        return out
+    for entry in entries:
+        if not isinstance(entry, (dict, CommentedMap)):
+            continue
+        out[(str(entry.get("script")), str(entry.get("finding")))] = entry
+    return out
+
+
+# ==================================================================================
+def ensure_finding_tickets(date_dir: pathlib.Path, run_name: str,
+                           report: Dict[str, Any],
+                           groups: Optional[Dict[str, List[str]]] = None,
+                           write: bool = True) -> List[str]:
+    """Author/refresh/auto-close machine finding-tickets from a QC report.
+
+    The QC-fail -> ticket bridge (QC findings plan, development-master
+    repo). Call **before** ``qr.write_report`` — Issues.yaml is a QC01
+    mtime-cache input, so patching it after the report write would make
+    every report stale-by-construction. Idempotent: an unchanged file is
+    never rewritten. Failures here must never gate the QC script — the
+    caller wraps in nothing; this function only warns and returns.
+
+    Per report, three passes over the calling script's own entries:
+
+    - **auto-close**: an open (``TODO``/``wip``) finding whose member
+      checks all measure good/acceptable flips to ``fixed`` +
+      ``resolved_utc`` (machine-only closure; entry kept). Human
+      closures are never touched.
+    - **refresh**: an open finding still failing gets its machine fields
+      (``checks``/``value``/``script_version``/``report_utc``) updated.
+    - **author**: a gating check measuring ``fail`` with no live entry
+      gets a new ``TODO`` entry; a ``fixed`` entry that refails gets a
+      fresh appended entry (last-per-identity is live). Entries closed
+      ``accepted``/``caution``/``failed`` are never re-authored — the
+      closure covers the finding.
+
+    Parameters
+    ----------
+    date_dir : pathlib.Path
+        Date folder holding ``<run>_Issues.yaml`` (created here if
+        absent and there is something to author).
+    run_name : str
+        Run folder name.
+    report : dict
+        The contract report dict the caller is about to pass to
+        ``write_report`` (``script``/``generated_utc``/``checks``/
+        ``run`` keys). Only gating checks author findings: ``fail``
+        status, not advisory, not waived — the same set that makes the
+        run status ``fail``.
+    groups : dict of str -> list of str, optional
+        Script-owned aggregation policy: finding key -> member check
+        names (e.g. ``{"dead_bands": ["dead_band_412nm", ...]}``).
+        Failing checks not claimed by any group become singleton
+        findings keyed by check name.
+    write : bool
+        When False, report planned actions without writing.
+
+    Returns
+    -------
+    list of str
+        Human-readable actions taken/planned (empty = nothing to do).
+    """
+    script = str((report.get("script") or {}).get("name", "unknown"))
+    version = str((report.get("script") or {}).get("version", ""))
+    report_utc = str(report.get("generated_utc", ""))
+    checks = report.get("checks") or {}
+
+    # +++++ gating fails (advisory/waived never fail the run -> no finding) +++++
+    failing = [n for n, c in checks.items()
+               if isinstance(c, dict) and c.get("status") == "fail"
+               and not c.get("advisory") and not c.get("waived")]
+    passing = {n for n, c in checks.items()
+               if isinstance(c, dict)
+               and c.get("status") in {"good", "acceptable"}}
+
+    # +++++ apply the script's grouping policy +++++
+    grouped: Dict[str, List[str]] = {}
+    claimed: set = set()
+    for key, members in (groups or {}).items():
+        mem = [m for m in members if m in failing]
+        if mem:
+            grouped[str(key)] = mem
+            claimed.update(mem)
+    for name in failing:
+        if name not in claimed:
+            grouped[name] = [name]
+
+    # +++++ load or create the yaml +++++
+    fpath = date_dir / f"{run_name}_Issues.yaml"
+    yaml_rt = YAML(typ="rt")
+    yaml_rt.preserve_quotes = True
+    yaml_rt.indent(mapping=2, sequence=4, offset=2)
+    created = False
+    if fpath.is_file():
+        try:
+            with open(fpath, encoding="utf-8") as f:
+                data = yaml_rt.load(f)
+        except YAMLError as err:
+            warn.warn(f"Skipping unparseable issue YAML {fpath}: {err}")
+            return []
+        if not isinstance(data, (dict, CommentedMap)):
+            warn.warn(f"Skipping issue YAML with non-mapping root: {fpath}")
+            return []
+    else:
+        if not grouped:
+            return []
+        data = CommentedMap()
+        data["schema_version"] = 1.1
+        data["run"] = run_name
+        sensor = (report.get("run") or {}).get("sensor")
+        if sensor:
+            data["sensor"] = str(sensor)
+        data.yaml_set_comment_before_after_key(
+            "schema_version",
+            before=f"{run_name}_Issues.yaml - created by {script} "
+                   f"(qc_findings only; RunOverview triggers add their "
+                   f"blocks via ProjectBuilder/scan)")
+        created = True
+
+    findings_seq = data.get("qc_findings")
+    if findings_seq is not None and not isinstance(
+            findings_seq, (list, CommentedSeq)):
+        warn.warn(f"{fpath}: qc_findings is not a list "
+                  f"({type(findings_seq).__name__}); leaving file untouched.")
+        return []
+    live = _live_findings(data)
+    actions: List[str] = []
+    open_states = set(finding_states()["open"])
+
+    def _headline(members: List[str]) -> str:
+        if len(members) == 1:
+            c = checks.get(members[0]) or {}
+            return str(c.get("value", "fail"))
+        return "; ".join(
+            f"{m}: {(checks.get(m) or {}).get('value', 'fail')}"
+            for m in members)
+
+    # +++++ auto-close: open findings whose members all pass +++++
+    for (fscript, fkey), entry in live.items():
+        if fscript != script:
+            continue
+        if str(entry.get("state", "TODO")).strip() not in open_states:
+            continue
+        members = [str(m) for m in (entry.get("checks") or [])]
+        if members and all(m in passing for m in members):
+            actions.append(f"close {fkey} as fixed")
+            entry["state"] = "fixed"
+            entry["resolved_utc"] = (
+                report_utc or pd.Timestamp.now(tz="UTC").isoformat())
+
+    # +++++ author / refresh failing findings +++++
+    for fkey in sorted(grouped):
+        members = grouped[fkey]
+        headline = _headline(members)
+        entry = live.get((script, fkey))
+        reopened = False
+        if entry is not None:
+            state = str(entry.get("state", "TODO")).strip()
+            if state in open_states:
+                fields = {"checks": members, "value": headline,
+                          "script_version": version,
+                          "report_utc": report_utc}
+                current = {"checks": [str(m) for m in
+                                      (entry.get("checks") or [])],
+                           "value": str(entry.get("value", "")),
+                           "script_version": str(
+                               entry.get("script_version", "")),
+                           "report_utc": str(entry.get("report_utc", ""))}
+                if current != {k: (v if k == "checks" else str(v))
+                               for k, v in fields.items()}:
+                    actions.append(f"refresh {fkey}")
+                    cseq = CommentedSeq(members)
+                    cseq.fa.set_flow_style()
+                    entry["checks"] = cseq
+                    entry["value"] = headline
+                    entry["script_version"] = version
+                    entry["report_utc"] = report_utc
+                continue
+            if state != "fixed":
+                continue  # human closure covers the finding
+            reopened = True
+        rec = CommentedMap()
+        rec["script"] = script
+        rec["finding"] = fkey
+        cseq = CommentedSeq(members)
+        cseq.fa.set_flow_style()
+        rec["checks"] = cseq
+        rec["status"] = "fail"
+        rec["value"] = headline
+        rec["script_version"] = version
+        rec["report_utc"] = report_utc
+        rec["state"] = "TODO"
+        rec["note"] = ""
+        rec.yaml_add_eol_comment(
+            "wip | accepted | caution | failed ('fixed' is machine-only,"
+            " set by a passing re-run; never 'ok')", key="state")
+        rec.yaml_add_eol_comment("required when state is 'accepted'",
+                                 key="note")
+        if not isinstance(data.get("qc_findings"), (list, CommentedSeq)):
+            data["qc_findings"] = CommentedSeq()
+            data.yaml_set_comment_before_after_key(
+                "qc_findings",
+                before="---- QC findings: machine tickets, check-scoped"
+                       " (QC scripts author/refresh/auto-close) ----\n"
+                       "Close by setting 'state': accepted (tolerable,"
+                       " run rejoins QA annotated - fill 'note') |\n"
+                       "caution/failed (confirmed problem, run excluded)."
+                       " 'wip' keeps it open; a passing QC\n"
+                       "re-run closes it as 'fixed' automatically.")
+        data["qc_findings"].append(rec)
+        actions.append(f"open finding {fkey}"
+                       + (" (refailed after fixed)" if reopened else ""))
+
+    if actions and write:
+        with open(fpath, "w", encoding="utf-8") as f:
+            yaml_rt.dump(data, f)
+        if created:
+            actions.insert(0, "created Issues.yaml")
+    return actions
+
+
+# ==================================================================================
+def _accepted_annotations(yaml_data: Optional[Dict[str, Any]],
+                          run_name: str) -> Tuple[str, ...]:
+    """Render annotation strings for a run's accepted findings.
+
+    Parameters
+    ----------
+    yaml_data : dict or None
+        Parsed issue-YAML mapping (None = no annotations).
+    run_name : str
+        Run folder name (for the empty-note warning).
+
+    Returns
+    -------
+    tuple of str
+        One ``accepted: <script>/<finding> — <note>`` per accepted live
+        finding. An empty note warns (the reason is the point) but the
+        annotation still renders.
+    """
+    if not yaml_data:
+        return ()
+    out: List[str] = []
+    for (fscript, fkey), entry in sorted(_live_findings(yaml_data).items()):
+        if str(entry.get("state", "TODO")).strip() != "accepted":
+            continue
+        note = str(entry.get("note", "") or "").strip()
+        if not note:
+            warn.warn(f"{run_name}: accepted finding {fscript}/{fkey} has "
+                      f"an empty note — the acceptance reason is required.")
+        out.append(f"accepted: {fscript}/{fkey}"
+                   + (f" — {note}" if note else " — (no note)"))
+    return tuple(out)
+
+
+# ==================================================================================
+def classify_run(date_dir: pathlib.Path, run_name: str) -> Tuple[str, str]:
+    """Classify one run's severity from its flags, tickets and findings.
+
+    The severity ladder (worst-wins) drives the QA scripts' filtering;
+    per-run QC scripts ignore it. ``accepted`` is the reviewed-but-
+    tolerable middle rung (QC findings plan, development-master repo),
+    reachable only through ``qc_findings`` entries closed ``accepted``.
 
     Parameters
     ----------
@@ -385,48 +695,114 @@ def classify_run(date_dir: pathlib.Path, run_name: str) -> Tuple[str, str]:
     Returns
     -------
     tuple of (str, str)
-        ``(severity, detail)`` with severity one of:
+        ``(severity, detail)`` with severity one of (worst wins):
 
-        - ``clean``     — no flags, ``Deviations`` only, or ``Issues``
-          with every ticket resolved (``ok``/``fixed``);
-        - ``untriaged`` — ``Issues`` set but tickets still open
-          (``TODO``/``wip``/unknown state) or no Issues.yaml yet;
-        - ``degraded``  — ``Issues`` set with a confirmed problem
-          (``caution``/``failed`` ticket) or an unparseable yaml;
+        - ``clean``     — no flags, ``Deviations`` only, or every
+          ticket/finding resolved (``ok``/``fixed``);
+        - ``accepted``  — all resolved, ≥1 finding closed ``accepted``
+          (QA-included by default, annotated);
+        - ``untriaged`` — open tickets/findings (``TODO``/``wip``), or
+          ``Issues`` set with no Issues.yaml yet;
+        - ``degraded``  — a confirmed problem (``caution``/``failed``
+          ticket or finding) or an unparseable yaml;
         - ``failed``    — ``RunFailed`` set (yaml never consulted).
+
+    Notes
+    -----
+    ``qc_findings`` classify regardless of the RunOverview ``Issues``
+    bool — the machine never flips bools, findings are its channel into
+    the ladder. ``payload_outcomes`` tickets keep requiring the bool,
+    which is what authors them.
     """
     triggers = read_triggers(date_dir, run_name)
     if triggers["RunFailed"]:
         return "failed", "RunFailed flagged in RunOverview.csv"
-    if not triggers["Issues"]:
-        return "clean", "no exclusion flags"
     yaml_data, yaml_state = load_issue_yaml(date_dir, run_name)
-    if yaml_state == "absent":
-        return "untriaged", "Issues flagged, no Issues.yaml yet"
     if yaml_state == "unparseable":
-        return "degraded", "Issues flagged, Issues.yaml unparseable"
-    tickets = yaml_data.get("payload_outcomes") or []
-    states = {str(t.get("payload")): str(t.get("state", "TODO")).strip().lower()
-              for t in tickets if isinstance(t, dict)}
-    confirmed = sorted(p for p, s in states.items()
+        prefix = "Issues flagged, " if triggers["Issues"] else ""
+        return "degraded", prefix + "Issues.yaml unparseable"
+    if yaml_state == "absent":
+        if triggers["Issues"]:
+            return "untriaged", "Issues flagged, no Issues.yaml yet"
+        return "clean", "no exclusion flags"
+
+    # +++++ machine findings (consulted regardless of the Issues bool) +++++
+    fstates = {f"{s}/{k}": str(e.get("state", "TODO")).strip()
+               for (s, k), e in _live_findings(yaml_data).items()}
+    f_bad = sorted(k for k, s in fstates.items()
+                   if s in {"caution", "failed"})
+    f_open = sorted(k for k, s in fstates.items() if s in {"TODO", "wip"})
+    f_acc = sorted(k for k, s in fstates.items() if s == "accepted")
+
+    # +++++ payload tickets (outcome axis — only authored when Issues set) +++++
+    t_bad: List[str] = []
+    t_open: List[str] = []
+    t_none = False
+    if triggers["Issues"]:
+        tickets = yaml_data.get("payload_outcomes") or []
+        states = {str(t.get("payload")):
+                  str(t.get("state", "TODO")).strip().lower()
+                  for t in tickets if isinstance(t, dict)}
+        t_bad = sorted(p for p, s in states.items()
                        if s in {"caution", "failed"})
-    if confirmed:
-        return "degraded", ("Issues flagged, caution/failed ticket(s): "
-                            + ", ".join(confirmed))
-    open_tickets = sorted(p for p, s in states.items()
-                          if s not in {"ok", "fixed"})
-    if open_tickets or not states:
-        return "untriaged", ("Issues flagged, open ticket(s): "
-                             + (", ".join(open_tickets) or "none authored"))
-    return "clean", "Issues flagged, all tickets resolved (ok/fixed)"
+        t_open = sorted(p for p, s in states.items()
+                        if s not in {"ok", "fixed"})
+        t_none = not states
+
+    if t_bad or f_bad:
+        if t_bad and not f_bad:
+            return "degraded", ("Issues flagged, caution/failed "
+                                "ticket(s): " + ", ".join(t_bad))
+        return "degraded", ("caution/failed ticket(s)/finding(s): "
+                            + ", ".join(t_bad + f_bad))
+    if t_open or f_open or t_none:
+        if not f_open:
+            return "untriaged", ("Issues flagged, open ticket(s): "
+                                 + (", ".join(t_open) or "none authored"))
+        return "untriaged", ("open ticket(s)/finding(s): "
+                             + ", ".join(t_open + f_open))
+    if f_acc:
+        return "accepted", "accepted finding(s): " + ", ".join(f_acc)
+    if triggers["Issues"]:
+        return "clean", "Issues flagged, all tickets resolved (ok/fixed)"
+    return "clean", "no exclusion flags"
 
 
 # ==================================================================================
-def run_exclusion(date_dir: pathlib.Path, run_name: str,
-                  include_runs: Optional[str] = None,
-                  include_duplicates: bool = False,
-                  include_flight_deviations: bool = False) -> Optional[str]:
-    """Decide whether a QA crawl should exclude this run.
+class RunDecision(NamedTuple):
+    """QA crawl decision for one run.
+
+    Attributes
+    ----------
+    included : bool
+        Process the run (True) or skip it (False).
+    reason : str or None
+        Exclusion reason naming the flag that re-includes it (None when
+        included).
+    annotations : tuple of str
+        Caveats to carry into every listing/report for an *included*
+        run (``accepted: <script>/<finding> — <note>`` per accepted
+        finding). Always empty for excluded runs.
+    """
+
+    included: bool
+    reason: Optional[str]
+    annotations: Tuple[str, ...]
+
+
+# ==================================================================================
+def run_decision(date_dir: pathlib.Path, run_name: str,
+                 include_runs: Optional[str] = None,
+                 include_duplicates: bool = False,
+                 include_flight_deviations: bool = False,
+                 exclude_accepted: bool = False) -> RunDecision:
+    """Decide whether a QA crawl processes this run, with annotations.
+
+    Three orthogonal exclusion axes checked in order (first hit wins):
+    duplicate-group winners, declared flight deviations, then the
+    severity ladder. ``accepted`` runs are included by default and carry
+    their acceptance annotations; ``--exclude-accepted`` drops them for
+    pristine-baseline work.
 
     Parameters
     ----------
@@ -436,8 +812,8 @@ def run_exclusion(date_dir: pathlib.Path, run_name: str,
         Run folder name.
     include_runs : str or None
         Cumulative severity ladder from the ``--include-runs`` flag:
-        None (clean only), ``untriaged``, ``degraded`` or ``failed``.
-        Each level also includes everything below it.
+        None (clean + accepted), ``untriaged``, ``degraded`` or
+        ``failed``. Each level also includes everything below it.
     include_duplicates : bool
         Include every member of each duplicate group (orthogonal axis).
         By default only the group's winner is processed: the single
@@ -450,43 +826,100 @@ def run_exclusion(date_dir: pathlib.Path, run_name: str,
         deliberately off-spec flights that would otherwise pollute
         cross-run baselines (orthogonal axis). Deployable/payload
         intent (panels, gcps) never feeds this flag.
+    exclude_accepted : bool
+        Exclude runs whose severity is ``accepted`` (reviewed-but-
+        tolerable findings) instead of including them annotated.
 
     Returns
     -------
-    str or None
-        None when the run should be processed; otherwise a reason
-        string carrying the CLI flag that would re-include it.
+    RunDecision
+        ``included`` + exclusion ``reason`` (naming the re-include
+        flag) + acceptance ``annotations`` for included runs.
 
     Raises
     ------
     ValueError
         If *include_runs* is not one of the ladder levels.
     """
-    rank = {"clean": 0, "untriaged": 1, "degraded": 2, "failed": 3}
-    level = include_runs or "clean"
-    if level not in rank:
-        raise ValueError(f"include_runs must be one of "
-                         f"{sorted(rank)[1:]} or None, got '{include_runs}'")
+    valid = ("untriaged", "degraded", "failed")
+    if include_runs is not None and include_runs not in valid:
+        raise ValueError(f"include_runs must be one of {sorted(valid)} "
+                         f"or None, got '{include_runs}'")
     if not include_duplicates:
         disp = run_disposition(date_dir).get(run_name)
         if disp is not None and not disp["is_winner"]:
             if not disp["is_duplicate"]:
-                return (f"superseded by {disp['winner']} (BestRun) "
-                        "(use --include-duplicates)")
+                return RunDecision(
+                    False, f"superseded by {disp['winner']} (BestRun) "
+                           "(use --include-duplicates)", ())
             if disp["winner"]:
-                return (f"DuplicateRun flagged, group winner is "
-                        f"{disp['winner']} (use --include-duplicates)")
-            return "DuplicateRun flagged (use --include-duplicates)"
+                return RunDecision(
+                    False, f"DuplicateRun flagged, group winner is "
+                           f"{disp['winner']} (use --include-duplicates)",
+                    ())
+            return RunDecision(
+                False, "DuplicateRun flagged (use --include-duplicates)",
+                ())
     if not include_flight_deviations:
         deviations = run_flight_deviations(date_dir, run_name)
         if deviations:
-            return (f"flight deviation(s) declared: "
-                    f"{', '.join(deviations)} "
-                    "(use --include-flight-deviations)")
+            return RunDecision(
+                False, f"flight deviation(s) declared: "
+                       f"{', '.join(deviations)} "
+                       "(use --include-flight-deviations)", ())
     severity, detail = classify_run(date_dir, run_name)
-    if rank[severity] > rank[level]:
-        return f"{severity}: {detail} (use --include-runs {severity})"
-    return None
+    if severity == "accepted" and exclude_accepted:
+        return RunDecision(
+            False, f"{detail} (excluded by --exclude-accepted)", ())
+    rank = {"clean": 0, "accepted": 1, "untriaged": 2, "degraded": 3,
+            "failed": 4}
+    # accepted is included by default — the ladder floor sits above it
+    threshold = max(rank[include_runs or "clean"], rank["accepted"])
+    if rank[severity] > threshold:
+        return RunDecision(
+            False, f"{severity}: {detail} (use --include-runs {severity})",
+            ())
+    yaml_data, yaml_state = load_issue_yaml(date_dir, run_name)
+    annotations = (_accepted_annotations(yaml_data, run_name)
+                   if yaml_state == "parsed" else ())
+    return RunDecision(True, None, annotations)
+
+
+# ==================================================================================
+def run_exclusion(date_dir: pathlib.Path, run_name: str,
+                  include_runs: Optional[str] = None,
+                  include_duplicates: bool = False,
+                  include_flight_deviations: bool = False) -> Optional[str]:
+    """DEPRECATED — thin wrapper over :func:`run_decision`.
+
+    Kept only until the QA scripts migrate to ``run_decision`` (QC
+    findings plan, QA-script step); deleted then. Drops the
+    annotations and cannot express ``--exclude-accepted``.
+
+    Parameters
+    ----------
+    date_dir : pathlib.Path
+        Date folder containing ``RunOverview.csv``.
+    run_name : str
+        Run folder name.
+    include_runs : str or None
+        See :func:`run_decision`.
+    include_duplicates : bool
+        See :func:`run_decision`.
+    include_flight_deviations : bool
+        See :func:`run_decision`.
+
+    Returns
+    -------
+    str or None
+        None when the run should be processed; otherwise the exclusion
+        reason.
+    """
+    decision = run_decision(
+        date_dir, run_name, include_runs=include_runs,
+        include_duplicates=include_duplicates,
+        include_flight_deviations=include_flight_deviations)
+    return None if decision.included else decision.reason
 
 
 # ==================================================================================
