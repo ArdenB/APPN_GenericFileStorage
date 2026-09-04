@@ -17,6 +17,7 @@ import sys
 import git
 import argparse
 import pathlib
+import time
 from git import exc as git_exc
 from collections import OrderedDict
 
@@ -83,12 +84,15 @@ def main(args, repo):
 					# +++++ Make the site name +++++
                     df_flog, gitmod =  Sitebuilder(flog_fname, df_flog, index, frow, check, site, project, node, args, repo, gitmod)
 
+                # +++++ Sync the per-site sensor lists in the project yaml +++++
+                gitmod = _syncSiteSensors(df_flog, ProjectInfo, project, node, args, repo, gitmod)
+
         # ========== Persist any sensor changes back to the project summary CSV ==========
         if psum_modified:
             df.to_csv(pfilename)
             print(f"Updated project summary written to {pfilename}")
             if not args.no_git and repo is not None:
-                repo.git.add(pfilename)
+                _gitAddRetry(repo, pfilename)
                 gitmod = True
 
 
@@ -154,8 +158,8 @@ def Sitebuilder(flog_fname, df_flog, index, frow, check, site, project, node, ar
     
 	# +++++ Check if there is already a sensor folder +++++
     pymkdir(f"./{node["name"]}/{project}/{sitename}/{frow.Sensor}")
-    # TO DO: Ammend the ProjectInfo to include the sensor
-    # TO DO: Add the sensor to the project yaml file
+    # NOTE: the per-site sensors list in ProjectSummary.yaml is rebuilt from
+    # the field log by _syncSiteSensors() after all rows are processed.
     
 	# +++++ Make the field day folder +++++
     dname    = f"{frow.Year:02d}{frow.Month:02d}{frow.Day:02d}"
@@ -223,7 +227,7 @@ def Sitebuilder(flog_fname, df_flog, index, frow, check, site, project, node, ar
             df_runs.index.name = "Run"
             df_runs.to_csv(run_overview_fname)
             if not args.no_git:
-                repo.git.add(run_overview_fname)
+                _gitAddRetry(repo, run_overview_fname)
                 gitmod = True
         else:
             # Propagate newly specced status columns to existing tables,
@@ -237,7 +241,7 @@ def Sitebuilder(flog_fname, df_flog, index, frow, check, site, project, node, ar
                 df_runs.to_csv(run_overview_fname)
                 print(f"Added status column(s) {missing_cols} to {run_overview_fname}")
                 if not args.no_git:
-                    repo.git.add(run_overview_fname)
+                    _gitAddRetry(repo, run_overview_fname)
                     gitmod = True
 
     # +++++ Write the resolved True/False back into the field log +++++
@@ -271,7 +275,7 @@ def Sitebuilder(flog_fname, df_flog, index, frow, check, site, project, node, ar
         df_flog.to_csv(flog_fname, index=False)
         # +++++ Add the file to the github repo +++++ 
         if not args.no_git:
-            repo.git.add(flog_fname)
+            _gitAddRetry(repo, flog_fname)
             gitmod = True
     return df_flog, gitmod
 
@@ -335,7 +339,7 @@ def projBuilder(project, node, colnames, args, repo, gitmod):
 
         # ========== Add the file to the github repo ========== 
         if not args.no_git:
-            repo.git.add(flog_fname)
+            _gitAddRetry(repo, flog_fname)
             gitmod = True
     
         # +++++ Open the log files +++++
@@ -425,7 +429,7 @@ def NodeChecker(args, node, gitmod, repo):
 
         # ========== Add the file to the github repo ========== 
         if not args.no_git and repo is not None:
-            repo.git.add(pfilename)
+            _gitAddRetry(repo, pfilename)
             gitmod = True
 
     # ========== Load the file with projects and fix any missing columns ==========
@@ -465,6 +469,63 @@ def NodeChecker(args, node, gitmod, repo):
         gitmod = GitChanged(repo, pfilename, gitmod)
 
     return df, gitmod
+
+
+def _syncSiteSensors(df_flog, ProjectInfo, project, node, args, repo, gitmod):
+    """
+    Rebuild each site's sensors list in ProjectSummary.yaml from the field log.
+
+    Every site entry that has matching field-log rows (same Site name and
+    Year) gets its ``sensors`` list replaced with ``[{sensor: count}, ...]``
+    where count is the number of field-day rows for that sensor. Sites with
+    no matching rows are left untouched so manually entered sensors survive.
+
+    Parameters
+    ----------
+    df_flog : pandas.DataFrame
+        The project field log.
+    ProjectInfo : dict
+        Loaded project YAML data (mutated in place).
+    project : str
+        The project name.
+    node : dict
+        Dictionary containing node information (e.g., name).
+    args : argparse.Namespace
+        Parsed command-line arguments.
+    repo : git.Repo
+        GitPython Repo object for git operations.
+    gitmod : bool
+        Flag indicating if the git repo has been modified.
+
+    Returns
+    -------
+    gitmod : bool
+        Updated git modification flag.
+    """
+    changed = False
+    for site in ProjectInfo["project"]["sites"]:
+        if not isinstance(site, dict):
+            continue
+        # +++++ Count field-day rows per sensor for this site +++++
+        mask = (df_flog["Site"] == site.get("name")) & (df_flog["Year"] == site.get("year"))
+        counts = df_flog.loc[mask, "Sensor"].value_counts()
+        if counts.empty:
+            continue  # No log rows for this site; keep any manual entries
+        sensors = [{sensor: int(n)} for sensor, n in sorted(counts.items())]
+        if site.get("sensors") != sensors:
+            site["sensors"] = sensors
+            changed = True
+
+    # ========== Write the yaml back if anything changed ==========
+    if changed:
+        psyl_fname = f"./{node['name']}/{project}/ProjectSummary.yaml"
+        with open(psyl_fname, "w") as f:
+            yaml.dump(ProjectInfo, f, sort_keys=False)
+        print(f"Updated site sensors from field log in {psyl_fname}")
+        if not args.no_git:
+            _gitAddRetry(repo, psyl_fname)
+            gitmod = True
+    return gitmod
 
 
 def _defaultProjectYAML(project):
@@ -673,7 +734,7 @@ def _projYAML(project, pym_fn, args, repo, gitmod):
         print(f"New Project YAML file created: {pym_fn}. Please edit it to add project and site information")
         # +++++ Add the file to the github repo +++++
         if not args.no_git:
-            repo.git.add(pym_fn)
+            _gitAddRetry(repo, pym_fn)
             gitmod = True   
 
     # +++++ Load the yaml file +++++
@@ -697,7 +758,7 @@ def _projYAML(project, pym_fn, args, repo, gitmod):
             yaml.dump(updated_data, f, sort_keys=False)
         print(f"Updated YAML structure in {pym_fn}")
         if not args.no_git:
-            repo.git.add(pym_fn)
+            _gitAddRetry(repo, pym_fn)
             gitmod = True
         Proj_data = updated_data
 
@@ -769,14 +830,14 @@ def _df_col_check(dfx, fname, colnms, args, repo, gitmod, fill_val=None):
             # be written without one to avoid an extra unnamed column.
             dfx.to_csv(fname, index=dfx.index.name is not None)
         if not args.no_git:
-            repo.git.add(fname)
+            _gitAddRetry(repo, fname)
             gitmod = True
     # +++++ Check if the file is in the repo +++++
     if not args.no_git:
         # +++++ che both the repo and the staged area +++++
         if not (fileInRepo(repo, fname) or is_file_staged(repo, fname)):
             print(f"File: {fname} is not in the git repo. Adding it to the repo")
-            repo.git.add(fname)
+            _gitAddRetry(repo, fname)
             gitmod = True
 
     return dfx, gitmod
@@ -907,7 +968,7 @@ def _seedDocReadme(folder, kind, yyyysite, args, repo, gitmod):
         f.write(body)
     print(f"Seeded README template: {fname}")
     if not args.no_git and repo is not None:
-        repo.git.add(fname)
+        _gitAddRetry(repo, fname)
         gitmod = True
     return gitmod
 
@@ -1110,6 +1171,42 @@ def pymkdir(path):
         print(path)
         os.makedirs(path)
 
+def _gitAddRetry(repo, fname, attempts=5, delay=0.5):
+    """git-add with retries around transient index.lock contention.
+
+    Bulk migrations rewrite many files in a tight loop; any concurrent
+    git client (e.g. the VS Code git extension refreshing its status)
+    briefly holds ``.git/index.lock`` and makes a plain ``git add`` die
+    with exit 128. Those windows are milliseconds wide, so retrying
+    with a short backoff is safe; any other git error re-raises
+    immediately.
+
+    Parameters
+    ----------
+    repo : git.Repo
+        A GitPython Repo object.
+    fname : str
+        Path to stage.
+    attempts : int, optional
+        Maximum tries before re-raising (default 5).
+    delay : float, optional
+        Base sleep in seconds, scaled linearly per attempt (default 0.5).
+
+    Returns
+    -------
+    None
+    """
+    for attempt in range(attempts):
+        try:
+            repo.git.add(fname)
+            return
+        except git_exc.GitCommandError as err:
+            if "index.lock" not in str(err) or attempt == attempts - 1:
+                raise
+            print(f"index.lock contention staging {fname} "
+                  f"(attempt {attempt + 1}/{attempts}), retrying ...")
+            time.sleep(delay * (attempt + 1))
+
 def is_file_staged(repo, filepath):
     """
     Check if a file is staged (added to the index) in the given git repository.
@@ -1189,7 +1286,7 @@ def GitChanged(repo, fname, gitmod):
     # +++++ Check if the file is in the repo +++++
     if not fileInRepo(repo, fname):
         print(f"WARNING. File: {fname} is not in the git repo. Adding it to the repo")
-        repo.git.add(fname)
+        _gitAddRetry(repo, fname)
         gitmod = True
 
     unstaged_diffs = repo.index.diff(None)
@@ -1199,7 +1296,7 @@ def GitChanged(repo, fname, gitmod):
         if diff.a_path == fname.replace("./", '') or diff.b_path == fname.replace("./", ''):
             # File has been modified
             if diff.change_type == 'M':
-                repo.git.add(fname)
+                _gitAddRetry(repo, fname)
                 gitmod = True
             else:
                 print(f"WARNING. File: {fname} has been modified but the change type in not M. Change type:{diff.change_type}. File Not added to repo")
