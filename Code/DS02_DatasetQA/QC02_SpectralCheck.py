@@ -428,9 +428,8 @@ def _target_region_stats(
     (bands whose wavelength falls outside the known-bad ranges) with the
     0 = nodata sentinel masked out. Both aggregations are always
     reported: their divergence is itself a contamination signal
-    (design record: the retired QC pipeline plan §7, in this repo's git
-    history). Each panel also carries the
-    ``homogeneity`` distribution-shape block from
+    (design record: the retired QC pipeline plan §7). Each panel also
+    carries the ``homogeneity`` distribution-shape block from
     :func:`Code.functions.spectral_qc.panel_homogeneity` plus its
     ``nodata_zero_fraction``; a panel whose good-band samples are all
     nodata reports ``all_nodata: True`` with None statistics instead of

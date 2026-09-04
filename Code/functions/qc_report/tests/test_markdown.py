@@ -1,6 +1,6 @@
 """Tests for the qc_report markdown fragment + assembly renderer.
 
-Covers ``Code/DS02_DatasetQA/QC_REPORT_PLAN.md``: fragment content per
+Covers the QC report plan (development-master repo): fragment content per
 script, assembly with all/partial/no fragments, the pre-fragment and
 legacy stubs, never-raise behaviour, relative-path/figure handling and
 idempotence (re-assembly byte-identical apart from timestamps).

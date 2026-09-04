@@ -1,7 +1,7 @@
 """JSON-first QC report writer and YAML-summary projector.
 
 Implements the DS02 reporting contract (``Code/DS02_DatasetQA/README.md``;
-design record: retired QC pipeline plan §2, git history): every
+design record: the retired QC pipeline plan §2): every
 DS02 script writes a dual-file report per invocation —
 
 - ``<script>_detail.json`` — everything (full check objects, per-item data,

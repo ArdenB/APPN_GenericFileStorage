@@ -1,6 +1,6 @@
 """Markdown section fragments + QC_report.md assembly for the QC scripts.
 
-Implements ``Code/DS02_DatasetQA/QC_REPORT_PLAN.md`` (parent plan §7
+Implements the QC report plan (development-master repo, parent plan §7
 revision item 3): each per-run QC script renders **only its own section**
 (from the report dict it just passed to ``write_report``) to a fragment
 file it owns (``QC_data/<script>/<script>_section.md``), then reassembles

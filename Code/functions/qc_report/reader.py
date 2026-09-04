@@ -1,7 +1,7 @@
 """QC report reader, tolerant of legacy filenames and schemas.
 
 Implements the reader half of the shared-helper design (retired QC
-pipeline plan §6, in this repo's git history): pre-migration JSON reports in
+pipeline plan §6): pre-migration JSON reports in
 existing ``QC_data/`` folders (``QC_GCP*distances*_report.json``,
 ``QC_spectra_report.json`` — ``status.result`` schema) remain readable next
 to contract ``<script>/<script>_detail.json`` reports, and legacy files are
@@ -135,6 +135,8 @@ def report_is_current(
         script_name: str,
         current_version: str,
         scope: Optional[str] = None,
+        min_version: Optional[str] = None,
+        config_sha256: Optional[str] = None,
     ) -> Tuple[bool, Optional[str]]:
     """Check whether a run's contract report was written by the current
     script version.
@@ -155,6 +157,19 @@ def report_is_current(
         The running script's ``__version__``.
     scope : str, optional
         Scope label for cross-run (QA) reports (see ``report_paths``).
+    min_version : str, optional
+        Results-compatibility floor: reports written by this version or
+        newer stay current, so plumbing-only ``vX.Y`` bumps (report
+        hooks, skip messaging, cache changes) don't force expensive
+        re-scans. Callers bump the floor — not just ``__version__`` —
+        when a change actually alters the graded outputs. Default None
+        (exact numeric match required, the original behaviour).
+    config_sha256 : str, optional
+        Current content hash of the script's threshold/spec file. When
+        given, a report whose recorded ``config.sha256`` differs is
+        stale — content-defined spec staleness, immune to mtime bumps
+        from syncs/copies that don't change the file. Default None (no
+        config check).
 
     Returns
     -------
@@ -171,12 +186,25 @@ def report_is_current(
     except (OSError, json.JSONDecodeError) as err:
         return False, f"unreadable contract report ({err})"
     recorded = report.get("script", {}).get("version")
-    if version_key(recorded) is None:
+    recorded_key = version_key(recorded)
+    if recorded_key is None:
         return False, (f"no parseable script version in "
                        f"{detail_path.name} ({recorded!r})")
-    if version_key(recorded) != version_key(current_version):
+    floor_key = version_key(min_version) if min_version is not None else None
+    if floor_key is not None:
+        if recorded_key < floor_key:
+            return False, (f"report written by {recorded}, below the "
+                           f"results floor {min_version} "
+                           f"(current script {current_version})")
+    elif recorded_key != version_key(current_version):
         return False, (f"report written by {recorded}, "
                        f"current script is {current_version}")
+    if config_sha256 is not None:
+        recorded_sha = (report.get("config") or {}).get("sha256")
+        if recorded_sha != config_sha256:
+            return False, (f"config changed (report sha "
+                           f"{str(recorded_sha)[:12]}, current "
+                           f"{config_sha256[:12]})")
     return True, None
 
 

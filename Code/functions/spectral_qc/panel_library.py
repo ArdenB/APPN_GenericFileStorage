@@ -2,7 +2,7 @@
 
 Resolves the manufacturer DHR curves in ``reference/panels/<NODE>/`` for
 the QC02 observed-vs-expected comparison, implementing the §5b rules
-(design record: retired QC pipeline plan, git history):
+(design record: the retired QC pipeline plan):
 
 1. The gpro pipeline YAML is the primary pin for ELM tables — nominal
    ``Panel_ref`` signatures cannot identify hardware (24005 and 25005

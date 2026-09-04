@@ -399,3 +399,46 @@ def test_report_is_current_unparseable_recorded_version(tmp_path):
         tmp_path, "QC01_FlightCheck", "v2.3(03.09.2026)")
     assert not current
     assert "no parseable script version" in reason
+
+
+def test_report_is_current_min_version_floor_accepts_older(tmp_path):
+    # written by v1.3, script now v1.6: plumbing bumps stay current
+    _write_versioned_report(tmp_path, "v1.3(27.08.2026)")
+    current, reason = qr.report_is_current(
+        tmp_path, "QC01_FlightCheck", "v1.6(03.09.2026)",
+        min_version="v1.3")
+    assert current and reason is None
+
+
+def test_report_is_current_min_version_floor_rejects_below(tmp_path):
+    _write_versioned_report(tmp_path, "v1.2(20.08.2026)")
+    current, reason = qr.report_is_current(
+        tmp_path, "QC01_FlightCheck", "v1.6(03.09.2026)",
+        min_version="v1.3")
+    assert not current
+    assert "below the results floor v1.3" in reason
+
+
+def _write_config_report(tmp_path, sha):
+    report = qr.new_report("QC03_RasterCheck", "v1.7(03.09.2026)")
+    qr.add_check(report, "header_bin_integrity_vnir", "good")
+    report["config"] = {"path": "reference/thresholds/raster_validity.yml",
+                        "sha256": sha}
+    qr.write_report(tmp_path, report)
+
+
+def test_report_is_current_config_sha_match(tmp_path):
+    _write_config_report(tmp_path, "a" * 64)
+    current, reason = qr.report_is_current(
+        tmp_path, "QC03_RasterCheck", "v1.7(03.09.2026)",
+        config_sha256="a" * 64)
+    assert current and reason is None
+
+
+def test_report_is_current_config_sha_mismatch(tmp_path):
+    _write_config_report(tmp_path, "a" * 64)
+    current, reason = qr.report_is_current(
+        tmp_path, "QC03_RasterCheck", "v1.7(03.09.2026)",
+        config_sha256="b" * 64)
+    assert not current
+    assert "config changed" in reason

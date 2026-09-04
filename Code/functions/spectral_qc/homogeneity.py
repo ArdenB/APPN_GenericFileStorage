@@ -6,7 +6,7 @@ make it bimodal (``l_kurt`` depressed, |skew| inflated), specular
 hotspots grow a heavy right tail (``skew`` up), and general
 contamination diverges the per-band mean from the median. These
 statistics detect the failure modes the mean-based residuals silently
-absorb (design record: retired QC pipeline plan §7, git history).
+absorb (design record: the retired QC pipeline plan §7).
 
 Thresholds are injected by the caller (``spectral_limits.yml``
 ``homogeneity`` block) — nothing is hardcoded here.

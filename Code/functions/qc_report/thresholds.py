@@ -1,7 +1,7 @@
 """Threshold-config loader for the DS02 QC/QA scripts.
 
-Implements the DS02 threshold pattern (design record: retired QC
-pipeline plan §5, git history): all thresholds live
+Implements the DS02 threshold pattern (design record: the retired QC
+pipeline plan §5): all thresholds live
 in spec YAMLs under ``reference/thresholds/`` (repo-shipped, never
 wiki-fetched — §5d). The loader returns the parsed spec plus the
 provenance snapshot (path + sha256) that the reporting contract embeds

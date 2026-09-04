@@ -1,7 +1,7 @@
 """Shared QC/QA status vocabulary and worst-wins collapse.
 
 Implements the DS02 status vocabulary (``Code/DS02_DatasetQA/README.md``;
-design record: retired QC pipeline plan §3, git history):
+design record: the retired QC pipeline plan §3):
 
 - Check level: ``good | acceptable | warning | fail | not_checked``
 - Script/run level: ``pass | warn | fail | not_evaluated``
