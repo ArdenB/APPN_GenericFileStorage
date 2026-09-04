@@ -1,7 +1,6 @@
 """Tests for the qc_report markdown fragment + assembly renderer.
 
-Covers the QC-report markdown design (QC-report plan, development-master
-repo): fragment content per
+Covers ``Code/DS02_DatasetQA/QC_REPORT_PLAN.md``: fragment content per
 script, assembly with all/partial/no fragments, the pre-fragment and
 legacy stubs, never-raise behaviour, relative-path/figure handling and
 idempotence (re-assembly byte-identical apart from timestamps).
@@ -207,6 +206,12 @@ def test_report_contains_overview_and_stubs(tmp_path, qc01_report):
     assert text.startswith("# QC report — USYD_Narrabri/2026_Test/TestSite/"
                            "CALVIS/2026-08-19/1")
     assert "gpro: test.gpro" in text
+    # client-context wording: intro before the table, legend + note after
+    assert "summarises four checks for one sensor run" in text
+    assert "Advisory checks do not affect" in text
+    assert '"Stale?" means the check used an older sensor bundle' in text
+    assert text.index("summarises four checks") \
+        < text.index("| Script |") < text.index("Advisory checks")
     # overview row for the script that ran + not-yet-run rows for the rest
     assert "QC01_FlightCheck" in text
     assert text.count("— not yet run") == 3
@@ -224,6 +229,11 @@ def test_all_four_sections_render(tmp_path, qc00_report, qc01_report,
         qr.update_qc_report(tmp_path, report)
     text = (tmp_path / "QC_report.md").read_text()
     assert "_Not yet run._" not in text
+    # every section opens with its what-this-checks blurb
+    assert "surveyed ground control points (GCPs)" in text
+    assert "APPN acquisition specification" in text
+    assert "lab measurements" in text
+    assert "zero or no-data pixels" in text
     # QC00: pair table + gate callout
     assert "QC00 fail — downstream QC void" in text
     assert "QC_GCP_distances" in text
@@ -316,6 +326,43 @@ def test_qc02_figures_ordered_val2_elm_val4(tmp_path, qc02_report):
     # overlay/delta pairing preserved within each target
     assert (frag.index("QC_VAL_Gryfn_2_Panels_SWIR_dhr_delta.png")
             < elm)
+    # one heading per target with a role line; heading precedes its figures
+    assert frag.index("### QC_VAL_Gryfn_2_Panels") < val2
+    assert frag.index("### QC_ELM_Panels") < elm
+    assert "Validation (VAL) panels" in frag
+    assert "ELM panels were used for calibration" in frag
+
+
+def test_figure_captions_render_when_file_exists(tmp_path, qc02_report):
+    plots = tmp_path / "QC02_SpectralCheck" / "QC_plots"
+    plots.mkdir(parents=True)
+    (plots / "QC_ELM_Panels_SWIR_dhr_overlay.png").write_bytes(b"png")
+    qr.update_qc_report(tmp_path, qc02_report)
+    frag = (tmp_path / "QC02_SpectralCheck" /
+            "QC02_SpectralCheck_section.md").read_text()
+    overlay_caption = "Image spectra compared with each panel's lab reference"
+    assert overlay_caption in frag
+    assert frag.index("dhr_overlay.png)") < frag.index(overlay_caption)
+    # delta figure was never written → no delta caption
+    assert "Values near zero are ideal" not in frag
+
+
+def test_qc03_figures_grouped_under_product(tmp_path, qc03_report):
+    plots = tmp_path / "QC03_RasterCheck" / "QC_plots"
+    plots.mkdir(parents=True)
+    arts = []
+    for stem in ("vnir_band_zero_fraction", "vnir_band_percentiles"):
+        (plots / f"{stem}.png").write_bytes(b"png")
+        arts.append(f"QC03_RasterCheck/QC_plots/{stem}.png")
+    qc03_report["artifacts"] = arts
+    qr.update_qc_report(tmp_path, qc03_report)
+    frag = (tmp_path / "QC03_RasterCheck" /
+            "QC03_RasterCheck_section.md").read_text()
+    # figures land inside the product block, percentile envelope first
+    assert frag.index("### vnir") \
+        < frag.index("vnir_band_percentiles.png") \
+        < frag.index("vnir_band_zero_fraction.png")
+    assert "Reflectance range by band" in frag
 
 
 def test_missing_and_present_figures(tmp_path, qc00_report):

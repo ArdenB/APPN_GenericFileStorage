@@ -1,7 +1,6 @@
 """Markdown section fragments + QC_report.md assembly for the QC scripts.
 
-Implements the per-run ``QC_report.md`` design (QC-report plan,
-development-master repo; parent = retired pipeline plan §7
+Implements ``Code/DS02_DatasetQA/QC_REPORT_PLAN.md`` (parent plan §7
 revision item 3): each per-run QC script renders **only its own section**
 (from the report dict it just passed to ``write_report``) to a fragment
 file it owns (``QC_data/<script>/<script>_section.md``), then reassembles
@@ -112,6 +111,77 @@ def status_glyph(status: Optional[str]) -> str:
 
 
 # ==================================================================================
+def _wording() -> Dict[str, str]:
+    """Return every client-facing context string in the report.
+
+    Single source for the operator-authored wording (finalised
+    2026-09-04; drafted in a temporary QC_REPORT_WORDING.md working doc
+    that was folded back here and deleted uncommitted — this function
+    is the canonical record).
+
+    Returns
+    -------
+    dict
+        Key → plain-text string (renderers add italics/bolding).
+    """
+    return {
+        "report_intro": (
+            "This report summarises four checks for one sensor run: "
+            "georeferencing (QC00), flight execution (QC01), reflectance "
+            "calibration (QC02) and raster validity (QC03). The table "
+            "below shows the overall result."),
+        "legend": (
+            "✅ Pass. ⚠️ Warning: usable with caution. ❌ Fail: review "
+            "before use. ➖ Not evaluated. Advisory checks do not affect "
+            "the overall result."),
+        "freshness_note": (
+            "\"Stale?\" means the check used an older sensor bundle. "
+            "Re-run it for current results."),
+        "blurb_QC00_GCPCheck": (
+            "Compares surveyed ground control points (GCPs) with their "
+            "image positions. Distances are in metres. If this check "
+            "fails, reprocess the georeferencing and re-run all checks."),
+        "blurb_QC01_FlightCheck": (
+            "Checks bundle completeness, altitude, image overlap "
+            "(sidelap), frame rate, pixel size (GSD) and sun position "
+            "against the APPN acquisition specification."),
+        "blurb_QC02_SpectralCheck": (
+            "Compares image spectra with lab measurements for each "
+            "reference panel and camera range (VNIR and SWIR). "
+            "Differences are reflectance percentage points (pp)."),
+        "blurb_QC03_RasterCheck": (
+            "Checks each raster band for file errors, zero or no-data "
+            "pixels, saturation, and dead or constant values."),
+        "role_val": (
+            "Validation (VAL) panels were not used for calibration, so "
+            "they provide the best independent test of reflectance."),
+        "role_elm": (
+            "ELM panels were used for calibration. Large differences "
+            "indicate a problem."),
+        "caption_displacements": (
+            "Each arrow shows the surveyed and image positions of one "
+            "GCP."),
+        "caption_sun_geometry": (
+            "Sun position relative to the flight lines."),
+        "caption_agl_profiles": (
+            "Altitude above ground level (AGL) along each flight line."),
+        "caption_dhr_overlay": (
+            "Image spectra compared with each panel's lab reference."),
+        "caption_dhr_delta": (
+            "Measured minus expected reflectance by band. Values near "
+            "zero are ideal; shading marks excluded atmospheric water "
+            "bands."),
+        "caption_band_percentiles": (
+            "Reflectance range by band. Sudden drops or spikes flag "
+            "suspect bands."),
+        "caption_band_zero_fraction": (
+            "Percentage of zero or no-data pixels by band."),
+        "caption_band_over_range": (
+            "Percentage of saturated pixels by band."),
+    }
+
+
+# ==================================================================================
 def checks_table(checks: Dict[str, Dict[str, Any]]) -> List[str]:
     """Render a report's ``checks`` mapping as a markdown table.
 
@@ -148,6 +218,7 @@ def checks_table(checks: Dict[str, Dict[str, Any]]) -> List[str]:
 def figure_embeds(
         artifacts: List[str],
         qc_data_dir: pathlib.Path,
+        captions: Optional[Dict[str, str]] = None,
     ) -> List[str]:
     """Render image embeds for a report's ``.png`` artifacts.
 
@@ -161,6 +232,9 @@ def figure_embeds(
         ``QC_data``-relative artifact paths (contract convention).
     qc_data_dir : pathlib.Path
         The run's ``QC_data/`` folder (existence checks only).
+    captions : dict, optional
+        Figure-stem *suffix* → caption text; the first matching caption
+        renders as an italic line under the image.
 
     Returns
     -------
@@ -175,6 +249,10 @@ def figure_embeds(
         title = pathlib.Path(rel).stem
         if (qc_data_dir / rel).is_file():
             lines += [f"![{title}]({rel})", ""]
+            caption = next((text for suffix, text in (captions or {}).items()
+                            if title.endswith(suffix)), None)
+            if caption:
+                lines += [f"_{caption}_", ""]
         else:
             lines += [f"_{rel} (missing)_", ""]
     return lines
@@ -266,9 +344,13 @@ def _assemble(qc_data_dir: pathlib.Path, report: Dict[str, Any]) -> str:
     meta_bits.append(
         f"rendered {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
 
+    wording = _wording()
     lines: List[str] = [f"# QC report — {identity}", "",
-                        "_" + " · ".join(meta_bits) + "_", ""]
+                        "_" + " · ".join(meta_bits) + "_", "",
+                        wording["report_intro"], ""]
     lines += _overview_table(qc_data_dir)
+    lines += [f"_{wording['legend']}_", "",
+              f"_{wording['freshness_note']}_", ""]
     for script_name, subject in _contract_sections():
         frag_path = _fragment_path(qc_data_dir, script_name)
         lines.append("")
@@ -442,6 +524,7 @@ def _section_qc00(
         Markdown lines for the fragment.
     """
     lines = _section_header(report, "GCP geometric accuracy")
+    lines += [f"_{_wording()['blurb_QC00_GCPCheck']}_", ""]
     lines += checks_table(report.get("checks", {}))
 
     if any(chk.get("status") == "fail"
@@ -468,7 +551,9 @@ def _section_qc00(
         lines += ["**Per-pair results:**", "",
                   cf.markdown_table(pd.DataFrame(rows)), ""]
 
-    lines += figure_embeds(report.get("artifacts", []), qc_data_dir)
+    lines += figure_embeds(
+        report.get("artifacts", []), qc_data_dir,
+        captions={"_displacements": _wording()["caption_displacements"]})
     lines += artifact_links(report.get("artifacts", []), qc_data_dir)
     lines += _config_line(report.get("config"))
     return lines
@@ -498,6 +583,7 @@ def _section_qc01(
         Markdown lines for the fragment.
     """
     lines = _section_header(report, "Flight / acquisition")
+    lines += [f"_{_wording()['blurb_QC01_FlightCheck']}_", ""]
     checks = report.get("checks", {})
     integrity_names = ("graw_present", "dark_reference", "panels_present",
                        "reflectance_product_vnir",
@@ -533,7 +619,11 @@ def _section_qc01(
     if bullets:
         lines += ["**Acquisition summary:**", ""] + bullets + [""]
 
-    lines += figure_embeds(report.get("artifacts", []), qc_data_dir)
+    wording = _wording()
+    lines += figure_embeds(
+        report.get("artifacts", []), qc_data_dir,
+        captions={"_sun_geometry": wording["caption_sun_geometry"],
+                  "_agl_profiles": wording["caption_agl_profiles"]})
     lines += artifact_links(report.get("artifacts", []), qc_data_dir)
     stale = report.get("staleness", {})
     if stale.get("gpro_path"):
@@ -568,6 +658,7 @@ def _section_qc02(
         Markdown lines for the fragment.
     """
     lines = _section_header(report, "Panel spectra")
+    lines += [f"_{_wording()['blurb_QC02_SpectralCheck']}_", ""]
     lines += checks_table(report.get("checks", {}))
 
     dhr = report.get("dhr_comparison") or {}
@@ -619,7 +710,7 @@ def _section_qc02(
                   "points):**", "",
                   cf.markdown_table(df, "{:.2f}"), ""]
 
-    lines += figure_embeds(_qc02_figure_order(report), qc_data_dir)
+    lines += _qc02_figure_blocks(report, qc_data_dir)
     tables = [a for a in report.get("artifacts", [])
               if not str(a).lower().endswith(".png")]
     if tables:
@@ -632,25 +723,32 @@ def _section_qc02(
 
 
 # ==================================================================================
-def _qc02_figure_order(report: Dict[str, Any]) -> List[str]:
-    """Order QC02 figure artifacts by reporting priority.
+def _qc02_figure_blocks(
+        report: Dict[str, Any],
+        qc_data_dir: pathlib.Path,
+    ) -> List[str]:
+    """Render QC02 figures grouped per target, in reporting priority.
 
-    Operator rule (2026-09-03): the 2-panel VAL sets are the headline
-    QC02 result — their figures embed first, then the ELM targets, then
-    the remaining (4-panel) VAL sets. Figures whose target cannot be
-    matched go last. The sort is stable, so the overlay/delta pairing
-    and region order within each target are preserved.
+    Operator rules: one ``###`` heading per target with both EM regions
+    under it (2026-09-04) and a one-line role note (VAL vs ELM); the
+    2-panel VAL sets are the headline QC02 result — their block renders
+    first, then the ELM targets, then the remaining (4-panel) VAL sets
+    (2026-09-03). Figures whose target cannot be matched go last,
+    ungrouped. Artifact order is preserved within each target, so the
+    overlay/delta pairing and region order survive.
 
     Parameters
     ----------
     report : dict
         The QC02 contract detail-report dict (targets + panel counts
         come from ``spectral_report``).
+    qc_data_dir : pathlib.Path
+        The run's ``QC_data/`` folder (figure existence checks).
 
     Returns
     -------
     list of str
-        The ``.png`` artifacts in embed order.
+        Markdown lines (empty when there are no figures).
     """
     targets = (report.get("spectral_report") or {}).get("targets", {})
     n_panels = {
@@ -658,21 +756,74 @@ def _qc02_figure_order(report: Dict[str, Any]) -> List[str]:
                      for block in regions.values()), default=0)
         for target, regions in targets.items()}
 
-    def priority(art: str) -> int:
-        stem = pathlib.Path(str(art)).stem
-        match = max((t for t in n_panels if stem.startswith(t)),
-                    key=len, default=None)
-        if match is None:
-            return 3
-        if "VAL" in match.upper() and n_panels[match] == 2:
+    def target_priority(target: str) -> int:
+        if "VAL" in target.upper() and n_panels[target] == 2:
             return 0
-        if "ELM" in match.upper():
+        if "ELM" in target.upper():
             return 1
         return 2
 
     pngs = [str(a) for a in report.get("artifacts", [])
             if str(a).lower().endswith(".png")]
-    return sorted(pngs, key=priority)
+    by_target: Dict[Optional[str], List[str]] = {}
+    for art in pngs:
+        stem = pathlib.Path(art).stem
+        match = max((t for t in n_panels if stem.startswith(t)),
+                    key=len, default=None)
+        by_target.setdefault(match, []).append(art)
+
+    wording = _wording()
+    captions = {"_dhr_overlay": wording["caption_dhr_overlay"],
+                "_dhr_delta": wording["caption_dhr_delta"]}
+    lines: List[str] = []
+    for target in sorted(n_panels, key=target_priority):
+        figs = by_target.get(target)
+        if not figs:
+            continue
+        lines += [f"### {target}", ""]
+        if "ELM" in target.upper():
+            lines += [f"_{wording['role_elm']}_", ""]
+        elif "VAL" in target.upper():
+            lines += [f"_{wording['role_val']}_", ""]
+        lines += figure_embeds(figs, qc_data_dir, captions=captions)
+    lines += figure_embeds(by_target.get(None, []), qc_data_dir,
+                           captions=captions)
+    return lines
+
+
+# ==================================================================================
+def _qc03_figure_order(artifacts: List[str]) -> List[str]:
+    """Order QC03 figure artifacts for embedding.
+
+    The percentile envelope (the data-health overview) leads, then the
+    zero-fraction and over-range fraction figures (operator order,
+    2026-09-04). The sort is stable, so products keep their recorded
+    order within each figure type; non-figure artifacts pass through.
+
+    Parameters
+    ----------
+    artifacts : list of str
+        The report's artifact paths.
+
+    Returns
+    -------
+    list of str
+        Artifacts with the ``.png`` entries reordered.
+    """
+    def priority(art: str) -> int:
+        stem = pathlib.Path(str(art)).stem
+        for rank, suffix in enumerate(("_band_percentiles",
+                                       "_band_zero_fraction",
+                                       "_band_over_range")):
+            if stem.endswith(suffix):
+                return rank
+        return 3
+
+    pngs = sorted((str(a) for a in artifacts
+                   if str(a).lower().endswith(".png")), key=priority)
+    others = [str(a) for a in artifacts
+              if not str(a).lower().endswith(".png")]
+    return pngs + others
 
 
 # ==================================================================================
@@ -684,8 +835,9 @@ def _section_qc03(
 
     Pivots the per-product check explosion into a check-family × product
     matrix, then one detail block per product (dims, integrity, zone-split
-    evidence), figure embeds (none today, future-proof) and the staleness
-    + config lines.
+    evidence), figure embeds (per-band figures since QC03 v1.8; the
+    percentile envelope leads — operator order, 2026-09-04) and the
+    staleness + config lines.
 
     Parameters
     ----------
@@ -700,11 +852,12 @@ def _section_qc03(
         Markdown lines for the fragment.
     """
     lines = _section_header(report, "Raster data validity")
+    lines += [f"_{_wording()['blurb_QC03_RasterCheck']}_", ""]
     checks = report.get("checks", {})
     labels = list(report.get("products", {}))
     families = ("header_bin_integrity", "zeros_in_footprint", "over_range",
-                "negative", "nan_inf", "capture_extent", "zero_edge_band",
-                "dropout_in_roi", "data_outside_bbox")
+                "negative", "nan_inf", "dead_bands", "capture_extent",
+                "zero_edge_band", "dropout_in_roi", "data_outside_bbox")
     if labels:
         rows = []
         for family in families:
@@ -720,6 +873,21 @@ def _section_qc03(
         lines += [cf.markdown_table(pd.DataFrame(rows)), ""]
     else:
         lines += checks_table(checks)
+
+    wording = _wording()
+    captions = {
+        "_band_percentiles": wording["caption_band_percentiles"],
+        "_band_zero_fraction": wording["caption_band_zero_fraction"],
+        "_band_over_range": wording["caption_band_over_range"]}
+    ordered = _qc03_figure_order(report.get("artifacts", []))
+    figures_by_label: Dict[Optional[str], List[str]] = {}
+    for art in ordered:
+        if not str(art).lower().endswith(".png"):
+            continue
+        stem = pathlib.Path(str(art)).stem
+        match = next((lbl for lbl in labels
+                      if stem.startswith(f"{lbl}_")), None)
+        figures_by_label.setdefault(match, []).append(str(art))
 
     for label, product in report.get("products", {}).items():
         shape = product.get("shape", {})
@@ -751,8 +919,11 @@ def _section_qc03(
             lines.append(
                 f"- Constant bands: {product['constant_bands']}")
         lines.append("")
+        lines += figure_embeds(figures_by_label.get(label, []), qc_data_dir,
+                               captions=captions)
 
-    lines += figure_embeds(report.get("artifacts", []), qc_data_dir)
+    lines += figure_embeds(figures_by_label.get(None, []), qc_data_dir,
+                           captions=captions)
     stale = report.get("staleness", {})
     for label, entry in stale.items():
         if isinstance(entry, dict) and entry.get("path"):

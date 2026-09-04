@@ -1,18 +1,18 @@
 """Shared QC/QA reporting contract for the DS02 scripts.
 
 One implementation of the DS02 pipeline's cross-cutting pieces (live
-spec: ``Code/DS02_DatasetQA/README.md``; design record: the retired QC
-pipeline plan, in this repo's git history — whose §-numbers the
+spec: ``Code/DS02_DatasetQA/README.md``; design record:
+``record/plan_archive/2026-09_QC_PIPELINE.md``, whose §-numbers the
 notes below cite):
 
 - status vocabulary + worst-wins collapse (§3)
 - JSON-first report writer + YAML-summary projector (§2/§4)
 - report reader tolerant of legacy filenames/schemas (§6)
 - threshold-config loader (§5/§5d)
-- QC_report.md section fragments + assembly (``markdown.py``)
+- QC_report.md section fragments + assembly (QC_REPORT_PLAN.md)
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __author__ = "Arden Burrell"
 
 from .status import (check_levels, script_levels, collapse, worst,
