@@ -44,6 +44,7 @@ from ruamel.yaml.comments import CommentedMap, CommentedSeq
 __all__ = [
     "read_triggers",
     "read_duplicate",
+    "run_disposition",
     "load_issue_yaml",
     "flight_deviation_vocab",
     "run_flight_deviations",
@@ -120,6 +121,138 @@ def read_duplicate(date_dir: pathlib.Path, run_name: str) -> bool:
     if isinstance(val, str):
         return val.strip().lower() in {"true", "t", "1", "yes", "y"}
     return bool(val) if pd.notna(val) else False
+
+
+# ==================================================================================
+def run_disposition(date_dir: pathlib.Path) -> Dict[str, Dict[str, Any]]:
+    """Resolve duplicate groups and their winners from RunOverview.csv.
+
+    A duplicate group is an original run plus every row whose ``DupOf``
+    (run number of the original, chains resolved to the root) points at
+    it. The group's winner is the single row flagged ``BestRun``; when
+    no row is flagged the original wins. Legacy flat duplicates
+    (``DuplicateRun`` set, no ``DupOf``) have no resolvable group: they
+    are never winners unless self-promoted via ``BestRun``.
+
+    Parameters
+    ----------
+    date_dir : pathlib.Path
+        Date folder containing ``RunOverview.csv``.
+
+    Returns
+    -------
+    dict
+        Maps each run name to ``{"is_duplicate": bool, "dup_of":
+        str or None, "winner": str or None, "is_winner": bool}``.
+        ``dup_of`` is the resolved root original; ``winner`` is None
+        only for flat duplicates with no group and no ``BestRun``.
+        Empty when the file is missing (callers treat unknown runs as
+        winners).
+
+    Raises
+    ------
+    ValueError
+        If more than one row in a duplicate group is flagged
+        ``BestRun`` (ambiguous curation — fix the table).
+
+    Warns
+    -----
+    UserWarning
+        On a ``DupOf`` that is unparseable, self-referencing, cyclic or
+        naming no run (row degrades to a flat duplicate), and on a
+        ``DupOf`` without ``DuplicateRun`` (treated as duplicate).
+    """
+    fpath = date_dir / "RunOverview.csv"
+    if not fpath.is_file():
+        return {}
+    df = pd.read_csv(fpath, index_col="Run")
+    runs = [str(r) for r in df.index]
+
+    # +++++ Per-row flag parsing (same truthy set as read_triggers) +++++
+    def _flag(run: str, col: str) -> bool:
+        if col not in df.columns:
+            return False
+        val = df.loc[run, col]
+        if isinstance(val, str):
+            return val.strip().lower() in {"true", "t", "1", "yes", "y"}
+        return bool(val) if pd.notna(val) else False
+
+    def _dupof(run: str) -> Optional[str]:
+        if "DupOf" not in df.columns:
+            return None
+        val = df.loc[run, "DupOf"]
+        if pd.isna(val) or (isinstance(val, str) and not val.strip()):
+            return None
+        if isinstance(val, str):
+            s = val.strip()
+            if s.lower().startswith("run"):
+                return s
+            try:
+                val = float(s)
+            except ValueError:
+                warn.warn(f"{fpath}: {run} has unparseable DupOf {s!r} "
+                          f"— ignored")
+                return None
+        return f"run_{int(val):02d}"
+
+    dup_flag = {r: _flag(r, "DuplicateRun") for r in runs}
+    best_flag = {r: _flag(r, "BestRun") for r in runs}
+    dup_of: Dict[str, Optional[str]] = {}
+    for r in runs:
+        target = _dupof(r)
+        if target is not None and (target == r or target not in runs):
+            warn.warn(f"{fpath}: {r} DupOf points at "
+                      f"{'itself' if target == r else target + ', which is not a run in the table'}"
+                      f" — ignored")
+            target = None
+        if target is not None and not dup_flag[r]:
+            warn.warn(f"{fpath}: {r} has DupOf but DuplicateRun is not set "
+                      f"— treating as duplicate")
+            dup_flag[r] = True
+        dup_of[r] = target
+
+    # +++++ Resolve DupOf chains (dup of a dup) to the root original +++++
+    def _root(run: str) -> Optional[str]:
+        seen, cur = {run}, run
+        while dup_of[cur] is not None:
+            cur = dup_of[cur]
+            if cur in seen:
+                warn.warn(f"{fpath}: circular DupOf chain involving {run} "
+                          f"— treating as flat duplicate")
+                return None
+            seen.add(cur)
+        return cur
+
+    groups: Dict[str, List[str]] = {}
+    root_of: Dict[str, Optional[str]] = {}
+    for r in runs:
+        root = _root(r) if dup_of[r] is not None else None
+        root_of[r] = root
+        if root is not None:
+            groups.setdefault(root, []).append(r)
+
+    # +++++ Pick each group's winner (single BestRun, else the root) +++++
+    out = {r: {"is_duplicate": dup_flag[r], "dup_of": root_of[r],
+               "winner": None} for r in runs}
+    grouped = set()
+    for root, dups in groups.items():
+        group = [root] + dups
+        grouped.update(group)
+        bests = [g for g in group if best_flag[g]]
+        if len(bests) > 1:
+            raise ValueError(
+                f"{fpath}: multiple BestRun rows in the duplicate group of "
+                f"{root}: {bests}. A group may declare at most one winner.")
+        winner = bests[0] if bests else root
+        for g in group:
+            out[g]["winner"] = winner
+    for r in runs:
+        if r not in grouped:
+            # Flat duplicates stay winnerless unless self-promoted.
+            out[r]["winner"] = (r if (not dup_flag[r]) or best_flag[r]
+                                else None)
+        out[r]["is_winner"] = out[r]["winner"] == r
+    return out
 
 
 # ==================================================================================
@@ -306,7 +439,11 @@ def run_exclusion(date_dir: pathlib.Path, run_name: str,
         None (clean only), ``untriaged``, ``degraded`` or ``failed``.
         Each level also includes everything below it.
     include_duplicates : bool
-        Include runs flagged ``DuplicateRun`` (orthogonal axis).
+        Include every member of each duplicate group (orthogonal axis).
+        By default only the group's winner is processed: the single
+        ``BestRun`` row, or the original when no ``BestRun`` is set —
+        so a winning reprocess demotes its original (see
+        ``run_disposition``).
     include_flight_deviations : bool
         Include runs with declared flight deviations (entries deleted
         from the ``flight_compliance`` list in their issue YAML) —
@@ -330,8 +467,16 @@ def run_exclusion(date_dir: pathlib.Path, run_name: str,
     if level not in rank:
         raise ValueError(f"include_runs must be one of "
                          f"{sorted(rank)[1:]} or None, got '{include_runs}'")
-    if not include_duplicates and read_duplicate(date_dir, run_name):
-        return "DuplicateRun flagged (use --include-duplicates)"
+    if not include_duplicates:
+        disp = run_disposition(date_dir).get(run_name)
+        if disp is not None and not disp["is_winner"]:
+            if not disp["is_duplicate"]:
+                return (f"superseded by {disp['winner']} (BestRun) "
+                        "(use --include-duplicates)")
+            if disp["winner"]:
+                return (f"DuplicateRun flagged, group winner is "
+                        f"{disp['winner']} (use --include-duplicates)")
+            return "DuplicateRun flagged (use --include-duplicates)"
     if not include_flight_deviations:
         deviations = run_flight_deviations(date_dir, run_name)
         if deviations:
