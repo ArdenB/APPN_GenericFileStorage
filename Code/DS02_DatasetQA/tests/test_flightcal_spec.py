@@ -241,3 +241,150 @@ def test_add_appn_compliance_check(qc01):
     qc01.add_appn_compliance_check(report4)
     assert report4["checks"]["appn_compliant"]["status"] == "not_checked"
     assert "value" not in report4["checks"]["appn_compliant"]
+
+
+# ==================================================================================
+def _spec_inputs(rows, lidar=False):
+    """Build (df, exposure, mission) for add_spec_check with one nHP sensor.
+
+    Parameters
+    ----------
+    rows : list of dict
+        Per-line values; keys agl_m, oversampling, sidelap, spacing,
+        fp_ms, rogue (all optional beyond agl_m).
+    lidar : bool
+        Add an OS1-128 LiDAR acquisition to the mission.
+
+    Returns
+    -------
+    tuple
+        (df, exposure, mission) ready for qc01.add_spec_check.
+    """
+    nan = float("nan")
+    df = pd.DataFrame({
+        "sensor_id": ["nHP-809"] * len(rows),
+        "line": list(range(len(rows))),
+        "line_length_m": [r.get("length", 95.0) for r in rows],
+        "agl_m": [r["agl_m"] for r in rows],
+        "ground_speed_ms": [5.0] * len(rows),
+        "achieved_frame_period_ms": [r.get("fp_ms", 5.5) for r in rows],
+        "line_spacing_m": [r.get("spacing", nan) for r in rows],
+        "est_sidelap_pct": [r.get("sidelap", nan) for r in rows],
+        "oversampling_actual_pct": [r.get("oversampling", nan) for r in rows],
+        "time_to_solar_noon_min": [10.0] * len(rows),
+        "rogue_line": [r.get("rogue", False) for r in rows],
+    })
+    exposure = {"sensors": {"nHP-809": {
+        "settings_txt": {"lens_efl_mm": 12.6, "frame_period_ms": 5.5}}}}
+    acqs = [{"sensor_id": "nHP-809", "type": "VNIR"}]
+    if lidar:
+        acqs.append({"sensor_id": "OS1-128", "type": "LiDAR"})
+    return df, exposure, {"acquisitions": acqs}
+
+
+# ==================================================================================
+def test_rogue_stub_excluded_from_spec_summary(qc01, cal_spec):
+    """AU Rosedale GOBI 20260707 run_00: a rogue capture stub must not
+    contaminate the per-sensor summary, contract checks or appn_compliant."""
+    df, exposure, mission = _spec_inputs([
+        {"agl_m": 30.0, "oversampling": 23.0, "sidelap": 41.0},
+        {"agl_m": 30.0, "oversampling": 25.0, "sidelap": 41.0},
+        {"agl_m": 30.0, "oversampling": 29.5, "sidelap": 41.0},
+        # 2.4 m stub at low AGL: negative oversampling, contaminated gsd
+        {"agl_m": 11.0, "oversampling": -26.0, "fp_ms": 10.4,
+         "length": 2.4, "rogue": True},
+    ])
+    out, rep = qc01.add_spec_check(df, exposure, mission, cal_spec)
+    rec = rep["linescan"]["nHP-809"]
+    assert rec["oversampling_status_fieldbook"] == "acceptable"
+    assert rec["oversampling_pct_range"] == pytest.approx([23.0, 29.5])
+    # low-AGL stub gsd (0.51 cm) excluded from the range too
+    assert rec["gsd_cm_range"] == pytest.approx([1.395, 1.395], abs=5e-4)
+    assert rep["verdict_fieldbook"] == "acceptable"
+    assert rep["rogue_lines"]["n_excluded"] == 1
+    # the line-level table keeps the rogue row, marked for audit
+    assert out.loc[3, "oversampling_status_fieldbook"] == "rogue_line"
+
+    report = {"checks": {}}
+    qc01.add_spec_contract_checks(report, mission, rep)
+    qc01.add_appn_compliance_check(report)
+    chk = report["checks"]["oversampling_vnir_fieldbook"]
+    assert chk["status"] == "acceptable"
+    assert chk["value"] == "23.0-29.5 %"
+    assert report["checks"]["appn_compliant"]["value"] is True
+
+
+# ==================================================================================
+def test_all_lines_rogue_not_checked(qc01, cal_spec):
+    """Every line rogue -> line-derived checks not_checked, ranges null."""
+    df, exposure, mission = _spec_inputs([
+        {"agl_m": 11.0, "oversampling": -26.0, "length": 2.4, "rogue": True},
+        {"agl_m": 12.0, "oversampling": -30.0, "length": 3.0, "rogue": True},
+    ])
+    _, rep = qc01.add_spec_check(df, exposure, mission, cal_spec)
+    rec = rep["linescan"]["nHP-809"]
+    assert rec["oversampling_status_fieldbook"] == "not_checked"
+    assert rec["gsd_status"] == "not_checked"
+    assert rec["achieved_frame_rate_status"] == "not_checked"
+    assert rec["oversampling_pct_range"] == [None, None]
+    assert rec["gsd_cm_range"] == [None, None]
+    assert rep["verdict_fieldbook"] == "not_checked"
+
+    # projection must not crash on null ranges or claim compliance
+    report = {"checks": {}}
+    qc01.add_spec_contract_checks(report, mission, rep)
+    qc01.add_appn_compliance_check(report)
+    assert report["checks"]["oversampling_vnir_fieldbook"]["status"] \
+        == "not_checked"
+    assert "value" not in report["checks"]["oversampling_vnir_fieldbook"]
+    assert report["checks"]["appn_compliant"]["status"] == "not_checked"
+
+
+# ==================================================================================
+def test_non_rogue_failure_stays_failed(qc01, cal_spec):
+    """UWA York_F 20260729 run_00 / DPIRD 20260812 run_02: a genuine
+    (non-rogue) negative-oversampling line keeps the fail, rogue or not."""
+    df, exposure, mission = _spec_inputs([
+        # incomplete survey transect: full-length line, imagery stops early
+        {"agl_m": 30.0, "oversampling": -33.8, "sidelap": 41.0},
+        {"agl_m": 30.0, "oversampling": 23.0, "sidelap": 41.0},
+        {"agl_m": 30.0, "oversampling": 25.0, "sidelap": 41.0},
+        {"agl_m": 11.0, "oversampling": -26.0, "fp_ms": 10.4,
+         "length": 2.4, "rogue": True},
+    ])
+    _, rep = qc01.add_spec_check(df, exposure, mission, cal_spec)
+    rec = rep["linescan"]["nHP-809"]
+    assert rec["oversampling_status_fieldbook"] == "fail"
+    assert rec["oversampling_pct_range"] == pytest.approx([-33.8, 25.0])
+    assert rep["verdict_fieldbook"] == "fail"
+
+    report = {"checks": {}}
+    qc01.add_spec_contract_checks(report, mission, rep)
+    qc01.add_appn_compliance_check(report)
+    assert report["checks"]["oversampling_vnir_fieldbook"]["status"] == "fail"
+    assert report["checks"]["appn_compliant"]["value"] is False
+
+
+# ==================================================================================
+def test_lidar_rogue_exclusion(qc01, cal_spec):
+    """Rogue rows are excluded from LiDAR ranges/medians but keep their
+    per-line LiDAR columns for audit."""
+    df, exposure, mission = _spec_inputs([
+        # worked example line: sidelap 75.5 %, single density 122.3 pts/m2
+        {"agl_m": 60.0, "oversampling": 23.0, "sidelap": 41.0,
+         "spacing": 17.0},
+        # low-AGL rogue: tiny swath -> huge density, no spacing
+        {"agl_m": 5.0, "length": 2.4, "rogue": True},
+    ], lidar=True)
+    out, rep = qc01.add_spec_check(df, exposure, mission, cal_spec)
+    lid = rep["lidar"]
+    assert lid["sidelap_pct_range"] == pytest.approx([75.5, 75.5], abs=0.05)
+    assert lid["sidelap_status"] == "good"
+    # nanmedian over both rows would average in the rogue's inflated density
+    assert lid["est_point_density_single_pts_m2"] == pytest.approx(
+        122.3, abs=0.05)
+    assert lid["est_point_density_overlap_pts_m2"] == pytest.approx(
+        306.99, abs=0.05)
+    # per-line columns keep the rogue row's values
+    assert out.loc[1, "lidar_swath_m"] > 0
+    assert out.loc[1, "lidar_sidelap_status"] == "rogue_line"

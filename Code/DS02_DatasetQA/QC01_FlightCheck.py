@@ -101,7 +101,7 @@ Command-line Arguments
 
 __title__ = "Flight check"
 __author__ = "Arden Burrell"
-__version__ = "v2.8(03.09.2026)"
+__version__ = "v2.9(04.09.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -1560,7 +1560,9 @@ def add_spec_check(
     constraint: negative sidelap = coverage gap, or frame period below
     the sensor minimum = physically unachievable) / not_checked (inputs
     missing). LiDAR reuses the hyperspec line spacing/AGL - the platform
-    flies one pattern for all sensors.
+    flies one pattern for all sensors. Rogue lines stay in the line
+    table (status columns marked `rogue_line`) but are excluded from
+    every summary aggregate, status and verdict.
 
     Parameters
     ----------
@@ -1607,6 +1609,10 @@ def add_spec_check(
         "lidar": {"source": "no LiDAR acquisition"},
     }
     cfg_statuses = []
+    # rogue lines stay in the line-level table but never in the summary
+    # aggregates: records here are frozen before the rogue-status
+    # replacement below, so filtering must happen at this boundary
+    live = ~df["rogue_line"]
     # ========== line-scan sensors ==========
     for sid, rec in exposure.get("sensors", {}).items():
         mask = df["sensor_id"] == sid
@@ -1658,7 +1664,7 @@ def add_spec_check(
             classify_high(v, ov["good_min"], ov["accept_min"],
                           ov.get("fail_below"))
             for v in df.loc[mask, "oversampling_actual_pct"]]
-        sub = df.loc[mask]
+        sub = df.loc[mask & live]
         fp = sub["achieved_frame_period_ms"].replace(0, np.nan)
         report["linescan"][sid] = {
             "calculator_name": ls.get("calculator_name"),
@@ -1707,14 +1713,15 @@ def add_spec_check(
                 "sensor_id": lid.get("sensor_id"),
                 "calculator_name": lrec.get("calculator_name"),
                 "corrections_applied": lrec.get("corrections") or None,
-                "sidelap_pct_range": [_nanfloat(df["lidar_sidelap_pct"].min()),
-                                      _nanfloat(df["lidar_sidelap_pct"].max())],
-                "sidelap_status": _worst(df["lidar_sidelap_status"]),
+                "sidelap_pct_range": [
+                    _nanfloat(df.loc[live, "lidar_sidelap_pct"].min()),
+                    _nanfloat(df.loc[live, "lidar_sidelap_pct"].max())],
+                "sidelap_status": _worst(df.loc[live, "lidar_sidelap_status"]),
                 "est_points_per_s": _nanfloat(m["points_per_s"]),
                 "est_point_density_single_pts_m2": _nanfloat(
-                    np.nanmedian(m["density_single_pts_m2"])),
+                    np.nanmedian(m["density_single_pts_m2"][live])),
                 "est_point_density_overlap_pts_m2": _nanfloat(
-                    np.nanmedian(m["density_overlap_pts_m2"])),
+                    np.nanmedian(m["density_overlap_pts_m2"][live])),
                 "density_note": "ESTIMATE (per-line median, FlightCal "
                                 f"section 2.2 formula); return mode {rmode} "
                                 "assumed - not recorded in the bundles",
@@ -1733,11 +1740,11 @@ def add_spec_check(
         ] or None,
         "note": "take-off/landing/stub captures (AGL below --rogue-agl-frac "
                 "x sensor median, or length below --rogue-len-frac x median); "
-                "excluded from line-spacing estimation and spec verdicts",
+                "excluded from line-spacing estimation, per-sensor summaries "
+                "and spec verdicts",
     }
     # ========== time to solar noon (fieldbook target, pass/fail) ==========
     tn = thr_f.get("time_to_solar_noon_min")
-    live = ~df["rogue_line"]
     if tn:
         df.loc[live, "solar_noon_status"] = [
             classify_low(v, tn["good_max"], tn["warn_min"],
