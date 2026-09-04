@@ -75,7 +75,7 @@ Multi-run comparison (figures across runs/sites/nodes, --load-dir /
 
 __title__ = "Spectral check"
 __author__ = "Arden Burrell"
-__version__ = "v3.6(03.09.2026)"
+__version__ = "v3.7(04.09.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 
@@ -123,6 +123,7 @@ if _git_root not in sys.path:
 import Code.functions.core_functions as cf
 import Code.functions.spectral_qc as sq
 import Code.functions.qc_report as qr
+import Code.functions.issue_yaml as iy
 
 
 # ==================================================================================
@@ -625,6 +626,8 @@ def _write_contract_report(
         }
         contract["config"]["spectral_limits"] = dhr["config"]
         contract["artifacts"] += dhr["artifacts"]
+    run_dir = qc_dir.parent.parent
+    iy.ensure_finding_tickets(run_dir.parent, run_dir.name, contract)
     summary_path, _ = qr.write_report(qc_dir, contract)
     qr.update_qc_report(qc_dir, contract)
     if verbose:

@@ -97,7 +97,7 @@ Command-line Arguments
 
 __title__ = "GCP check"
 __author__ = "Arden Burrell"
-__version__ = "v2.3(03.09.2026)"
+__version__ = "v2.4(04.09.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -139,6 +139,7 @@ except git_exc.InvalidGitRepositoryError:
 import Code.functions.core_functions as cf
 import Code.functions.gcp_qc as gq
 import Code.functions.qc_report as qr
+import Code.functions.issue_yaml as iy
 
 
 # +++++ DSM filename pattern: <stem>_LiDAR_DSM_<cm>cm.tif +++++
@@ -607,7 +608,10 @@ def write_contract_report(
     ``gcp_2d[_{product}]`` check (the pass/fail gate) plus
     ``height_bias``/``planar_bias`` warning checks. The full per-pair
     reports are embedded in the detail JSON; the per-pair JSON files
-    stay on disk for QA00_GCPComparison.
+    stay on disk for QA00_GCPComparison. Gating fails also
+    author/refresh machine finding-tickets in the run's ``Issues.yaml``
+    before the report write (QC findings loop; a passing re-run closes
+    its own open findings as ``fixed``).
 
     Parameters
     ----------
@@ -690,6 +694,7 @@ def write_contract_report(
     report["pairs"] = {_pair_stem(r): r for r in reports}
     report["config"] = spec_snapshot or {"path": None, "sha256": None}
     report["artifacts"] = artifacts
+    iy.ensure_finding_tickets(run_dir.parent, run_dir.name, report)
     qr.write_report(qc_data, report)
     qr.update_qc_report(qc_data, report)
     if verbose:

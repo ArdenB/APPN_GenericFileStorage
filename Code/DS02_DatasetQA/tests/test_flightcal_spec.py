@@ -388,3 +388,24 @@ def test_lidar_rogue_exclusion(qc01, cal_spec):
     # per-line columns keep the rogue row's values
     assert out.loc[1, "lidar_swath_m"] > 0
     assert out.loc[1, "lidar_sidelap_status"] == "rogue_line"
+
+
+# ==================================================================================
+def test_finding_groups_aggregation(qc01):
+    """Spec-family checks group per sensor tag; everything else stays out."""
+    report = {"checks": {name: {"status": "fail"} for name in [
+        "gsd_vnir", "frame_rate_vnir", "sidelap_vnir_calculator",
+        "sidelap_vnir_fieldbook", "oversampling_vnir_fieldbook",
+        "gsd_swir", "sidelap_lidar", "graw_present",
+        "time_to_solar_noon", "flightcal_spec",
+    ]}}
+    groups = qc01.finding_groups(report)
+    assert sorted(groups) == ["flight_spec_swir", "flight_spec_vnir"]
+    assert sorted(groups["flight_spec_vnir"]) == [
+        "frame_rate_vnir", "gsd_vnir", "oversampling_vnir_fieldbook",
+        "sidelap_vnir_calculator", "sidelap_vnir_fieldbook"]
+    assert groups["flight_spec_swir"] == ["gsd_swir"]
+    grouped = {m for members in groups.values() for m in members}
+    # bundle integrity, the gate, solar timing and lidar stay singletons
+    assert grouped.isdisjoint({"sidelap_lidar", "graw_present",
+                               "time_to_solar_noon", "flightcal_spec"})
