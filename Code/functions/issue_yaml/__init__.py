@@ -33,6 +33,7 @@ re-adds) and let QC01 annotate/waive the covered checks.
 
 import json
 import pathlib
+import re
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 import warnings as warn
 
@@ -49,6 +50,7 @@ __all__ = [
     "flight_deviation_vocab",
     "run_flight_deviations",
     "finding_states",
+    "finding_groups",
     "ensure_finding_tickets",
     "classify_run",
     "RunDecision",
@@ -398,6 +400,56 @@ def finding_states() -> Dict[str, Tuple[str, ...]]:
 
 
 # ==================================================================================
+def finding_groups(report: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Canonical per-script finding-grouping policy (one-writer contract).
+
+    Every writer of ``qc_findings`` (the QC scripts inline, PS00 as the
+    scheduled backstop) must author identical ``(script, finding)``
+    identities or they duplicate each other's tickets, so the
+    per-script grouping policies live in this one dispatch:
+
+    - ``QC01_FlightCheck`` — ``flight_spec_{tag}`` groups the
+      per-sensor spec family (GSD + frame rate + sidelap +
+      oversampling: one mis-set config is one ticket);
+      ``sidelap_lidar``, bundle integrity and the flightcal gate stay
+      singletons;
+    - ``QC03_RasterCheck`` — ``raster_{label}`` groups every
+      per-product check (raster problems on one product share a
+      cause);
+    - anything else — singletons (per product-layer / per region fails
+      have independent causes).
+
+    Parameters
+    ----------
+    report : dict
+        Contract report dict (``script.name`` + ``checks`` keys;
+        statuses are irrelevant here — :func:`ensure_finding_tickets`
+        keeps only failing members).
+
+    Returns
+    -------
+    dict of str -> list of str
+        Finding key -> member check names. Checks outside every group
+        become singleton findings.
+    """
+    script = str((report.get("script") or {}).get("name", ""))
+    checks = report.get("checks") or {}
+    if script == "QC01_FlightCheck":
+        groups: Dict[str, List[str]] = {}
+        for name in checks:
+            m = re.match(r"(?:gsd|frame_rate|sidelap|oversampling)_"
+                         r"(?!lidar$)(.+?)(?:_calculator|_fieldbook)?$", name)
+            if m:
+                groups.setdefault(f"flight_spec_{m.group(1)}", []).append(name)
+        return groups
+    if script == "QC03_RasterCheck":
+        return {f"raster_{label}": [n for n in checks
+                                    if n.endswith(f"_{label}")]
+                for label in (report.get("products") or {})}
+    return {}
+
+
+# ==================================================================================
 def _live_findings(yaml_data: Dict[str, Any],
                    ) -> Dict[Tuple[str, str], Dict[str, Any]]:
     """Resolve the live ``qc_findings`` entry per ``(script, finding)``.
@@ -470,9 +522,10 @@ def ensure_finding_tickets(date_dir: pathlib.Path, run_name: str,
         status, not advisory, not waived — the same set that makes the
         run status ``fail``.
     groups : dict of str -> list of str, optional
-        Script-owned aggregation policy: finding key -> member check
-        names (e.g. ``{"dead_bands": ["dead_band_412nm", ...]}``).
-        Failing checks not claimed by any group become singleton
+        Grouping override: finding key -> member check names. Default
+        None derives the canonical per-script policy via
+        :func:`finding_groups` — pass an explicit mapping only in
+        tests. Failing checks not claimed by any group become singleton
         findings keyed by check name.
     write : bool
         When False, report planned actions without writing.
@@ -486,6 +539,8 @@ def ensure_finding_tickets(date_dir: pathlib.Path, run_name: str,
     version = str((report.get("script") or {}).get("version", ""))
     report_utc = str(report.get("generated_utc", ""))
     checks = report.get("checks") or {}
+    if groups is None:
+        groups = finding_groups(report)
 
     # +++++ gating fails (advisory/waived never fail the run -> no finding) +++++
     failing = [n for n, c in checks.items()
@@ -495,10 +550,10 @@ def ensure_finding_tickets(date_dir: pathlib.Path, run_name: str,
                if isinstance(c, dict)
                and c.get("status") in {"good", "acceptable"}}
 
-    # +++++ apply the script's grouping policy +++++
+    # +++++ apply the grouping policy +++++
     grouped: Dict[str, List[str]] = {}
     claimed: set = set()
-    for key, members in (groups or {}).items():
+    for key, members in groups.items():
         mem = [m for m in members if m in failing]
         if mem:
             grouped[str(key)] = mem

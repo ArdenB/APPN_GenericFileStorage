@@ -353,13 +353,7 @@ def process_run(
                          p["bin"].stat().st_mtime, unit="s",
                          tz="UTC").isoformat()}
         for p in products}
-    # one finding per product, not per check (QC findings loop; currently
-    # dormant - every QC03 check is advisory and advisory never authors)
-    groups = {f"raster_{label}": [n for n in report["checks"]
-                                  if n.endswith(f"_{label}")]
-              for label in report["products"]}
-    iy.ensure_finding_tickets(run_dir.parent, run_dir.name, report,
-                              groups=groups)
+    iy.ensure_finding_tickets(run_dir.parent, run_dir.name, report)
     qr.write_report(qc_data, report)
     qr.update_qc_report(qc_data, report)
     row.update({"status": report["status"], "reason": None})

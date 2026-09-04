@@ -328,47 +328,13 @@ def process_run(
         spec_report, spec_snapshot, acq_report)
     annotate_flight_deviations(
         report, iy.run_flight_deviations(run_dir.parent, run_dir.name))
-    iy.ensure_finding_tickets(run_dir.parent, run_dir.name, report,
-                              groups=finding_groups(report))
+    iy.ensure_finding_tickets(run_dir.parent, run_dir.name, report)
     qr.write_report(qc_data, report)
     qr.update_qc_report(qc_data, report)
     row.update({"status": report["status"], "reason": None})
     if args.verbose:
         tqdm.write(f"{run_dir}: {report['status']}")
     return row
-
-
-# ==================================================================================
-def finding_groups(report: Dict[str, Any]) -> Dict[str, List[str]]:
-    """Group correlated per-sensor spec fails into one finding each.
-
-    One mis-set sensor configuration typically fails several spec
-    checks at once (GSD + frame rate + sidelap + oversampling), so the
-    finding-ticket policy (QC findings plan, development-master repo)
-    aggregates the spec family per sensor tag: ``flight_spec_{tag}``
-    covers ``gsd_{tag}``, ``frame_rate_{tag}``, ``sidelap_{tag}_*`` and
-    ``oversampling_{tag}_*``. ``sidelap_lidar``, the bundle-integrity
-    checks and the flightcal gate stay singleton findings.
-
-    Parameters
-    ----------
-    report : dict
-        The contract report dict (its ``checks`` keys are grouped;
-        statuses are irrelevant here — ``ensure_finding_tickets`` keeps
-        only failing members).
-
-    Returns
-    -------
-    dict of str -> list of str
-        Finding key -> member check names.
-    """
-    groups: Dict[str, List[str]] = {}
-    for name in report.get("checks", {}):
-        m = re.match(r"(?:gsd|frame_rate|sidelap|oversampling)_"
-                     r"(?!lidar$)(.+?)(?:_calculator|_fieldbook)?$", name)
-        if m:
-            groups.setdefault(f"flight_spec_{m.group(1)}", []).append(name)
-    return groups
 
 
 # ==================================================================================

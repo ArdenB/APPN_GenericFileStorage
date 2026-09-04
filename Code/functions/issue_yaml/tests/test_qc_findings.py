@@ -148,24 +148,24 @@ def set_state(date_dir: pathlib.Path, run: str, script: str, finding: str,
 # ==================================================================================
 # ========== ensure_finding_tickets: authoring ==========
 def test_author_creates_file(tmp_path):
-    report = make_report({"sidelap_vnir_fieldbook": fail()})
+    report = make_report({"graw_present": fail()})
     actions = iy.ensure_finding_tickets(tmp_path, "run_00", report)
-    assert any("open finding sidelap_vnir_fieldbook" in a for a in actions)
+    assert any("open finding graw_present" in a for a in actions)
     assert any("created" in a for a in actions)
     data, state = iy.load_issue_yaml(tmp_path, "run_00")
     assert state == "parsed"
     assert data["run"] == "run_00"
     assert data["sensor"] == "CALVIS"
     entry = iy._live_findings(data)[("QC01_FlightCheck",
-                                     "sidelap_vnir_fieldbook")]
+                                     "graw_present")]
     assert entry["state"] == "TODO"
     assert entry["status"] == "fail"
-    assert list(entry["checks"]) == ["sidelap_vnir_fieldbook"]
+    assert list(entry["checks"]) == ["graw_present"]
     assert entry["script_version"] == "v2.9"
 
 
 def test_no_findings_no_file(tmp_path):
-    report = make_report({"sidelap_vnir_fieldbook": good()})
+    report = make_report({"graw_present": good()})
     assert iy.ensure_finding_tickets(tmp_path, "run_00", report) == []
     assert not (tmp_path / "run_00_Issues.yaml").is_file()
 
@@ -213,7 +213,7 @@ def test_author_appends_to_existing_yaml(tmp_path):
 
 
 def test_dry_run_writes_nothing(tmp_path):
-    report = make_report({"sidelap_vnir_fieldbook": fail()})
+    report = make_report({"graw_present": fail()})
     actions = iy.ensure_finding_tickets(tmp_path, "run_00", report,
                                         write=False)
     assert actions
@@ -223,14 +223,14 @@ def test_dry_run_writes_nothing(tmp_path):
 def test_unparseable_yaml_skipped(tmp_path):
     (tmp_path / "run_00_Issues.yaml").write_text(
         "run: [unclosed", encoding="utf-8")
-    report = make_report({"sidelap_vnir_fieldbook": fail()})
+    report = make_report({"graw_present": fail()})
     with pytest.warns(UserWarning, match="[Uu]nparseable"):
         assert iy.ensure_finding_tickets(tmp_path, "run_00", report) == []
 
 
 # ========== ensure_finding_tickets: idempotency + refresh ==========
 def test_idempotent_second_call(tmp_path):
-    report = make_report({"sidelap_vnir_fieldbook": fail()})
+    report = make_report({"graw_present": fail()})
     iy.ensure_finding_tickets(tmp_path, "run_00", report)
     before = (tmp_path / "run_00_Issues.yaml").read_bytes()
     assert iy.ensure_finding_tickets(tmp_path, "run_00", report) == []
@@ -239,16 +239,16 @@ def test_idempotent_second_call(tmp_path):
 
 def test_refresh_updates_machine_fields_only(tmp_path):
     iy.ensure_finding_tickets(
-        tmp_path, "run_00", make_report({"sidelap_vnir_fieldbook": fail()}))
+        tmp_path, "run_00", make_report({"graw_present": fail()}))
     set_state(tmp_path, "run_00", "QC01_FlightCheck",
-              "sidelap_vnir_fieldbook", "wip", note="looking at it")
-    report2 = make_report({"sidelap_vnir_fieldbook": fail("35.0 %")},
+              "graw_present", "wip", note="looking at it")
+    report2 = make_report({"graw_present": fail("35.0 %")},
                           version="v3.0", utc="2026-09-05T00:00:00+00:00")
     actions = iy.ensure_finding_tickets(tmp_path, "run_00", report2)
-    assert actions == ["refresh sidelap_vnir_fieldbook"]
+    assert actions == ["refresh graw_present"]
     data, _ = iy.load_issue_yaml(tmp_path, "run_00")
     entry = iy._live_findings(data)[("QC01_FlightCheck",
-                                     "sidelap_vnir_fieldbook")]
+                                     "graw_present")]
     assert entry["value"] == "35.0 %"
     assert entry["script_version"] == "v3.0"
     assert entry["state"] == "wip"            # human field preserved
@@ -259,17 +259,17 @@ def test_refresh_updates_machine_fields_only(tmp_path):
 @pytest.mark.parametrize("open_state", ["TODO", "wip"])
 def test_autoclose_open_states(tmp_path, open_state):
     iy.ensure_finding_tickets(
-        tmp_path, "run_00", make_report({"sidelap_vnir_fieldbook": fail()}))
+        tmp_path, "run_00", make_report({"graw_present": fail()}))
     if open_state != "TODO":
         set_state(tmp_path, "run_00", "QC01_FlightCheck",
-                  "sidelap_vnir_fieldbook", open_state)
-    report2 = make_report({"sidelap_vnir_fieldbook": good("55 %")},
+                  "graw_present", open_state)
+    report2 = make_report({"graw_present": good("55 %")},
                           utc="2026-09-05T00:00:00+00:00")
     actions = iy.ensure_finding_tickets(tmp_path, "run_00", report2)
-    assert actions == ["close sidelap_vnir_fieldbook as fixed"]
+    assert actions == ["close graw_present as fixed"]
     data, _ = iy.load_issue_yaml(tmp_path, "run_00")
     entry = iy._live_findings(data)[("QC01_FlightCheck",
-                                     "sidelap_vnir_fieldbook")]
+                                     "graw_present")]
     assert entry["state"] == "fixed"
     assert entry["resolved_utc"] == "2026-09-05T00:00:00+00:00"
 
@@ -292,47 +292,47 @@ def test_autoclose_requires_all_members(tmp_path):
 @pytest.mark.parametrize("closure", ["accepted", "caution", "failed"])
 def test_human_closures_never_touched(tmp_path, closure):
     iy.ensure_finding_tickets(
-        tmp_path, "run_00", make_report({"sidelap_vnir_fieldbook": fail()}))
+        tmp_path, "run_00", make_report({"graw_present": fail()}))
     set_state(tmp_path, "run_00", "QC01_FlightCheck",
-              "sidelap_vnir_fieldbook", closure, note="ruled")
+              "graw_present", closure, note="ruled")
     # passing re-run: no auto-close of a human closure
-    passing = make_report({"sidelap_vnir_fieldbook": good()})
+    passing = make_report({"graw_present": good()})
     assert iy.ensure_finding_tickets(tmp_path, "run_00", passing) == []
     # failing re-run: no re-author over a human closure
-    failing = make_report({"sidelap_vnir_fieldbook": fail("30 %")})
+    failing = make_report({"graw_present": fail("30 %")})
     assert iy.ensure_finding_tickets(tmp_path, "run_00", failing) == []
     assert live_state(tmp_path, "run_00", "QC01_FlightCheck",
-                      "sidelap_vnir_fieldbook") == closure
+                      "graw_present") == closure
 
 
 def test_other_scripts_findings_untouched(tmp_path):
     iy.ensure_finding_tickets(
-        tmp_path, "run_00", make_report({"sidelap_vnir_fieldbook": fail()}))
-    other = make_report({"sidelap_vnir_fieldbook": good()},
+        tmp_path, "run_00", make_report({"graw_present": fail()}))
+    other = make_report({"graw_present": good()},
                         script="QC00_GCPCheck")
     assert iy.ensure_finding_tickets(tmp_path, "run_00", other) == []
     assert live_state(tmp_path, "run_00", "QC01_FlightCheck",
-                      "sidelap_vnir_fieldbook") == "TODO"
+                      "graw_present") == "TODO"
 
 
 def test_refail_after_fixed_appends_new_entry(tmp_path):
     iy.ensure_finding_tickets(
-        tmp_path, "run_00", make_report({"sidelap_vnir_fieldbook": fail()}))
+        tmp_path, "run_00", make_report({"graw_present": fail()}))
     iy.ensure_finding_tickets(
-        tmp_path, "run_00", make_report({"sidelap_vnir_fieldbook": good()}))
+        tmp_path, "run_00", make_report({"graw_present": good()}))
     actions = iy.ensure_finding_tickets(
         tmp_path, "run_00",
-        make_report({"sidelap_vnir_fieldbook": fail("20 %")}))
-    assert actions == ["open finding sidelap_vnir_fieldbook "
+        make_report({"graw_present": fail("20 %")}))
+    assert actions == ["open finding graw_present "
                        "(refailed after fixed)"]
     data, _ = iy.load_issue_yaml(tmp_path, "run_00")
     entries = [e for e in data["qc_findings"]
-               if e.get("finding") == "sidelap_vnir_fieldbook"]
+               if e.get("finding") == "graw_present"]
     assert len(entries) == 2                      # history kept
     assert entries[0]["state"] == "fixed"
     assert entries[1]["state"] == "TODO"          # live = last
     assert live_state(tmp_path, "run_00", "QC01_FlightCheck",
-                      "sidelap_vnir_fieldbook") == "TODO"
+                      "graw_present") == "TODO"
 
 
 # ========== classify_run: the accepted rung + findings channel ==========
@@ -359,29 +359,29 @@ def write_overview(date_dir: pathlib.Path, run: str = "run_00",
 def test_findings_classify_without_issues_bool(tmp_path):
     write_overview(tmp_path)  # all bools False
     iy.ensure_finding_tickets(
-        tmp_path, "run_00", make_report({"sidelap_vnir_fieldbook": fail()}))
+        tmp_path, "run_00", make_report({"graw_present": fail()}))
     severity, detail = iy.classify_run(tmp_path, "run_00")
     assert severity == "untriaged"
-    assert "QC01_FlightCheck/sidelap_vnir_fieldbook" in detail
+    assert "QC01_FlightCheck/graw_present" in detail
 
 
 def test_accepted_rung(tmp_path):
     write_overview(tmp_path)
     iy.ensure_finding_tickets(
-        tmp_path, "run_00", make_report({"sidelap_vnir_fieldbook": fail()}))
+        tmp_path, "run_00", make_report({"graw_present": fail()}))
     set_state(tmp_path, "run_00", "QC01_FlightCheck",
-              "sidelap_vnir_fieldbook", "accepted", note="edge line only")
+              "graw_present", "accepted", note="edge line only")
     severity, detail = iy.classify_run(tmp_path, "run_00")
     assert severity == "accepted"
-    assert "sidelap_vnir_fieldbook" in detail
+    assert "graw_present" in detail
 
 
 def test_fixed_finding_is_clean(tmp_path):
     write_overview(tmp_path)
     iy.ensure_finding_tickets(
-        tmp_path, "run_00", make_report({"sidelap_vnir_fieldbook": fail()}))
+        tmp_path, "run_00", make_report({"graw_present": fail()}))
     iy.ensure_finding_tickets(
-        tmp_path, "run_00", make_report({"sidelap_vnir_fieldbook": good()}))
+        tmp_path, "run_00", make_report({"graw_present": good()}))
     assert iy.classify_run(tmp_path, "run_00")[0] == "clean"
 
 
@@ -390,9 +390,9 @@ def test_fixed_finding_is_clean(tmp_path):
 def test_condemned_finding_degrades(tmp_path, closure, severity):
     write_overview(tmp_path)
     iy.ensure_finding_tickets(
-        tmp_path, "run_00", make_report({"sidelap_vnir_fieldbook": fail()}))
+        tmp_path, "run_00", make_report({"graw_present": fail()}))
     set_state(tmp_path, "run_00", "QC01_FlightCheck",
-              "sidelap_vnir_fieldbook", closure, note="confirmed")
+              "graw_present", closure, note="confirmed")
     assert iy.classify_run(tmp_path, "run_00")[0] == severity
 
 
@@ -402,9 +402,9 @@ def test_worst_wins_across_tickets_and_findings(tmp_path):
         "schema_version: 1.0\nrun: run_00\npayload_outcomes:\n"
         "  - payload: lidar\n    state: caution\n", encoding="utf-8")
     iy.ensure_finding_tickets(
-        tmp_path, "run_00", make_report({"sidelap_vnir_fieldbook": fail()}))
+        tmp_path, "run_00", make_report({"graw_present": fail()}))
     set_state(tmp_path, "run_00", "QC01_FlightCheck",
-              "sidelap_vnir_fieldbook", "accepted", note="tolerable")
+              "graw_present", "accepted", note="tolerable")
     # caution ticket outranks the accepted finding
     assert iy.classify_run(tmp_path, "run_00")[0] == "degraded"
 
@@ -413,23 +413,23 @@ def test_worst_wins_across_tickets_and_findings(tmp_path):
 def test_accepted_included_by_default_with_annotation(tmp_path):
     write_overview(tmp_path)
     iy.ensure_finding_tickets(
-        tmp_path, "run_00", make_report({"sidelap_vnir_fieldbook": fail()}))
+        tmp_path, "run_00", make_report({"graw_present": fail()}))
     set_state(tmp_path, "run_00", "QC01_FlightCheck",
-              "sidelap_vnir_fieldbook", "accepted", note="edge line only")
+              "graw_present", "accepted", note="edge line only")
     decision = iy.run_decision(tmp_path, "run_00")
     assert decision.included
     assert decision.reason is None
     assert decision.annotations == (
-        "accepted: QC01_FlightCheck/sidelap_vnir_fieldbook "
+        "accepted: QC01_FlightCheck/graw_present "
         "— edge line only",)
 
 
 def test_exclude_accepted_flag(tmp_path):
     write_overview(tmp_path)
     iy.ensure_finding_tickets(
-        tmp_path, "run_00", make_report({"sidelap_vnir_fieldbook": fail()}))
+        tmp_path, "run_00", make_report({"graw_present": fail()}))
     set_state(tmp_path, "run_00", "QC01_FlightCheck",
-              "sidelap_vnir_fieldbook", "accepted", note="edge line only")
+              "graw_present", "accepted", note="edge line only")
     decision = iy.run_decision(tmp_path, "run_00", exclude_accepted=True)
     assert not decision.included
     assert "--exclude-accepted" in decision.reason
@@ -439,7 +439,7 @@ def test_exclude_accepted_flag(tmp_path):
 def test_open_finding_excludes_by_default(tmp_path):
     write_overview(tmp_path)
     iy.ensure_finding_tickets(
-        tmp_path, "run_00", make_report({"sidelap_vnir_fieldbook": fail()}))
+        tmp_path, "run_00", make_report({"graw_present": fail()}))
     decision = iy.run_decision(tmp_path, "run_00")
     assert not decision.included
     assert "--include-runs untriaged" in decision.reason
@@ -453,9 +453,9 @@ def test_annotations_carried_at_higher_include_levels(tmp_path):
         "schema_version: 1.0\nrun: run_00\npayload_outcomes:\n"
         "  - payload: lidar\n    state: caution\n", encoding="utf-8")
     iy.ensure_finding_tickets(
-        tmp_path, "run_00", make_report({"sidelap_vnir_fieldbook": fail()}))
+        tmp_path, "run_00", make_report({"graw_present": fail()}))
     set_state(tmp_path, "run_00", "QC01_FlightCheck",
-              "sidelap_vnir_fieldbook", "accepted", note="tolerable")
+              "graw_present", "accepted", note="tolerable")
     decision = iy.run_decision(tmp_path, "run_00", include_runs="degraded")
     assert decision.included
     assert any("accepted: QC01_FlightCheck" in a
@@ -465,9 +465,9 @@ def test_annotations_carried_at_higher_include_levels(tmp_path):
 def test_empty_note_warns_but_annotates(tmp_path):
     write_overview(tmp_path)
     iy.ensure_finding_tickets(
-        tmp_path, "run_00", make_report({"sidelap_vnir_fieldbook": fail()}))
+        tmp_path, "run_00", make_report({"graw_present": fail()}))
     set_state(tmp_path, "run_00", "QC01_FlightCheck",
-              "sidelap_vnir_fieldbook", "accepted", note="")
+              "graw_present", "accepted", note="")
     with pytest.warns(UserWarning, match="empty note"):
         decision = iy.run_decision(tmp_path, "run_00")
     assert decision.included
@@ -477,11 +477,11 @@ def test_empty_note_warns_but_annotates(tmp_path):
 def test_reason_none_iff_included(tmp_path):
     write_overview(tmp_path)
     iy.ensure_finding_tickets(
-        tmp_path, "run_00", make_report({"sidelap_vnir_fieldbook": fail()}))
+        tmp_path, "run_00", make_report({"graw_present": fail()}))
     decision = iy.run_decision(tmp_path, "run_00")
     assert not decision.included and decision.reason
     set_state(tmp_path, "run_00", "QC01_FlightCheck",
-              "sidelap_vnir_fieldbook", "accepted", note="fine")
+              "graw_present", "accepted", note="fine")
     decision = iy.run_decision(tmp_path, "run_00")
     assert decision.included and decision.reason is None
 
@@ -490,3 +490,44 @@ def test_bad_include_runs_raises(tmp_path):
     write_overview(tmp_path)
     with pytest.raises(ValueError, match="include_runs must be one of"):
         iy.run_decision(tmp_path, "run_00", include_runs="accepted")
+
+
+# ========== finding_groups: the canonical one-writer grouping policy ==========
+def test_finding_groups_qc01_spec_family():
+    report = {"script": {"name": "QC01_FlightCheck"},
+              "checks": {name: {"status": "fail"} for name in [
+                  "gsd_vnir", "frame_rate_vnir", "sidelap_vnir_calculator",
+                  "sidelap_vnir_fieldbook", "oversampling_vnir_fieldbook",
+                  "gsd_swir", "sidelap_lidar", "graw_present",
+                  "time_to_solar_noon", "flightcal_spec"]}}
+    groups = iy.finding_groups(report)
+    assert sorted(groups) == ["flight_spec_swir", "flight_spec_vnir"]
+    assert sorted(groups["flight_spec_vnir"]) == [
+        "frame_rate_vnir", "gsd_vnir", "oversampling_vnir_fieldbook",
+        "sidelap_vnir_calculator", "sidelap_vnir_fieldbook"]
+    grouped = {m for members in groups.values() for m in members}
+    # bundle integrity, the gate, solar timing and lidar stay singletons
+    assert grouped.isdisjoint({"sidelap_lidar", "graw_present",
+                               "time_to_solar_noon", "flightcal_spec"})
+
+
+def test_finding_groups_qc03_per_product():
+    report = {"script": {"name": "QC03_RasterCheck"},
+              "products": {"vnir": {}, "swir": {}},
+              "checks": {"zeros_in_footprint_vnir": {}, "negative_vnir": {},
+                         "over_range_swir": {}}}
+    groups = iy.finding_groups(report)
+    assert sorted(groups["raster_vnir"]) == ["negative_vnir",
+                                             "zeros_in_footprint_vnir"]
+    assert groups["raster_swir"] == ["over_range_swir"]
+
+
+def test_finding_groups_default_singletons(tmp_path):
+    # QC00/QC02 grade singleton findings via the empty default
+    assert iy.finding_groups({"script": {"name": "QC00_GCPCheck"},
+                              "checks": {"gcp_2d_vnir": {}}}) == {}
+    report = make_report({"gcp_2d_vnir": fail("0.31 m")},
+                         script="QC00_GCPCheck")
+    iy.ensure_finding_tickets(tmp_path, "run_00", report)
+    data, _ = iy.load_issue_yaml(tmp_path, "run_00")
+    assert ("QC00_GCPCheck", "gcp_2d_vnir") in iy._live_findings(data)
