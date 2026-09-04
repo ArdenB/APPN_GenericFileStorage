@@ -14,6 +14,31 @@ import Code.functions.issue_yaml as iy
 
 
 # ==================================================================================
+def run_exclusion(*args, **kwargs):
+    """Legacy-contract shim: exclusion reason via ``run_decision``.
+
+    The historical ``run_exclusion`` API (None = include, else reason)
+    was retired with the QC findings loop; these tests keep asserting
+    through the same contract so the reason strings and axis ordering
+    stay pinned.
+
+    Parameters
+    ----------
+    *args : Any
+        Positional arguments for ``iy.run_decision``.
+    **kwargs : Any
+        Keyword arguments for ``iy.run_decision``.
+
+    Returns
+    -------
+    str or None
+        None when the run is included; otherwise the exclusion reason.
+    """
+    decision = iy.run_decision(*args, **kwargs)
+    return None if decision.included else decision.reason
+
+
+# ==================================================================================
 def write_overview(date_dir: pathlib.Path, run: str = "run_00",
                    **flags: bool) -> None:
     """Write a one-row RunOverview.csv with the given trigger bools.
@@ -192,14 +217,14 @@ class TestRunExclusion:
 
     def test_clean_run_always_included(self, tmp_path):
         write_overview(tmp_path)
-        assert iy.run_exclusion(tmp_path, "run_00") is None
+        assert run_exclusion(tmp_path, "run_00") is None
 
     @pytest.mark.parametrize("level,expected_excluded", [
         (None, True), ("untriaged", True), ("degraded", True),
         ("failed", False)])
     def test_failed_needs_top_level(self, tmp_path, level, expected_excluded):
         write_overview(tmp_path, RunFailed=True)
-        reason = iy.run_exclusion(tmp_path, "run_00", include_runs=level)
+        reason = run_exclusion(tmp_path, "run_00", include_runs=level)
         assert (reason is not None) == expected_excluded
 
     @pytest.mark.parametrize("level,expected_excluded", [
@@ -208,7 +233,7 @@ class TestRunExclusion:
     def test_untriaged_ladder_is_cumulative(self, tmp_path, level,
                                             expected_excluded):
         write_overview(tmp_path, Issues=True)
-        reason = iy.run_exclusion(tmp_path, "run_00", include_runs=level)
+        reason = run_exclusion(tmp_path, "run_00", include_runs=level)
         assert (reason is not None) == expected_excluded
 
     @pytest.mark.parametrize("level,expected_excluded", [
@@ -218,30 +243,30 @@ class TestRunExclusion:
                                            expected_excluded):
         write_overview(tmp_path, Issues=True)
         write_issues_yaml(tmp_path, "run_00", ["caution"])
-        reason = iy.run_exclusion(tmp_path, "run_00", include_runs=level)
+        reason = run_exclusion(tmp_path, "run_00", include_runs=level)
         assert (reason is not None) == expected_excluded
 
     def test_exclusion_reason_names_the_flag(self, tmp_path):
         write_overview(tmp_path, RunFailed=True)
-        reason = iy.run_exclusion(tmp_path, "run_00")
+        reason = run_exclusion(tmp_path, "run_00")
         assert "--include-runs failed" in reason
 
     def test_duplicate_excluded_by_default(self, tmp_path):
         write_overview(tmp_path, DuplicateRun=True)
-        reason = iy.run_exclusion(tmp_path, "run_00")
+        reason = run_exclusion(tmp_path, "run_00")
         assert reason is not None and "--include-duplicates" in reason
 
     def test_duplicate_opt_in(self, tmp_path):
         write_overview(tmp_path, DuplicateRun=True)
-        assert iy.run_exclusion(tmp_path, "run_00",
+        assert run_exclusion(tmp_path, "run_00",
                                 include_duplicates=True) is None
 
     def test_group_original_wins_by_default(self, tmp_path):
         write_overview_rows(tmp_path, [
             {"Run": "run_00"},
             {"Run": "run_01", "DuplicateRun": True, "DupOf": 0}])
-        assert iy.run_exclusion(tmp_path, "run_00") is None
-        reason = iy.run_exclusion(tmp_path, "run_01")
+        assert run_exclusion(tmp_path, "run_00") is None
+        reason = run_exclusion(tmp_path, "run_01")
         assert reason is not None
         assert "run_00" in reason and "--include-duplicates" in reason
 
@@ -251,8 +276,8 @@ class TestRunExclusion:
             {"Run": "run_01", "DuplicateRun": True, "DupOf": 0,
              "BestRun": True}])
         # The winning reprocess is included despite DuplicateRun=True
-        assert iy.run_exclusion(tmp_path, "run_01") is None
-        reason = iy.run_exclusion(tmp_path, "run_00")
+        assert run_exclusion(tmp_path, "run_01") is None
+        reason = run_exclusion(tmp_path, "run_00")
         assert reason is not None
         assert "superseded by run_01" in reason
         assert "--include-duplicates" in reason
@@ -263,7 +288,7 @@ class TestRunExclusion:
             {"Run": "run_01", "DuplicateRun": True, "DupOf": 0,
              "BestRun": True}])
         for run in ("run_00", "run_01"):
-            assert iy.run_exclusion(tmp_path, run,
+            assert run_exclusion(tmp_path, run,
                                     include_duplicates=True) is None
 
     def test_double_bestrun_raises(self, tmp_path):
@@ -272,25 +297,25 @@ class TestRunExclusion:
             {"Run": "run_01", "DuplicateRun": True, "DupOf": 0,
              "BestRun": True}])
         with pytest.raises(ValueError, match="BestRun"):
-            iy.run_exclusion(tmp_path, "run_01")
+            run_exclusion(tmp_path, "run_01")
 
     def test_duplicate_axis_is_orthogonal(self, tmp_path):
         # include-runs failed alone must NOT pull in a duplicate
         write_overview(tmp_path, DuplicateRun=True, RunFailed=True)
-        assert iy.run_exclusion(tmp_path, "run_00",
+        assert run_exclusion(tmp_path, "run_00",
                                 include_runs="failed") is not None
-        assert iy.run_exclusion(tmp_path, "run_00", include_runs="failed",
+        assert run_exclusion(tmp_path, "run_00", include_runs="failed",
                                 include_duplicates=True) is None
 
     def test_resolved_issues_run_rejoins_default(self, tmp_path):
         write_overview(tmp_path, Issues=True)
         write_issues_yaml(tmp_path, "run_00", ["fixed", "ok"])
-        assert iy.run_exclusion(tmp_path, "run_00") is None
+        assert run_exclusion(tmp_path, "run_00") is None
 
     def test_invalid_level_raises(self, tmp_path):
         write_overview(tmp_path)
         with pytest.raises(ValueError, match="include_runs"):
-            iy.run_exclusion(tmp_path, "run_00", include_runs="everything")
+            run_exclusion(tmp_path, "run_00", include_runs="everything")
 
 
 # ==================================================================================
@@ -333,7 +358,7 @@ class TestFlightDeviations:
         write_overview(tmp_path, Deviations=True)
         write_compliance_yaml(tmp_path, "run_00",
                               ["flight_pattern", "sensor_config"])
-        reason = iy.run_exclusion(tmp_path, "run_00")
+        reason = run_exclusion(tmp_path, "run_00")
         assert reason is not None
         assert "--include-flight-deviations" in reason
         assert "solar_window" in reason
@@ -342,7 +367,7 @@ class TestFlightDeviations:
         write_overview(tmp_path, Deviations=True)
         write_compliance_yaml(tmp_path, "run_00",
                               ["flight_pattern", "sensor_config"])
-        assert iy.run_exclusion(tmp_path, "run_00",
+        assert run_exclusion(tmp_path, "run_00",
                                 include_flight_deviations=True) is None
 
     def test_fully_compliant_run_included(self, tmp_path):
@@ -350,18 +375,18 @@ class TestFlightDeviations:
         write_overview(tmp_path, Deviations=True)
         write_compliance_yaml(tmp_path, "run_00",
                               list(iy.flight_deviation_vocab()))
-        assert iy.run_exclusion(tmp_path, "run_00") is None
+        assert run_exclusion(tmp_path, "run_00") is None
 
     def test_deviation_axis_is_orthogonal(self, tmp_path):
         # include-runs failed alone must NOT pull in a deviation run
         write_overview(tmp_path, Deviations=True, RunFailed=True)
         write_compliance_yaml(tmp_path, "run_00",
                               ["solar_window", "sensor_config"])
-        assert iy.run_exclusion(tmp_path, "run_00",
+        assert run_exclusion(tmp_path, "run_00",
                                 include_runs="failed") is not None
-        assert iy.run_exclusion(tmp_path, "run_00",
+        assert run_exclusion(tmp_path, "run_00",
                                 include_flight_deviations=True) is not None
-        assert iy.run_exclusion(tmp_path, "run_00", include_runs="failed",
+        assert run_exclusion(tmp_path, "run_00", include_runs="failed",
                                 include_flight_deviations=True) is None
 
     def test_template_deviations_emit_block(self, tmp_path):

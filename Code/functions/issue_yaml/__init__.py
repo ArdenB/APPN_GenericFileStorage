@@ -53,7 +53,6 @@ __all__ = [
     "classify_run",
     "RunDecision",
     "run_decision",
-    "run_exclusion",
     "load_sensor_pipeline",
     "render_issue_template",
     "patch_issue_yaml",
@@ -883,43 +882,6 @@ def run_decision(date_dir: pathlib.Path, run_name: str,
     annotations = (_accepted_annotations(yaml_data, run_name)
                    if yaml_state == "parsed" else ())
     return RunDecision(True, None, annotations)
-
-
-# ==================================================================================
-def run_exclusion(date_dir: pathlib.Path, run_name: str,
-                  include_runs: Optional[str] = None,
-                  include_duplicates: bool = False,
-                  include_flight_deviations: bool = False) -> Optional[str]:
-    """DEPRECATED — thin wrapper over :func:`run_decision`.
-
-    Kept only until the QA scripts migrate to ``run_decision`` (QC
-    findings plan, QA-script step); deleted then. Drops the
-    annotations and cannot express ``--exclude-accepted``.
-
-    Parameters
-    ----------
-    date_dir : pathlib.Path
-        Date folder containing ``RunOverview.csv``.
-    run_name : str
-        Run folder name.
-    include_runs : str or None
-        See :func:`run_decision`.
-    include_duplicates : bool
-        See :func:`run_decision`.
-    include_flight_deviations : bool
-        See :func:`run_decision`.
-
-    Returns
-    -------
-    str or None
-        None when the run should be processed; otherwise the exclusion
-        reason.
-    """
-    decision = run_decision(
-        date_dir, run_name, include_runs=include_runs,
-        include_duplicates=include_duplicates,
-        include_flight_deviations=include_flight_deviations)
-    return None if decision.included else decision.reason
 
 
 # ==================================================================================

@@ -94,33 +94,46 @@ root themselves, and accept `--path` at any APPN tree level plus
 ## Flagged-run filtering (QA scripts only)
 
 The QA comparisons exclude runs flagged in their date folder's
-`RunOverview.csv` so degraded/failed/duplicate acquisitions never
-contaminate cross-run statistics; the per-run QC scripts ignore the
-flags and grade everything they can. Re-inclusion is opt-in
-(`Code/functions/issue_yaml.run_exclusion`):
+`RunOverview.csv` or carrying open QC findings, so degraded/failed/
+duplicate acquisitions never contaminate cross-run statistics; the
+per-run QC scripts ignore the flags and grade everything they can —
+but a run-status `fail` authors a machine finding-ticket
+(`qc_findings` in the run's `*_Issues.yaml`, written by the QC script
+itself before its report; a passing re-run closes its own open
+findings as `fixed`). Findings classify the run even when the `Issues`
+bool is false — the bools stay human-authored. Re-inclusion is opt-in
+(`Code/functions/issue_yaml.run_decision`):
 
 | Severity | Run state | Included by |
 |----------|-----------|-------------|
-| clean | no flags, `Deviations` only, or `Issues` with every ticket closed `ok`/`fixed` | always |
-| untriaged | `Issues` with open `TODO`/`wip` tickets, or no `*_Issues.yaml` yet | `--include-runs untriaged` (or higher) |
-| degraded | `Issues` with a `caution`/`failed` ticket, or an unparseable yaml | `--include-runs degraded` (or higher) |
+| clean | no flags, `Deviations` only, or every ticket/finding resolved (`ok`/`fixed`) | always |
+| accepted | all resolved, ≥1 finding closed `accepted` (reviewed, real but tolerable — note required) | default, annotated in listings; `--exclude-accepted` drops |
+| untriaged | open `TODO`/`wip` tickets or findings, or `Issues` set with no `*_Issues.yaml` yet | `--include-runs untriaged` (or higher) |
+| degraded | a `caution`/`failed` ticket or finding, or an unparseable yaml | `--include-runs degraded` (or higher) |
 | failed | `RunFailed` | `--include-runs failed` |
 
+Finding states are split from payload tickets: a finding can never be
+closed `ok` (the measurement happened) and `fixed` is machine-only (a
+passing QC re-run); human closures are `accepted` (include + annotate),
+`caution`/`failed` (condemn). Acceptance never softens the measured QC
+status — reports keep the `fail`, QA carries the annotation.
+
 `--include-runs` is cumulative (each level includes the ones below);
-`--include-duplicates` re-includes `DuplicateRun` re-runs and
+`--include-duplicates` re-includes non-winner duplicate-group members and
 `--include-flight-deviations` re-includes runs with declared flight
 deviations — axes deleted from the delete-down `flight_compliance`
 list in their Issues.yaml (deliberately off-spec flights, e.g. a
 solar-window sweep; QC01 still grades them, annotates the covered
 checks, and waives a covered `fail` so it contributes `warn` to the run
-status instead of failing it) — both are independent of the ladder.
-Only the acquisition-spec `flight_compliance` list feeds the flag:
-deployable/payload intent (panels not placed, raw not kept) is
-irrelevant to QA inclusion and never excludes a run. Excluded runs are always
-listed (QA00 also carries them in its end-of-run summary as
-`status=excluded`), and the resolution path back to the default set is
-closing the run's Issues tickets — never unflipping the RunOverview
-bools.
+status instead of failing it) — both are independent of the ladder, as
+is `--exclude-accepted`. Only the acquisition-spec `flight_compliance`
+list feeds the deviation flag: deployable/payload intent (panels not
+placed, raw not kept) is irrelevant to QA inclusion and never excludes
+a run. Excluded runs are always listed (QA00 also carries them in its
+end-of-run summary as `status=excluded`; accepted runs print/annotate
+with their finding notes), and the resolution path back to the default
+set is closing the run's tickets/findings — never unflipping the
+RunOverview bools.
 
 ## Per-script notes (QC00, QC01, QC03, QA01)
 

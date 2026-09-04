@@ -474,15 +474,16 @@ def test_empty_note_warns_but_annotates(tmp_path):
     assert "(no note)" in decision.annotations[0]
 
 
-def test_run_exclusion_wrapper_parity(tmp_path):
+def test_reason_none_iff_included(tmp_path):
     write_overview(tmp_path)
     iy.ensure_finding_tickets(
         tmp_path, "run_00", make_report({"sidelap_vnir_fieldbook": fail()}))
-    assert iy.run_exclusion(tmp_path, "run_00") == \
-        iy.run_decision(tmp_path, "run_00").reason
+    decision = iy.run_decision(tmp_path, "run_00")
+    assert not decision.included and decision.reason
     set_state(tmp_path, "run_00", "QC01_FlightCheck",
               "sidelap_vnir_fieldbook", "accepted", note="fine")
-    assert iy.run_exclusion(tmp_path, "run_00") is None
+    decision = iy.run_decision(tmp_path, "run_00")
+    assert decision.included and decision.reason is None
 
 
 def test_bad_include_runs_raises(tmp_path):

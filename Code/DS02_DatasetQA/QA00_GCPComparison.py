@@ -60,12 +60,17 @@ Command-line Arguments
     with open TODO/wip tickets; ``degraded`` adds confirmed
     caution/failed tickets; ``failed`` adds RunFailed runs.
 --include-duplicates : flag
-    Include runs flagged ``DuplicateRun`` (orthogonal to
-    --include-runs).
+    Include every member of each duplicate group, not just its winner
+    (the ``BestRun`` row, or the original when none is flagged;
+    orthogonal to --include-runs).
 --include-flight-deviations : flag
     Include runs with declared flight deviations (axes deleted from
     the ``flight_compliance`` list in their Issues.yaml; orthogonal to
     --include-runs).
+--exclude-accepted : flag
+    Exclude runs whose QC findings are all closed ``accepted``
+    (reviewed-but-tolerable fails). Default: included, annotated in the
+    end-of-run summary.
 --force : flag
     Regenerate outputs even when they are newer than every input.
 --verbose : flag
@@ -76,7 +81,7 @@ Command-line Arguments
 
 __title__ = "GCP run comparison"
 __author__ = "Arden Burrell"
-__version__ = "v1.2(03.09.2026)"
+__version__ = "v1.3(04.09.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -158,6 +163,7 @@ def main(
         include_runs=args.include_runs,
         include_duplicates=args.include_duplicates,
         include_flight_deviations=args.include_flight_deviations,
+        exclude_accepted=args.exclude_accepted,
         verbose=args.verbose)
     if args.load_dir is not None:
         entries.extend(load_external_artefacts(
@@ -402,6 +408,7 @@ def gather_distance_artefacts(
         include_runs: Optional[str] = None,
         include_duplicates: bool = False,
         include_flight_deviations: bool = False,
+        exclude_accepted: bool = False,
         verbose: bool = False,
     ) -> List[Dict[str, Any]]:
     """Find every QC00 distance table (+ sibling report) under *path*.
@@ -413,7 +420,7 @@ def gather_distance_artefacts(
     both a parquet and a csv exist for the same stem, the parquet wins.
     Runs flagged in their date folder's ``RunOverview.csv`` are excluded
     unless opted in (see
-    :func:`Code.functions.issue_yaml.run_exclusion`); their entries
+    :func:`Code.functions.issue_yaml.run_decision`); their entries
     carry the exclusion reason and surface in the end-of-run summary.
 
     Parameters
@@ -428,6 +435,9 @@ def gather_distance_artefacts(
         Include runs flagged ``DuplicateRun``. Default False.
     include_flight_deviations : bool, optional
         Include runs with declared flight deviations. Default False.
+    exclude_accepted : bool, optional
+        Exclude runs whose findings are all closed ``accepted``
+        (default: included, annotated). Default False.
     verbose : bool, optional
         Print per-file diagnostics. Default False.
 
@@ -467,13 +477,17 @@ def gather_distance_artefacts(
         # <run>/T1_proc/QC_data[/QC00_GCPCheck]/<table>
         depth = 3 if fpath.parent.name == "QC00_GCPCheck" else 2
         run_dir = fpath.parents[depth]
-        exclusion = iy.run_exclusion(
+        decision = iy.run_decision(
             run_dir.parent, run_dir.name,
             include_runs=include_runs,
             include_duplicates=include_duplicates,
-            include_flight_deviations=include_flight_deviations)
-        entries.append(_load_entry(fpath, run_dir=run_dir,
-                                   verbose=verbose, exclusion=exclusion))
+            include_flight_deviations=include_flight_deviations,
+            exclude_accepted=exclude_accepted)
+        entry = _load_entry(fpath, run_dir=run_dir, verbose=verbose,
+                            exclusion=decision.reason)
+        if decision.annotations:
+            entry["annotations"] = list(decision.annotations)
+        entries.append(entry)
     n_excl = sum(1 for e in entries if e.get("excluded"))
     if n_excl:
         print(f"  EXCLUDED {n_excl} table(s) from flagged runs "
@@ -501,7 +515,7 @@ def _load_entry(
         Print the reason when a file is problematic. Default False.
     exclusion : str or None, optional
         Flagged-run exclusion reason from
-        :func:`Code.functions.issue_yaml.run_exclusion`; when set the
+        :func:`Code.functions.issue_yaml.run_decision`; when set the
         entry keeps its run metadata but the table is never read.
 
     Returns
@@ -1574,6 +1588,7 @@ def end_of_run_summary(entries: List[Dict[str, Any]]) -> pd.DataFrame:
                        else "skipped" if e.get("skip_reason") is not None
                        else "reported"),
             "reason": e.get("skip_reason"),
+            "annotations": "; ".join(e.get("annotations") or []),
         }
         if e.get("df") is not None and e.get("skip_reason") is None:
             d2d = e["df"]["distance_2d_m"].dropna()
@@ -1582,7 +1597,7 @@ def end_of_run_summary(entries: List[Dict[str, Any]]) -> pd.DataFrame:
                                 if len(d2d) else None)
         rows.append(row)
     columns = ["project", "sensor", "date", "run", "product",
-               "n", "rmse_2d_m", "status", "reason"]
+               "n", "rmse_2d_m", "status", "reason", "annotations"]
     return pd.DataFrame(rows, columns=columns)
 
 
@@ -1607,18 +1622,28 @@ def _print_end_of_run(df: pd.DataFrame) -> None:
         lambda v: "" if v is None or pd.isna(v) else f"{v:.4f}")
     disp["product"] = disp["product"].fillna("")
     disp["reason"] = disp["reason"].fillna("")
+    disp["annotations"] = disp.get(
+        "annotations", pd.Series("", index=disp.index)).fillna("")
     reported = disp[disp["status"] == "reported"]
     skipped = disp[disp["status"] == "skipped"]
     excluded = disp[disp["status"] == "excluded"]
+    accepted = reported[reported["annotations"] != ""]
     if not excluded.empty:
         print(f"\nEXCLUDED ({len(excluded)}):")
-        print(excluded.drop(columns=["n", "rmse_2d_m"]).to_string(index=False))
+        print(excluded.drop(columns=["n", "rmse_2d_m", "annotations"])
+              .to_string(index=False))
+    if not accepted.empty:
+        print(f"\nINCLUDED WITH ACCEPTED FINDINGS ({len(accepted)}):")
+        print(accepted[["project", "sensor", "date", "run", "product",
+                        "annotations"]].to_string(index=False))
     if not skipped.empty:
         print(f"\nSKIPPED ({len(skipped)}):")
-        print(skipped.drop(columns=["n", "rmse_2d_m"]).to_string(index=False))
+        print(skipped.drop(columns=["n", "rmse_2d_m", "annotations"])
+              .to_string(index=False))
     if not reported.empty:
         print(f"\nREPORTED ({len(reported)}):")
-        print(reported.drop(columns=["reason"]).to_string(index=False))
+        print(reported.drop(columns=["reason", "annotations"])
+              .to_string(index=False))
 
 
 # ==================================================================================
@@ -1634,8 +1659,9 @@ if __name__ == "__main__":
     parser.add_argument("--end-date", type=str, default=None, help="Only include runs on or before this date (inclusive).")
     parser.add_argument("--exclude-dir", type=str, nargs="+", default=[], help="Directory names to exclude from the table search.")
     parser.add_argument("--include-runs", type=str, default=None, choices=["untriaged", "degraded", "failed"], help="Cumulative severity ladder for runs flagged in RunOverview.csv. Default: clean runs only (no flags, Deviations only, or Issues with every ticket closed ok/fixed). untriaged also includes Issues runs with open TODO/wip tickets or no Issues.yaml yet; degraded adds confirmed caution/failed tickets (and unparseable yamls); failed adds RunFailed runs.")
-    parser.add_argument("--include-duplicates", default=False, action="store_true", help="Include runs flagged DuplicateRun in RunOverview.csv (reprocessings of another run's raw, e.g. BaseStation GNSS re-runs). Independent of --include-runs.")
+    parser.add_argument("--include-duplicates", default=False, action="store_true", help="Include every member of each RunOverview.csv duplicate group, not just its winner (the BestRun row, or the DupOf original when none is flagged). Independent of --include-runs.")
     parser.add_argument("--include-flight-deviations", default=False, action="store_true", help="Include runs with declared flight deviations (axes deleted from the flight_compliance list in their Issues.yaml, e.g. a solar-window sweep). Independent of --include-runs.")
+    parser.add_argument("--exclude-accepted", default=False, action="store_true", help="Exclude runs whose QC findings are all closed 'accepted' (reviewed-but-tolerable fails). Default: included, annotated in the end-of-run summary.")
     parser.add_argument("-f", "--force", default=False, action="store_true", help="Regenerate the comparison outputs even when they are newer than every gathered input.")
     parser.add_argument("-v", "--verbose", default=False, action="store_true", help="Enable verbose output.")
 

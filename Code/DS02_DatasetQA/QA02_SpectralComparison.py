@@ -78,12 +78,17 @@ Command-line Arguments
     with open TODO/wip tickets; ``degraded`` adds confirmed
     caution/failed tickets; ``failed`` adds RunFailed runs.
 --include-duplicates : flag
-    Include runs flagged ``DuplicateRun`` (orthogonal to
-    --include-runs).
+    Include every member of each duplicate group, not just its winner
+    (the ``BestRun`` row, or the original when none is flagged;
+    orthogonal to --include-runs).
 --include-flight-deviations : flag
-    Include runs with kept ``flight_deviations`` entries in their
-    Issues.yaml (deliberately off-spec flights; orthogonal to
+    Include runs with declared flight deviations (axes deleted from
+    the ``flight_compliance`` list in their Issues.yaml; orthogonal to
     --include-runs).
+--exclude-accepted : flag
+    Exclude runs whose QC findings are all closed ``accepted``
+    (reviewed-but-tolerable fails). Default: included, annotated via
+    the run-label flag mark.
 --spec : str, optional
     Spectral-limits YAML (drift thresholds) relative to the repo root.
 """
@@ -92,7 +97,7 @@ Command-line Arguments
 
 __title__ = "Spectral run comparison"
 __author__ = "Arden Burrell"
-__version__ = "v1.8(03.09.2026)"
+__version__ = "v1.9(04.09.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -172,6 +177,7 @@ def main(
         include_runs=args.include_runs,
         include_duplicates=args.include_duplicates,
         include_flight_deviations=args.include_flight_deviations,
+        exclude_accepted=args.exclude_accepted,
         verbose=args.verbose)
     if args.load_dir is not None:
         tables.extend(load_external_spectra(pathlib.Path(args.load_dir), args.type))
@@ -198,6 +204,7 @@ def main(
         include_runs=args.include_runs,
         include_duplicates=args.include_duplicates,
         include_flight_deviations=args.include_flight_deviations,
+        exclude_accepted=args.exclude_accepted,
         verbose=args.verbose)
 
     # ========== Combine, align wavelengths, and label the runs ==========
@@ -351,6 +358,7 @@ def gather_spectra_tables(
         include_runs: Optional[str] = None,
         include_duplicates: bool = False,
         include_flight_deviations: bool = False,
+        exclude_accepted: bool = False,
         verbose: bool = False,
     ) -> List[pd.DataFrame]:
     """Find and load every extracted spectra table under *path*.
@@ -359,8 +367,9 @@ def gather_spectra_tables(
     ``QC_Spectral_Tables`` folders (the QC02 output convention) and
     loads the ones that pass schema validation. Runs flagged in their
     date folder's ``RunOverview.csv`` are excluded unless opted in
-    (see :func:`Code.functions.issue_yaml.run_exclusion`); opted-in
-    runs gain a non-empty ``run_flag_reason`` column that
+    (see :func:`Code.functions.issue_yaml.run_decision`); opted-in
+    runs and runs carrying accepted QC findings gain a non-empty
+    ``run_flag_reason`` column that
     :func:`_mark_noncompliant_labels` renders as a superscript mark.
 
     Parameters
@@ -376,8 +385,11 @@ def gather_spectra_tables(
     include_duplicates : bool, optional
         Include runs flagged ``DuplicateRun``. Default False.
     include_flight_deviations : bool, optional
-        Include runs with kept ``flight_deviations`` entries. Default
+        Include runs with declared flight deviations. Default
         False.
+    exclude_accepted : bool, optional
+        Exclude runs whose findings are all closed ``accepted``
+        (default: included, annotated). Default False.
     verbose : bool, optional
         Print per-file diagnostics. Default False.
 
@@ -395,7 +407,8 @@ def gather_spectra_tables(
                  if not (set(p.name for p in f.parents) & exclude_set)]
     files, flagged = _exclude_flagged_runs(files, include_runs,
                                            include_duplicates,
-                                           include_flight_deviations)
+                                           include_flight_deviations,
+                                           exclude_accepted)
     print(f"Found {len(files)} spectra table(s).")
 
     tables: List[pd.DataFrame] = []
@@ -413,6 +426,7 @@ def _exclude_flagged_runs(
         include_runs: Optional[str],
         include_duplicates: bool,
         include_flight_deviations: bool = False,
+        exclude_accepted: bool = False,
     ) -> Tuple[List[pathlib.Path], Dict[pathlib.Path, str]]:
     """Drop artifacts whose run is excluded by its RunOverview.csv flags.
 
@@ -420,8 +434,9 @@ def _exclude_flagged_runs(
     ``<date>/<run>/T1_proc/QC_data/<subdir>/<file>``, so the run folder
     is always ``parents[3]``. One line per excluded run is printed with
     the flag that re-includes it. Kept runs that the default (clean-only)
-    policy would have excluded are returned as *flagged* so their labels
-    can carry the non-compliance mark.
+    policy would have excluded, and kept runs carrying accepted QC
+    findings (annotated, printed), are returned as *flagged* so their
+    labels can carry the non-compliance mark.
 
     Parameters
     ----------
@@ -432,39 +447,55 @@ def _exclude_flagged_runs(
     include_duplicates : bool
         Include runs flagged ``DuplicateRun``.
     include_flight_deviations : bool, optional
-        Include runs with kept ``flight_deviations`` entries. Default
+        Include runs with declared flight deviations. Default
         False.
+    exclude_accepted : bool, optional
+        Exclude runs whose findings are all closed ``accepted``
+        (default: included, annotated). Default False.
 
     Returns
     -------
     tuple of (list of pathlib.Path, dict of pathlib.Path to str)
         The paths whose runs are included, and a ``{run_dir: reason}``
-        map for kept runs only included via an ``--include-*`` opt-in.
+        map for kept runs only included via an ``--include-*`` opt-in
+        or carrying accepted findings.
     """
     kept: List[pathlib.Path] = []
     excluded: Dict[pathlib.Path, str] = {}
     flagged: Dict[pathlib.Path, str] = {}
+    accepted: Dict[pathlib.Path, str] = {}
     opted_in = (include_runs is not None or include_duplicates
                 or include_flight_deviations)
     for fpath in files:
         run_dir = fpath.parents[3]
         if run_dir in excluded:
             continue
-        reason = iy.run_exclusion(
+        decision = iy.run_decision(
             run_dir.parent, run_dir.name,
             include_runs=include_runs,
             include_duplicates=include_duplicates,
-            include_flight_deviations=include_flight_deviations)
-        if reason is None:
+            include_flight_deviations=include_flight_deviations,
+            exclude_accepted=exclude_accepted)
+        if decision.included:
             kept.append(fpath)
-            if opted_in and run_dir not in flagged:
-                default_reason = iy.run_exclusion(run_dir.parent, run_dir.name)
-                if default_reason is not None:
-                    flagged[run_dir] = default_reason
+            if run_dir not in flagged:
+                marks: List[str] = []
+                if opted_in:
+                    default = iy.run_decision(run_dir.parent, run_dir.name)
+                    if not default.included:
+                        marks.append(str(default.reason))
+                if decision.annotations:
+                    marks.extend(decision.annotations)
+                    accepted[run_dir] = "; ".join(decision.annotations)
+                if marks:
+                    flagged[run_dir] = "; ".join(marks)
         else:
-            excluded[run_dir] = reason
+            excluded[run_dir] = str(decision.reason)
     for run_dir, reason in sorted(excluded.items()):
         print(f"  EXCLUDED {run_dir}: {reason}")
+    for run_dir, note in sorted(accepted.items()):
+        print(f"  INCLUDED {run_dir}: {note} "
+              "(--exclude-accepted drops it)")
     return kept, flagged
 
 
@@ -1483,6 +1514,7 @@ def aggregate_dhr_comparisons(
         include_runs: Optional[str] = None,
         include_duplicates: bool = False,
         include_flight_deviations: bool = False,
+        exclude_accepted: bool = False,
         verbose: bool = False,
     ) -> Dict[str, Any]:
     """Aggregate the per-run QC02 DHR comparisons across runs (ex DT01).
@@ -1511,8 +1543,11 @@ def aggregate_dhr_comparisons(
     include_duplicates : bool, optional
         Include runs flagged ``DuplicateRun``. Default False.
     include_flight_deviations : bool, optional
-        Include runs with kept ``flight_deviations`` entries. Default
+        Include runs with declared flight deviations. Default
         False.
+    exclude_accepted : bool, optional
+        Exclude runs whose findings are all closed ``accepted``
+        (default: included, annotated). Default False.
     verbose : bool, optional
         Print per-file diagnostics. Default False.
 
@@ -1543,6 +1578,7 @@ def aggregate_dhr_comparisons(
         include_runs=include_runs,
         include_duplicates=include_duplicates,
         include_flight_deviations=include_flight_deviations,
+        exclude_accepted=exclude_accepted,
         verbose=verbose)
     if comp is None or stats is None:
         out["checks"].append((
@@ -1586,6 +1622,7 @@ def _gather_dhr_tables(
         include_runs: Optional[str] = None,
         include_duplicates: bool = False,
         include_flight_deviations: bool = False,
+        exclude_accepted: bool = False,
         verbose: bool = False,
     ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     """Load and identity-stamp every per-run DHR artifact pair under *path*.
@@ -1607,8 +1644,11 @@ def _gather_dhr_tables(
     include_duplicates : bool, optional
         Include runs flagged ``DuplicateRun``. Default False.
     include_flight_deviations : bool, optional
-        Include runs with kept ``flight_deviations`` entries. Default
+        Include runs with declared flight deviations. Default
         False.
+    exclude_accepted : bool, optional
+        Exclude runs whose findings are all closed ``accepted``
+        (default: included, annotated). Default False.
     verbose : bool, optional
         Print per-file diagnostics. Default False.
 
@@ -1627,7 +1667,8 @@ def _gather_dhr_tables(
                  if not (set(p.name for p in f.parents) & exclude_set)]
     files, flagged = _exclude_flagged_runs(files, include_runs,
                                            include_duplicates,
-                                           include_flight_deviations)
+                                           include_flight_deviations,
+                                           exclude_accepted)
     comp_parts: List[pd.DataFrame] = []
     stats_parts: List[pd.DataFrame] = []
     for fpath in tqdm(files, desc="Loading DHR artifacts"):
@@ -1798,8 +1839,9 @@ if __name__ == "__main__":
     parser.add_argument("--split-platforms", default=False, action="store_true", help="Keep sensor platforms in separate figures instead of pooling platforms that share an EM region (e.g. the CALVIS/GOBI shared Headwall VNIR). Pooled figures show the platform via line style and the run label.")
     parser.add_argument("--exclude-dir", type=str, nargs="+", default=[], help="Directory names to exclude from the table search.")
     parser.add_argument("--include-runs", type=str, default=None, choices=["untriaged", "degraded", "failed"], help="Cumulative severity ladder for runs flagged in RunOverview.csv. Default: clean runs only (no flags, Deviations only, or Issues with every ticket closed ok/fixed). untriaged also includes Issues runs with open TODO/wip tickets or no Issues.yaml yet; degraded adds confirmed caution/failed tickets (and unparseable yamls); failed adds RunFailed runs.")
-    parser.add_argument("--include-duplicates", default=False, action="store_true", help="Include runs flagged DuplicateRun in RunOverview.csv (reprocessings of another run's raw, e.g. BaseStation GNSS re-runs). Independent of --include-runs.")
-    parser.add_argument("--include-flight-deviations", default=False, action="store_true", help="Include runs with kept flight_deviations entries in their Issues.yaml (deliberately off-spec flights, e.g. a solar-window sweep). Independent of --include-runs.")
+    parser.add_argument("--include-duplicates", default=False, action="store_true", help="Include every member of each RunOverview.csv duplicate group, not just its winner (the BestRun row, or the DupOf original when none is flagged). Independent of --include-runs.")
+    parser.add_argument("--include-flight-deviations", default=False, action="store_true", help="Include runs with declared flight deviations (axes deleted from the flight_compliance list in their Issues.yaml, e.g. a solar-window sweep). Independent of --include-runs.")
+    parser.add_argument("--exclude-accepted", default=False, action="store_true", help="Exclude runs whose QC findings are all closed 'accepted' (reviewed-but-tolerable fails). Default: included, annotated via the run-label flag mark.")
     parser.add_argument("--spec", type=str, default="reference/thresholds/spectral_limits.yml", help="Spectral-limits YAML relative to the repo root (within-day drift thresholds; the advisory drift check reports not_checked if missing).")
     parser.add_argument("-v", "--verbose", default=False, action="store_true", help="Enable verbose output.")
 
