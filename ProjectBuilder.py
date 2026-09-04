@@ -77,7 +77,8 @@ def main(args, repo):
                         psum_modified = True
 
                     # +++++ Sanity check the row +++++
-                    check, site = Rowchecker(flog_fname, frow, row, ProjectInfo, args.historical)
+                    check, site = Rowchecker(flog_fname, frow, row, ProjectInfo, args.historical,
+                                             update_checksums=args.update_checksums)
 
 					# +++++ Make the site name +++++
                     df_flog, gitmod =  Sitebuilder(flog_fname, df_flog, index, frow, check, site, project, node, args, repo, gitmod)
@@ -911,7 +912,7 @@ def _seedDocReadme(folder, kind, yyyysite, args, repo, gitmod):
     return gitmod
 
 # ==============================================================================
-def Rowchecker(flog_fname, flrow, prow, ProjectInfo, historical, past_date=(pd.Timestamp.now()-pd.Timedelta(days=14))):
+def Rowchecker(flog_fname, flrow, prow, ProjectInfo, historical, update_checksums=False, past_date=(pd.Timestamp.now()-pd.Timedelta(days=14))):
     """
     Validate a row from the field log for correctness and consistency.
 
@@ -927,6 +928,9 @@ def Rowchecker(flog_fname, flrow, prow, ProjectInfo, historical, past_date=(pd.T
         Project information dictionary containing project details.
     historical : bool
         Whether to allow dates earlier than the default past_date.
+    update_checksums : bool, optional
+        Accept rows whose stored CheckSum no longer matches (i.e. rows edited
+        after registration) without prompting, and recompute the checksum.
     past_date : pandas.Timestamp, optional
         The earliest allowed date for the log entry. Defaults to 14 days before the current date.
 
@@ -963,10 +967,29 @@ def Rowchecker(flog_fname, flrow, prow, ProjectInfo, historical, past_date=(pd.T
     if not np.isnan(flrow.CheckSum):
         # Make sure the checksum matches
         if not check == flrow.CheckSum:
-            print(f"CheckSum doesn't match in {flog_fname}. {flrow}, Check: {check} This feature has not been implemented yet. Going interactive")
-            breakpoint()
-            # TO DO: ADD ome command line arguments here
-            # sys.exit()
+            print(
+                f"\nCheckSum mismatch in {flog_fname} (row index {flrow.name}):\n"
+                f"{flrow}\n"
+                f"Stored CheckSum: {flrow.CheckSum:.0f}, recomputed: {check:.0f}\n"
+                "This row was edited after it was first registered. Accepting it "
+                "will update the checksum and (re)build folders for the new "
+                "values. Folders built from the OLD values are NOT removed - "
+                "clean those up manually if the date/site/sensor changed.")
+            if update_checksums:
+                print("--update-checksums given: accepting the edited row.")
+            elif sys.stdin.isatty():
+                resp = input("Accept the edited row and update its checksum? [y/N] ")
+                if resp.strip().lower() not in ("y", "yes"):
+                    _ErrorMessage(
+                        "Edited row rejected by user. Revert the edit in the "
+                        "field log (or fix it and re-run) to continue.",
+                        flog_fname, flrow)
+            else:
+                _ErrorMessage(
+                    "CheckSum mismatch and no way to confirm (non-interactive "
+                    "session). Re-run interactively, or re-run with "
+                    "--update-checksums to accept edited rows automatically.",
+                    flog_fname, flrow)
         else:
             # Make the check = None to indicate its already done
             check = None
@@ -1240,6 +1263,14 @@ if __name__ == '__main__':
     # parser.add_argument("--projects-csv", type=str, default="./Projects_Summary.csv", help="Projects summary CSV path.")
     parser.add_argument("--projectsYAML", type=str, default="./NodeSummary.yaml", help="the node yaml file with the sensors.")
     parser.add_argument("-p","--historical", action="store_true", help="Allow historical data")
+    parser.add_argument(
+        "--update-checksums",
+        action="store_true",
+        help=("Accept FieldLog rows whose CheckSum no longer matches (rows "
+              "edited after they were first registered) without prompting, "
+              "and rewrite the checksum. Without this flag an interactive "
+              "session prompts y/N per row; a non-interactive session errors."),
+    )
     parser.add_argument(
         "--enable-sensors",
         action="store_true",
