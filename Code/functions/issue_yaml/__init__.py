@@ -51,6 +51,7 @@ __all__ = [
     "run_flight_deviations",
     "finding_states",
     "finding_groups",
+    "finding_exclusions",
     "ensure_finding_tickets",
     "classify_run",
     "RunDecision",
@@ -450,6 +451,40 @@ def finding_groups(report: Dict[str, Any]) -> Dict[str, List[str]]:
 
 
 # ==================================================================================
+def finding_exclusions(script: str) -> Tuple[str, ...]:
+    """Check-name prefixes never authored as findings (deferred classes).
+
+    Part of the shared one-writer grammar, like :func:`finding_groups`.
+    Two operator-deferred classes (2026-09-04, from the first node-wide
+    backstop dry-run):
+
+    - ``QC01_FlightCheck`` ``reflectance_product_`` — a missing
+      reflectance ortho usually means *not processed yet*, not
+      *broken*; deferred until the intent-aware applicability design
+      (pipeline plan §5e) can tell the two apart;
+    - ``QC03_RasterCheck`` — everything (the empty prefix matches all
+      check names): its thresholds are explicitly uncalibrated, and
+      tickets from uncalibrated gates are noise. Remove the entry when
+      the QC03 calibration work lands.
+
+    Parameters
+    ----------
+    script : str
+        Contract script name.
+
+    Returns
+    -------
+    tuple of str
+        Prefixes whose failing checks are skipped by
+        :func:`ensure_finding_tickets` (empty = author everything).
+    """
+    return {
+        "QC01_FlightCheck": ("reflectance_product_",),
+        "QC03_RasterCheck": ("",),
+    }.get(script, ())
+
+
+# ==================================================================================
 def _live_findings(yaml_data: Dict[str, Any],
                    ) -> Dict[Tuple[str, str], Dict[str, Any]]:
     """Resolve the live ``qc_findings`` entry per ``(script, finding)``.
@@ -542,10 +577,14 @@ def ensure_finding_tickets(date_dir: pathlib.Path, run_name: str,
     if groups is None:
         groups = finding_groups(report)
 
-    # +++++ gating fails (advisory/waived never fail the run -> no finding) +++++
+    # +++++ gating fails (advisory/waived never fail the run -> no finding;
+    # deferred classes never author, see finding_exclusions) +++++
     failing = [n for n, c in checks.items()
                if isinstance(c, dict) and c.get("status") == "fail"
                and not c.get("advisory") and not c.get("waived")]
+    deferred = finding_exclusions(script)
+    if deferred:
+        failing = [n for n in failing if not n.startswith(deferred)]
     passing = {n for n, c in checks.items()
                if isinstance(c, dict)
                and c.get("status") in {"good", "acceptable"}}

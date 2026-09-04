@@ -184,18 +184,18 @@ def test_grouping_aggregates(tmp_path):
     report = make_report({
         "dead_band_412nm": fail("99.9 %"), "dead_band_413nm": fail("99.8 %"),
         "over_range_vnir": fail("2.1 %"),
-    }, script="QC03_RasterCheck")
+    }, script="QC02_SpectralCheck")  # mechanics only; QC03 authoring is deferred
     groups = {"dead_bands": ["dead_band_412nm", "dead_band_413nm"]}
     actions = iy.ensure_finding_tickets(tmp_path, "run_00", report,
                                         groups=groups)
     assert any("open finding dead_bands" in a for a in actions)
     data, _ = iy.load_issue_yaml(tmp_path, "run_00")
     live = iy._live_findings(data)
-    grouped = live[("QC03_RasterCheck", "dead_bands")]
+    grouped = live[("QC02_SpectralCheck", "dead_bands")]
     assert list(grouped["checks"]) == ["dead_band_412nm", "dead_band_413nm"]
     assert "dead_band_412nm: 99.9 %" in grouped["value"]
     # unclaimed failing check becomes a singleton finding
-    assert ("QC03_RasterCheck", "over_range_vnir") in live
+    assert ("QC02_SpectralCheck", "over_range_vnir") in live
 
 
 def test_author_appends_to_existing_yaml(tmp_path):
@@ -276,16 +276,16 @@ def test_autoclose_open_states(tmp_path, open_state):
 
 def test_autoclose_requires_all_members(tmp_path):
     report = make_report({"dead_band_412nm": fail(), "dead_band_413nm": fail()},
-                         script="QC03_RasterCheck")
+                         script="QC02_SpectralCheck")
     iy.ensure_finding_tickets(tmp_path, "run_00", report, groups={
         "dead_bands": ["dead_band_412nm", "dead_band_413nm"]})
     half = make_report({"dead_band_412nm": good(),
                         "dead_band_413nm": fail("99.1 %")},
-                       script="QC03_RasterCheck")
+                       script="QC02_SpectralCheck")
     actions = iy.ensure_finding_tickets(tmp_path, "run_00", half, groups={
         "dead_bands": ["dead_band_412nm", "dead_band_413nm"]})
     assert "close dead_bands as fixed" not in actions
-    assert live_state(tmp_path, "run_00", "QC03_RasterCheck",
+    assert live_state(tmp_path, "run_00", "QC02_SpectralCheck",
                       "dead_bands") == "TODO"
 
 
@@ -531,3 +531,25 @@ def test_finding_groups_default_singletons(tmp_path):
     iy.ensure_finding_tickets(tmp_path, "run_00", report)
     data, _ = iy.load_issue_yaml(tmp_path, "run_00")
     assert ("QC00_GCPCheck", "gcp_2d_vnir") in iy._live_findings(data)
+
+
+# ========== finding_exclusions: deferred classes never author ==========
+def test_qc01_reflectance_product_deferred(tmp_path):
+    report = make_report({"reflectance_product_vnir": fail("MISSING"),
+                          "reflectance_product_swir": fail("MISSING"),
+                          "gsd_vnir": fail("120 %")})
+    actions = iy.ensure_finding_tickets(tmp_path, "run_00", report)
+    # the spec fail still authors; the not-yet-processed class never does
+    assert actions == ["created Issues.yaml", "open finding flight_spec_vnir"]
+    data, _ = iy.load_issue_yaml(tmp_path, "run_00")
+    live = iy._live_findings(data)
+    assert not any("reflectance_product" in k for _, k in live)
+
+
+def test_qc03_fully_deferred(tmp_path):
+    report = make_report({"zeros_in_footprint_vnir": fail("18.7 %"),
+                          "header_bin_integrity_swir": fail("bad header")},
+                         script="QC03_RasterCheck")
+    report["products"] = {"vnir": {}, "swir": {}}
+    assert iy.ensure_finding_tickets(tmp_path, "run_00", report) == []
+    assert not (tmp_path / "run_00_Issues.yaml").is_file()
