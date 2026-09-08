@@ -61,7 +61,7 @@ hook for it. Not in scope for v1.0.
 
 __title__ = "Spectral index calculation"
 __author__ = "Arden Burrell"
-__version__ = "v1.0(13.08.2026)"
+__version__ = "v1.1(08.09.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 
@@ -135,7 +135,8 @@ class SIConfig:
         Reflectance scale factor applied to integer rasters (GRYFN
         orthos are 0-10000 scaled).
     mem_headroom_bytes : float
-        Memory kept free when sizing index-computation chunks.
+        Memory kept free when sizing index-computation chunks. Sized so
+        the script also fits on a 16 GB laptop.
     headline_indices : tuple of str
         Preferred indices for the overview figures (first computable
         one becomes the map thumbnail).
@@ -149,7 +150,7 @@ class SIConfig:
     output_dirname: str = "SpectralIndices"
     figures_dirname: str = "SI_figures"
     int_scale: float = 10000.0
-    mem_headroom_bytes: float = 8e9
+    mem_headroom_bytes: float = 3e9
     headline_indices: Tuple[str, ...] = (
         "NDVI", "GNDVI", "NDREI", "EVI", "SAVI", "NDWI", "NDMI", "NBR")
     hist_sample_size: int = 200_000
@@ -542,7 +543,9 @@ def build_params(
 
     # ========== Open each source and read its band wavelengths ==========
     for region, ortho in product["sources"].items():
-        ds = rioxarray.open_rasterio(ortho, chunks={"band": 1})
+        # Spatial chunks bound the dask intermediates each spyndex formula
+        # materialises at compute time (full-grid bands blow small-RAM boxes).
+        ds = rioxarray.open_rasterio(ortho, chunks={"band": 1, "x": 4096, "y": 4096})
         handles.append(ds)
         if ds.rio.crs is None:
             raise ValueError(f"Raster {ortho} does not have a CRS defined.")
@@ -696,7 +699,11 @@ def _memory_chunks(
         Ordered chunks of index names.
     """
     bytes_per_index = float(ref_ds.sizes["x"]) * float(ref_ds.sizes["y"]) * 4
-    budget = max(psutil.virtual_memory().available - cfg.mem_headroom_bytes, 4e9)
+    avail = psutil.virtual_memory().available
+    # ponytail: the floor is capped at half of what is actually free so
+    # small-RAM machines (16 GB laptops) are never promised memory they
+    # don't have; upgrade path is a --mem-budget CLI override.
+    budget = max(avail - cfg.mem_headroom_bytes, min(2e9, 0.5 * avail))
     per_chunk = max(1, int(budget / (2 * bytes_per_index)))
     if per_chunk >= len(valid):
         return [valid]
