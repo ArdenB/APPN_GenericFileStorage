@@ -36,7 +36,9 @@ Outputs (per run, §4 layout):
 - ``QC_data/QC01_FlightCheck/QC01_sun_geometry.png`` - flight-axis vs
   solar-geometry polar figure (BRDF risk band).
 - ``QC_data/QC01_FlightCheck/QC01_agl_profiles.png`` - along-line AGL
-  profiles on a common ground axis.
+  profiles on a common ground axis; a second column shows the same
+  profiles as height above the landing pad (the pilot's relative
+  altitude) when the gpro trajectory ends at ground level.
 
 Within-spec check: as-flown values (AGL, ground speed, line spacing,
 settings.txt optics) are re-run through the GRYFN Flight Calculator's
@@ -72,7 +74,11 @@ upstream failure counting always sees the measurement.
 
 Note on heights: flight-line KML heights and the LiDAR DTM share the
 GNSS trajectory's vertical frame, so their difference (AGL) is internally
-consistent even though neither is orthometric.
+consistent even though neither is orthometric. Height above landing is
+the KML height minus the trajectory's landing-pad vertex (same frame):
+the last trajectory vertex is used when it sits on the DTM (or, outside
+the DTM, at the trajectory's minimum height), else the first vertex
+(take-off) is tried; if neither is at ground level the field is missing.
 
 Command-line Arguments
 ----------------------
@@ -101,7 +107,7 @@ Command-line Arguments
 
 __title__ = "Flight check"
 __author__ = "Arden Burrell"
-__version__ = "v3.0(04.09.2026)"
+__version__ = "v3.1(17.09.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -305,6 +311,7 @@ def process_run(
         row["reason"] = "no flight lines extracted from gpro"
         return row
     df = add_agl(df, gpro)
+    df = add_height_above_landing(df, gpro, mission)
     df = flag_rogue_lines(df, frac=args.rogue_agl_frac,
                           len_frac=args.rogue_len_frac)
     df = add_solar_geometry(df)
@@ -892,7 +899,8 @@ def extract_flight_lines(gpro: pathlib.Path, mission: dict) -> pd.DataFrame:
             geom = line_geometry(chosen)
             # per-vertex coords kept for the AGL-profile figure; dropped
             # before flight_lines.csv is written
-            rows.append({"sensor_id": acq["sensor_id"], **rec, **geom,
+            rows.append({"sensor_id": acq["sensor_id"],
+                         "flight": acq.get("flight", 1), **rec, **geom,
                          "_kml_coords": chosen})
     if not rows:
         raise FileNotFoundError(
@@ -1122,6 +1130,118 @@ def add_agl(df: pd.DataFrame, gpro: pathlib.Path) -> pd.DataFrame:
     df["agl_m"] = np.round(df["flight_height_m"] - df["ground_elev_m"], 2)
     if df["agl_m"].isna().any():
         warn.warn("Some line centroids fall on DTM nodata - AGL is NaN there.")
+    return df
+
+
+# ==================================================================================
+def landing_heights(gpro: pathlib.Path, mission: dict,
+                    dtm_tol_m: float = 5.0,
+                    min_tol_m: float = 3.0) -> Dict[int, float]:
+    """Landing-pad height per flight from the gpro GNSS trajectory.
+
+    Reads ``trajectory.json`` under each GNSS acquisition's ``data_root``
+    (the LineString feature; SBG bundles also carry a MultiPoint). The
+    last vertex is the landing candidate and the first the take-off
+    fallback. A candidate counts as "on the ground" when it is within
+    ``dtm_tol_m`` of the LiDAR DTM, or - when there is no DTM sample at
+    that point - within ``min_tol_m`` of the trajectory's minimum height.
+
+    Parameters
+    ----------
+    gpro : pathlib.Path
+        Path to the `.gpro` bundle directory.
+    mission : dict
+        Parsed mission metadata (``acquisitions[].type == "GNSS"``).
+    dtm_tol_m : float
+        Max |vertex height - DTM| for a ground-level vertex.
+    min_tol_m : float
+        Max vertex height above the trajectory minimum when the DTM
+        cannot be sampled there.
+
+    Returns
+    -------
+    Dict[int, float]
+        ``{flight: landing_height_m}`` in the trajectory's vertical
+        frame; flights whose trajectory neither ends nor starts at
+        ground level are omitted (field reported missing, no graw
+        fallback).
+    """
+    dtms = sorted((gpro / "products").glob("*_DTM_*.tif"))
+    src = rasterio.open(dtms[0]) if dtms else None
+
+    def _ground_level(p: np.ndarray, hmin: float) -> bool:
+        if src is not None:
+            xs, ys = rasterio.warp.transform("EPSG:4326", src.crs,
+                                             [p[0]], [p[1]])
+            g = float(next(src.sample(zip(xs, ys)))[0])
+            if src.nodata is not None and np.isclose(g, src.nodata):
+                g = np.nan
+            if np.isfinite(g):
+                return abs(p[2] - g) <= dtm_tol_m
+        return (p[2] - hmin) <= min_tol_m
+
+    out: Dict[int, float] = {}
+    for acq in mission.get("acquisitions", []):
+        if acq.get("type") != "GNSS":
+            continue
+        flight = acq.get("flight", 1)
+        traj = gpro / acq["data_root"].replace("\\", "/") / "trajectory.json"
+        if not traj.is_file():
+            warn.warn(f"flight {flight}: trajectory.json missing from "
+                      f"{traj.parent} - height above landing reported missing.")
+            continue
+        with open(traj, encoding="utf-8") as fh:
+            feats = json.load(fh)["features"]
+        lines = [f for f in feats if f["geometry"]["type"] == "LineString"]
+        if not lines:
+            warn.warn(f"flight {flight}: no LineString in {traj} - height "
+                      "above landing reported missing.")
+            continue
+        coords = np.asarray(lines[0]["geometry"]["coordinates"], dtype=float)
+        hmin = float(coords[:, 2].min())
+        if _ground_level(coords[-1], hmin):
+            out[flight] = round(float(coords[-1, 2]), 2)
+        elif _ground_level(coords[0], hmin):
+            warn.warn(f"flight {flight}: trajectory does not end at ground "
+                      "level - using the take-off vertex as the landing pad.")
+            out[flight] = round(float(coords[0, 2]), 2)
+        else:
+            warn.warn(f"flight {flight}: trajectory neither starts nor ends "
+                      "at ground level - height above landing reported missing.")
+    if src is not None:
+        src.close()
+    return out
+
+
+# ==================================================================================
+def add_height_above_landing(df: pd.DataFrame, gpro: pathlib.Path,
+                             mission: dict) -> pd.DataFrame:
+    """Add landing-pad height and height-above-landing columns.
+
+    Height above landing = mean flight height - landing-pad height from
+    :func:`landing_heights` (same vertical frame), i.e. the relative
+    altitude the pilot flew to. Compared with ``agl_m`` it separates the
+    terrain contribution from the flown altitude.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Flight-line table with ``flight`` and ``flight_height_m``.
+    gpro : pathlib.Path
+        Path to the `.gpro` bundle directory.
+    mission : dict
+        Parsed mission metadata.
+
+    Returns
+    -------
+    pd.DataFrame
+        Input with ``landing_height_m`` and ``height_above_landing_m``
+        columns added (NaN where the landing pad is underivable).
+    """
+    heights = landing_heights(gpro, mission)
+    df["landing_height_m"] = df["flight"].map(heights).astype(float)
+    df["height_above_landing_m"] = np.round(
+        df["flight_height_m"] - df["landing_height_m"], 2)
     return df
 
 
@@ -2460,21 +2580,27 @@ def make_agl_profile_plot(
     gpro: pathlib.Path,
     out_dir: pathlib.Path,
 ) -> Optional[pathlib.Path]:
-    """Render along-line AGL profiles on a common ground axis.
+    """Render along-line AGL and height-above-landing profiles.
 
-    One panel per sensor: per-vertex height above ground (epoch-KML
-    vertex height minus a DTM sample at that vertex, both in the
-    trajectory's vertical frame) against distance along the mean flight
-    axis. All lines are projected onto that axis, so reverse-flown lines
-    align spatially: terrain-driven wiggles line up vertically across
-    lines while platform-driven drift does not. Rogue lines are
-    excluded; the dashed line marks the panel median AGL.
+    One row per metric, single column with all sensors overlaid (they
+    share the one GNSS trajectory; linestyle distinguishes sensors,
+    colour distinguishes lines): per-vertex height above
+    ground (epoch-KML vertex height minus a DTM sample at that vertex)
+    and per-vertex height above the landing pad (vertex height minus
+    ``landing_height_m``), both in the trajectory's vertical frame,
+    against distance along the mean flight axis. All lines are projected
+    onto that axis, so reverse-flown lines align spatially:
+    terrain-driven wiggles line up vertically across lines while
+    platform-driven drift does not; the two rows share a y-axis so
+    the terrain contribution reads as their difference. Rogue lines are
+    excluded; the dashed line marks the panel median.
 
     Parameters
     ----------
     df : pd.DataFrame
         Flight-line table carrying the ``_kml_coords`` object column
-        from :func:`extract_flight_lines`.
+        from :func:`extract_flight_lines` and ``landing_height_m`` from
+        :func:`add_height_above_landing`.
     gpro : pathlib.Path
         Path to the `.gpro` bundle (LiDAR DTM product).
     out_dir : pathlib.Path
@@ -2483,54 +2609,78 @@ def make_agl_profile_plot(
     Returns
     -------
     Optional[pathlib.Path]
-        Path of the written PNG, or None when the DTM product or the
-        line geometry is missing (AGL underivable - no graw fallback).
+        Path of the written PNG, or None when the line geometry is
+        missing or neither the DTM nor a landing pad is available
+        (no graw fallback).
     """
-    dtms = sorted((gpro / "products").glob("*_DTM_*.tif"))
-    if not dtms or "_kml_coords" not in df.columns:
+    if "_kml_coords" not in df.columns:
         return None
     sub = df.loc[~df["rogue_line"].astype(bool)]
     sub = sub.loc[[c is not None for c in sub["_kml_coords"]]]
     if sub.empty:
         return None
+    dtms = sorted((gpro / "products").glob("*_DTM_*.tif"))
+    src = rasterio.open(dtms[0]) if dtms else None
+    has_landing = sub["landing_height_m"].notna().any()
+    metrics = ([("AGL (m)", "agl")] if src is not None else []) + \
+              ([("height above landing (m)", "hal")] if has_landing else [])
+    if not metrics:
+        return None
 
     sensors = list(dict.fromkeys(sub["sensor_id"]))
-    fig, axes = plt.subplots(len(sensors), 1,
-                             figsize=(8, 3.2 * len(sensors) + 0.8),
+    styles = dict(zip(sensors, ["-", "--", ":", "-."]))
+    fig, axes = plt.subplots(len(metrics), 1,
+                             figsize=(8, 3.2 * len(metrics) + 0.8),
                              sharex=True, sharey=True, squeeze=False)
-    with rasterio.open(dtms[0]) as src:
-        for ax, sid in zip(axes.ravel(), sensors):
-            rows = sub[sub["sensor_id"] == sid]
-            # +++++ common ground axis: circular-mean flight axis +++++
-            h2 = np.deg2rad(rows["heading_deg"].to_numpy() * 2.0)
-            axis_rad = 0.5 * np.arctan2(np.nanmean(np.sin(h2)),
-                                        np.nanmean(np.cos(h2)))
-            profiles = []
-            for _, r in rows.iterrows():
-                c = r["_kml_coords"]
-                xs, ys = rasterio.warp.transform(
-                    "EPSG:4326", src.crs,
-                    c[:, 0].tolist(), c[:, 1].tolist())
-                ground = np.array([v[0] for v in src.sample(zip(xs, ys))],
-                                  dtype=float)
-                if src.nodata is not None:
-                    ground[np.isclose(ground, src.nodata)] = np.nan
-                s = (np.asarray(xs) * np.sin(axis_rad)
-                     + np.asarray(ys) * np.cos(axis_rad))
-                profiles.append((int(r["line"]), s, c[:, 2] - ground))
-            s0 = min(p[1].min() for p in profiles)
-            cmap = plt.get_cmap("viridis", max(len(profiles), 2))
-            for k, (line, s, agl) in enumerate(profiles):
-                ax.plot(s - s0, agl, color=cmap(k), lw=1.1,
-                        label=f"line {line}")
-            med = np.nanmedian(np.concatenate([p[2] for p in profiles]))
+    # +++++ common ground axis: circular-mean flight axis (all sensors) +++++
+    h2 = np.deg2rad(sub["heading_deg"].to_numpy() * 2.0)
+    axis_rad = 0.5 * np.arctan2(np.nanmean(np.sin(h2)),
+                                np.nanmean(np.cos(h2)))
+    # local metric frame so the axis does not depend on having a DTM
+    local = pyproj.Transformer.from_crs(
+        "EPSG:4326",
+        f"+proj=aeqd +lat_0={sub['centroid_lat'].mean()} "
+        f"+lon_0={sub['centroid_lon'].mean()} +datum=WGS84 +units=m",
+        always_xy=True)
+    profiles = []
+    for _, r in sub.iterrows():
+        c = r["_kml_coords"]
+        ex, ny = local.transform(c[:, 0], c[:, 1])
+        s = ex * np.sin(axis_rad) + ny * np.cos(axis_rad)
+        ground = np.full(len(c), np.nan)
+        if src is not None:
+            xs, ys = rasterio.warp.transform(
+                "EPSG:4326", src.crs,
+                c[:, 0].tolist(), c[:, 1].tolist())
+            ground = np.array([v[0] for v in src.sample(zip(xs, ys))],
+                              dtype=float)
+            if src.nodata is not None:
+                ground[np.isclose(ground, src.nodata)] = np.nan
+        profiles.append({"sensor": r["sensor_id"], "line": int(r["line"]),
+                         "s": s, "agl": c[:, 2] - ground,
+                         "hal": c[:, 2] - r["landing_height_m"]})
+    if src is not None:
+        src.close()
+    s0 = min(p["s"].min() for p in profiles)
+    n_lines = int(sub["line"].max()) + 1
+    cmap = plt.get_cmap("viridis", max(n_lines, 2))
+    for ax, (ylabel, key) in zip(axes[:, 0], metrics):
+        for p in profiles:
+            # one legend entry per line (first sensor) + one per sensor style
+            first = p["sensor"] == sensors[0]
+            ax.plot(p["s"] - s0, p[key], color=cmap(p["line"]), lw=1.1,
+                    ls=styles[p["sensor"]],
+                    label=f"line {p['line']}" if first else None)
+        for sid in sensors:
+            ax.plot([], [], color="0.2", ls=styles[sid], lw=1.1, label=sid)
+        med = np.nanmedian(np.concatenate([p[key] for p in profiles]))
+        if np.isfinite(med):
             ax.axhline(med, color="0.4", lw=0.8, ls="--")
-            ax.set_ylabel("AGL (m)")
-            ax.set_title(sid, fontsize=9)
-            ax.grid(alpha=0.3)
-            ax.legend(fontsize=7, ncol=4, frameon=False)
-    axes.ravel()[-1].set_xlabel("distance along mean flight axis (m)")
-    fig.suptitle("Along-line AGL profiles (common ground axis; "
+        ax.set_ylabel(ylabel)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=7, ncol=4, frameon=False)
+    axes[-1, 0].set_xlabel("distance along mean flight axis (m)")
+    fig.suptitle("Along-line height profiles (common ground axis; "
                  "dashed = median)", fontsize=11)
     fig.tight_layout()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2617,6 +2767,8 @@ def write_outputs(
         "centroid_lat": round(df["centroid_lat"].mean(), 6),
         "centroid_lon": round(df["centroid_lon"].mean(), 6),
         "mean_agl_m": round(good["agl_m"].mean(), 1),
+        "mean_height_above_landing_m": _nanfloat(
+            round(good["height_above_landing_m"].mean(), 1)),
         "max_flight_height_range_m": _nanfloat(df["flight_height_range_m"].max()),
         "mean_solar_elevation_deg": round(df["solar_elevation_deg"].mean(), 1),
         "min_time_to_solar_noon_min": df["time_to_solar_noon_min"].abs().min(),
@@ -2679,6 +2831,15 @@ def write_outputs(
             "agl_note": "flight height minus LiDAR DTM at line centroid "
                         "(shared trajectory vertical frame); mean excludes "
                         "rogue lines",
+            "mean_height_above_landing_m": _nanfloat(
+                good["height_above_landing_m"].mean()),
+            "landing_height_m": {
+                int(k): _nanfloat(v) for k, v in
+                df.groupby("flight")["landing_height_m"].first().items()},
+            "height_above_landing_note": "flight height minus the gpro "
+                                         "trajectory's landing-pad vertex "
+                                         "(pilot's relative altitude); "
+                                         "mean excludes rogue lines",
             "flight_height_range_m_max": _nanfloat(
                 df["flight_height_range_m"].max()),
             "flight_height_std_m_max": _nanfloat(

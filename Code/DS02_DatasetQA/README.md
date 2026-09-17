@@ -141,7 +141,9 @@ RunOverview bools.
   layer; limits from `gcp_limits.yml` (`--spec`); key args:
   `--id-column`, `--plot`, `--type`.
 - **QC01_FlightCheck** — flight lines from the gpro bundle (KML +
-  timestamps), DTM-based AGL, solar geometry (pvlib SPA), exposure
+  timestamps), DTM-based AGL and height above the landing pad (from the
+  gpro trajectory's ground-level end vertex; `QC01_agl_profiles.png`
+  shows both side by side), solar geometry (pvlib SPA), exposure
   segments, FlightCal-calculator + fieldbook spec verdicts, bundle
   integrity (graw/dark-ref/panels/reflectance-ortho ELM tell); spec from
   `flightcal_spec.yml` (`--spec`); rogue take-off/landing lines are
