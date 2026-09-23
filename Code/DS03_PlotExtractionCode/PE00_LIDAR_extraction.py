@@ -30,6 +30,17 @@ metadata. ``--full-percentiles`` additionally writes the full 0-100
 percentile profile per plot to
 ``PlotLevel/PE_LIDAR_plot_percentiles[…].parquet``.
 
+Independently of the point pipeline, a raster canopy height model is
+computed per run as ``CHM = DSM − DTM`` (the 1 m DTM resampled to the
+DSM grid by nearest neighbour): each plot polygon is clipped out of the
+DSM through a windowed read (PE01 pattern) and the per-plot CHM cells
+get the same shared statistic set, written to its own table
+``PlotLevel/PE_LIDAR_chm_metrics[…].parquet`` (``variable == "CHM"``;
+count = cells, not points) with its own provenance sidecar and cache
+(inputs = DSM, DTM, plot file). It cross-checks the point-based
+numbers without ever touching the point cloud. ``--full-percentiles``
+also writes ``PlotLevel/PE_LIDAR_chm_percentiles[…].parquet``.
+
 Command-line Arguments
 ----------------------
 --path : str, optional
@@ -51,7 +62,7 @@ Command-line Arguments
 
 __title__ = "LIDAR plot extraction"
 __author__ = "Arden Burrell & Richard Harwood"
-__version__ = "v2.2(19.08.2026)"
+__version__ = "v2.3(23.09.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -158,6 +169,12 @@ def main(args: argparse.Namespace, path: pathlib.Path) -> pd.DataFrame:
             summary_rows.append(_summary_row(job, "skipped", "; ".join(plot_issues)))
             continue
         row = process_lidar(job, plotshp, cfg, args, repo)
+        # +++++ Raster CHM metrics: independent inputs, cache and sidecar +++++
+        chm_status, chm_reason = process_chm(job, plotshp, args, repo)
+        row["chm"] = chm_status
+        if chm_reason:
+            row["reason"] = "; ".join(
+                r for r in [row.get("reason"), chm_reason] if r)
         summary_rows.append(row)
 
     # ========== Print the end-of-run summary ==========
@@ -288,6 +305,9 @@ def locate_lidar_runs(
             "metadata_outfile": dirs["pixel"] / f"{stem}_metadata.yaml",
             "metrics_file": dirs["plot"] / f"PE_LIDAR_plot_metrics{suffix}.parquet",
             "percentiles_file": dirs["plot"] / f"PE_LIDAR_plot_percentiles{suffix}.parquet",
+            "chm_metrics_file": dirs["plot"] / f"PE_LIDAR_chm_metrics{suffix}.parquet",
+            "chm_percentiles_file": dirs["plot"] / f"PE_LIDAR_chm_percentiles{suffix}.parquet",
+            "chm_metadata_outfile": dirs["plot"] / f"PE_LIDAR_chm_metrics{suffix}_metadata.yaml",
             "site_dir": site_dir,
             "gpro_nu": gpro_nu,
             "issues": issues,
@@ -486,6 +506,215 @@ def write_plot_metrics(
         pctl.to_parquet(job["percentiles_file"], index=False,
                         compression="zstd")
     return []
+
+
+# ==================================================================================
+def process_chm(
+        job: Dict[str, Any],
+        plotshp: gpd.GeoDataFrame,
+        args: argparse.Namespace,
+        repo: Optional[git.Repo],
+    ) -> Tuple[str, Optional[str]]:
+    """Compute (or reuse) the per-plot raster CHM metrics for one run.
+
+    The CHM pipeline is fully independent of the point extraction: its
+    inputs are the DSM/DTM rasters and the plot file, and its outputs
+    live in their own table + provenance sidecar (written last, so it
+    is the completion marker and cache anchor). Skipped in ``--type
+    csv`` debug mode, which writes no metrics tables.
+
+    Parameters
+    ----------
+    job : dict
+        Job dict from :func:`locate_lidar_runs`.
+    plotshp : geopandas.GeoDataFrame
+        Validated plot polygons (plus trial-info columns when joined).
+    args : argparse.Namespace
+        Parsed command-line arguments (``force``, ``type``,
+        ``full_percentiles``).
+    repo : git.Repo or None
+        Repository handle for the provenance sidecar.
+
+    Returns
+    -------
+    str
+        CHM status for the summary row (``computed``,
+        ``computed_with_issues``, ``cached``, ``skipped``).
+    str or None
+        Reason/issue text (``CHM: ...``) for skipped/qualified rows.
+    """
+    if args.type == "csv":
+        return "skipped", None
+    if job["dsm"] is None or job["dtm"] is None:
+        return "skipped", "CHM: DSM or DTM raster missing; CHM metrics skipped."
+    plot_file = plotshp.attrs["plot_file"]
+    outputs = [job["chm_metrics_file"]]
+    if args.full_percentiles:
+        outputs.append(job["chm_percentiles_file"])
+    if (not args.force and all(f.is_file() for f in outputs)
+            and cf.outputs_up_to_date([job["chm_metadata_outfile"]],
+                                      [job["dsm"], job["dtm"], plot_file])):
+        return "cached", None
+
+    n_cells, issues = write_chm_metrics(job, plotshp, args, repo)
+    if n_cells == 0:
+        return "skipped", "CHM: " + "; ".join(issues)
+    status = "computed" if not issues else "computed_with_issues"
+    return status, ("CHM: " + "; ".join(issues)) if issues else None
+
+
+# ==================================================================================
+def write_chm_metrics(
+        job: Dict[str, Any],
+        plotshp: gpd.GeoDataFrame,
+        args: argparse.Namespace,
+        repo: Optional[git.Repo],
+    ) -> Tuple[int, List[str]]:
+    """Compute and save the per-plot CHM (DSM − DTM) metrics table(s).
+
+    Clips each plot polygon out of the DSM, differences it against the
+    nearest-neighbour-resampled DTM, and computes the shared DS03
+    statistic set over the per-plot CHM cells (``variable == "CHM"``;
+    ``count`` = cells). Run metadata and any trial-info columns on
+    *plotshp* are attached, mirroring :func:`write_plot_metrics`. The
+    provenance sidecar is written last (completion marker).
+
+    Parameters
+    ----------
+    job : dict
+        Job dict from :func:`locate_lidar_runs`.
+    plotshp : geopandas.GeoDataFrame
+        Validated plot polygons (plus trial-info columns when joined).
+    args : argparse.Namespace
+        Parsed command-line arguments (``full_percentiles``).
+    repo : git.Repo or None
+        Repository handle for the provenance sidecar.
+
+    Returns
+    -------
+    int
+        CHM cells used across all plots (0 = nothing written).
+    list of str
+        Issues encountered; empty on clean success.
+    """
+    print(f"Computing CHM (DSM - DTM) metrics for {job['dsm'].name} ...")
+    cells, issues = _chm_plot_values(job["dsm"], job["dtm"], plotshp)
+    if cells is None or cells.empty:
+        issues.append("No finite CHM cells fell inside any plot polygon; "
+                      "CHM metrics skipped.")
+        return 0, issues
+
+    metrics = pex.group_value_stats(cells, ["plot_id"], value_col="CHM")
+    metrics.insert(1, "variable", "CHM")
+    for key in ["node", "project", "site", "sensor", "date", "run"]:
+        metrics[key] = job[key]
+    if job["gpro_nu"] is not None:
+        metrics["gpro_nu"] = job["gpro_nu"]
+    trial_cols = [c for c in plotshp.columns
+                  if c not in ("geometry",) and c != "plot_id"]
+    if trial_cols:
+        metrics = metrics.merge(
+            pd.DataFrame(plotshp[["plot_id"] + trial_cols]),
+            on="plot_id", how="left")
+    job["chm_metrics_file"].parent.mkdir(parents=True, exist_ok=True)
+    metrics.to_parquet(job["chm_metrics_file"], index=False, compression="zstd")
+
+    # +++++ Full percentile profile (own table; joined via plot_id) +++++
+    if args.full_percentiles:
+        pctl = pex.group_value_percentiles(cells, ["plot_id"], value_col="CHM")
+        pctl.insert(1, "variable", "CHM")
+        for key in ["node", "project", "site", "sensor", "date", "run"]:
+            pctl[key] = job[key]
+        if job["gpro_nu"] is not None:
+            pctl["gpro_nu"] = job["gpro_nu"]
+        pctl.to_parquet(job["chm_percentiles_file"], index=False,
+                        compression="zstd")
+
+    # ========== Provenance sidecar (written last: completion marker) ==========
+    meta = cf.build_run_metadata(
+        {**{k: job[k] for k in ["dsm", "dtm", "gpro_nu", "node", "project",
+                                "site", "sensor", "date", "run"]},
+         "outfile": job["chm_metrics_file"],
+         "plot_file": plotshp.attrs["plot_file"],
+         "n_cells": int(len(cells)),
+         "n_plots_with_cells": int(metrics["plot_id"].nunique()),
+         "n_plots_total": len(plotshp),
+         "issues": issues},
+        script_path=__file__, repo=repo)
+    cf.write_metadata_yaml(meta, job["chm_metadata_outfile"])
+    return int(len(cells)), issues
+
+
+# ==================================================================================
+def _chm_plot_values(
+        dsm_path: pathlib.Path,
+        dtm_path: pathlib.Path,
+        plotshp: gpd.GeoDataFrame,
+    ) -> Tuple[Optional[pd.DataFrame], List[str]]:
+    """Clip per-plot CHM (DSM − DTM) cells into a long table.
+
+    The DSM is opened lazily and each plot is read through its own
+    bounding-box window (``clip_box`` → ``clip``, the PE01 pattern), so
+    the full-site 4–8 cm DSM is never loaded whole. The coarse (1 m)
+    DTM is loaded once and resampled onto each clipped DSM window by
+    nearest neighbour (``reindex_like``).
+
+    Parameters
+    ----------
+    dsm_path : pathlib.Path
+        DSM raster path.
+    dtm_path : pathlib.Path
+        DTM raster path.
+    plotshp : geopandas.GeoDataFrame
+        Validated plot polygons with a ``plot_id`` column.
+
+    Returns
+    -------
+    pandas.DataFrame or None
+        Long table with ``plot_id`` and ``CHM`` columns (one row per
+        finite CHM cell); None when the rasters cannot be related.
+    list of str
+        Issues encountered (missing CRS, CRS mismatch, per-plot clip
+        failures).
+    """
+    issues: List[str] = []
+    dsm = rioxarray.open_rasterio(dsm_path, masked=True).squeeze("band", drop=True)  # type: ignore[union-attr]
+    dtm = rioxarray.open_rasterio(dtm_path, masked=True).squeeze("band", drop=True)  # type: ignore[union-attr]
+    try:
+        crs = dsm.rio.crs
+        if crs is None:
+            issues.append(f"DSM {dsm_path.name} has no CRS; CHM skipped.")
+            return None, issues
+        if dtm.rio.crs != crs:
+            issues.append(f"DTM CRS ({dtm.rio.crs}) differs from the DSM "
+                          f"({crs}); CHM skipped.")
+            return None, issues
+        plots = plotshp.to_crs(crs)[["plot_id", "geometry"]]
+        dtm = dtm.load()  # 1 m grid -> small; one read serves every window
+
+        frames: List[pd.DataFrame] = []
+        for _, prow in tqdm(plots.iterrows(), total=len(plots),
+                            desc=f"CHM {dsm_path.stem}", leave=False):
+            try:
+                window = dsm.rio.clip_box(*prow.geometry.bounds)
+                sub = window.rio.clip([prow.geometry], crs, drop=True)
+            except Exception as er:  # rioxarray raises several types here
+                issues.append(f"Could not clip plot {prow['plot_id']} from "
+                              f"the DSM: {er}.")
+                continue
+            chm = sub - dtm.reindex_like(sub, method="nearest")
+            vals = np.asarray(chm.values, dtype=float).ravel()
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                continue
+            frames.append(pd.DataFrame({"plot_id": prow["plot_id"],
+                                        "CHM": vals}))
+    finally:
+        dsm.close()
+        dtm.close()
+    if not frames:
+        return None, issues
+    return pd.concat(frames, ignore_index=True), issues
 
 
 # ==================================================================================
@@ -809,7 +1038,7 @@ def _print_run_summary(rows: List[Dict[str, Any]]) -> pd.DataFrame:
         The full summary with a fixed column order.
     """
     columns = ["project", "sensor", "date", "run", "n_points", "n_plots",
-               "status", "reason"]
+               "status", "chm", "reason"]
     df = pd.DataFrame(rows, columns=columns)
     if df.empty:
         print("\nNo runs to summarise.")
@@ -820,13 +1049,14 @@ def _print_run_summary(rows: List[Dict[str, Any]]) -> pd.DataFrame:
         disp[col] = disp[col].apply(
             lambda v: "" if v is None or pd.isna(v) else f"{int(v)}")
     disp["reason"] = disp["reason"].fillna("")
+    disp["chm"] = disp["chm"].fillna("")
 
     skipped = disp[disp["status"] == "skipped"]
     reported = disp[disp["status"] != "skipped"]
     if not skipped.empty:
         print(f"\nSKIPPED ({len(skipped)}):")
-        print(skipped[["project", "sensor", "date", "run", "status", "reason"]
-                      ].to_string(index=False))
+        print(skipped[["project", "sensor", "date", "run", "status", "chm",
+                       "reason"]].to_string(index=False))
     if not reported.empty:
         print(f"\nREPORTED ({len(reported)}):")
         print(reported.to_string(index=False))

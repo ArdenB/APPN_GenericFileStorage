@@ -20,7 +20,7 @@ ML-model-derived products), split into three sub-folders:
 
 | Script | Input | Output |
 |--------|-------|--------|
-| `PE00_LIDAR_extraction.py` | `*_LiDAR_CombinedPointCloud.las/.laz` + DSM/DTM | `PixelLevel/PE_LIDAR_points[…]/` dataset + metadata YAML, `PlotLevel/PE_LIDAR_plot_metrics[…].parquet` (+ `PE_LIDAR_plot_percentiles[…].parquet` with `--full-percentiles`) |
+| `PE00_LIDAR_extraction.py` | `*_LiDAR_CombinedPointCloud.las/.laz` + DSM/DTM | `PixelLevel/PE_LIDAR_points[…]/` dataset + metadata YAML, `PlotLevel/PE_LIDAR_plot_metrics[…].parquet` and `PE_LIDAR_chm_metrics[…].parquet` (+ `PE_LIDAR_plot_percentiles[…].parquet` / `PE_LIDAR_chm_percentiles[…].parquet` with `--full-percentiles`) |
 | `PE01_HyperspecPlotExtraction.py` | `*_{VNIR\|SWIR}_Orthomosaic.bin` (GOBI: VNIR, CALVIS: VNIR+SWIR) | `PixelLevel/PE_{REGION}_pixels[…]/` dataset, `PlotLevel/PE_{REGION}_plot_metrics[…].parquet` (+ `…_plot_percentiles[…].parquet` with `--full-percentiles`), `Reports/PE_extraction_report[…].md` + `PE_figures/` |
 | `PE02_IndexPlotExtraction.py` | DS05/SI00 index maps (`SpectralIndices/SI_*_report.json` manifests + NetCDF/GeoTIFF) | `PixelLevel/PE_INDEX_{REGION}_{METHOD}_pixels[…]/` dataset, `PlotLevel/PE_INDEX_{REGION}_{METHOD}_plot_metrics[…].parquet` (+ `…_plot_percentiles[…].parquet` with `--full-percentiles`), `Reports/PE_INDEX_{REGION}_{METHOD}_report[…].md` + `PE_figures/` |
 
@@ -99,6 +99,20 @@ file instead; no plot metrics). A per-plot canopy-height metrics table
 `Delta_z` + a `variable` column for future height definitions) is then
 derived from the saved dataset — the point cloud is never re-read — and
 refreshed independently when stale (`status=metrics_refreshed`).
+
+Independently of the point pipeline, a raster canopy height model
+(`CHM = DSM − DTM`, the 1 m DTM resampled to the DSM grid by nearest
+neighbour) is computed per run: each plot polygon is clipped out of the
+DSM through a windowed read (the PE01 pattern — the DSM is never loaded
+whole) and the per-plot CHM *cells* get the same shared statistic set,
+written to `PlotLevel/PE_LIDAR_chm_metrics[…].parquet`
+(`variable == "CHM"`; `count` = cells, not points) with its own
+provenance sidecar and cache (inputs = DSM, DTM, plot file — a plot-file
+or raster update refreshes the CHM without re-extracting points, and
+vice versa). The summary table reports it in a separate `chm` column
+(`computed`/`cached`/`skipped`). It cross-checks the point-based heights
+without ever touching the point cloud; `--full-percentiles` also writes
+`PlotLevel/PE_LIDAR_chm_percentiles[…].parquet`.
 
 ```bash
 python Code/DS03_PlotExtractionCode/PE00_LIDAR_extraction.py --path <Node>/<Project>
