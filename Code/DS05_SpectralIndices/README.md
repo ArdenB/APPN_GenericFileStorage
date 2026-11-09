@@ -1,13 +1,27 @@
 # DS05 — Spectral index calculation
 
 Computes spyndex spectral index maps from the hyperspectral orthomosaics
-produced by the GRYFN processing chain. **Raster in → raster out**:
-scripts here never open plot geojson or parquet — all plot-level
-extraction from these index maps lives in DS03 (`PE02`).
+produced by the GRYFN processing chain and from commercial satellite
+surface-reflectance mosaics. **Raster in → raster out**: scripts here
+never open plot geojson or parquet — all plot-level extraction from
+these index maps lives in DS03 (`PE02`).
 
 | Script | Purpose |
 |---|---|
 | `SI00_SpectralIndices.py` | Crawl runs, map sensor bands → spyndex symbols, compute every computable index, write per-run index maps + reports |
+| `SI01_SatelliteIndices.py` | Satellite (MAXAR / JILIN) variant: crawl `<run>/T1_proc/05_Mosaic/` for the `*_SR_*_Multi_FinalRev.tif` keeper mosaic, static native-band table (JILIN `B,G,R,N`; MAXAR `A,B,G,Y,R,RE1,RE2,N`), vendor SR scale /20000, same product schema (output machinery imported from SI00) |
+
+## SI01 usage
+
+```bash
+python Code/DS05_SpectralIndices/SI01_SatelliteIndices.py --path <node_or_project_folder> [--outdir <scratch>]
+```
+
+`--outdir` mirrors `<site>/<sensor>/<date>/<run>/T1_proc/SpectralIndices/`
+under a scratch root instead of writing into the archive; omit only for
+the production run. `--indices`, `--force`, `--skipplot` as for SI00. The
+three indices that need `lambdaX` wavelength constants (`DVIplus`,
+`NDGI`, `NIRvH2`) use nominal band centres and are flagged in the report.
 
 ## SI00 usage
 
