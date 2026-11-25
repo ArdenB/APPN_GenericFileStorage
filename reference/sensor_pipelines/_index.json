@@ -1,0 +1,30 @@
+{
+  "metadata": {
+    "description": "Sensor platform-specific file structure patterns for APPN datastorage",
+    "created": "2025-10-22",
+    "purpose": "Define expected file structures for each sensor platform within T0_raw, T1_proc, and T2_traits folders",
+    "usage": "Use with pathlib.Path.rglob() to validate sensor data organization and check for missing/expected files"
+  },
+  "sensor_order": [
+    "M3M",
+    "CALVIS",
+    "GOBI",
+    "HIRES",
+    "MOLE",
+    "RHIZO",
+    "MAXAR",
+    "JILIN",
+    "H30T",
+    "M3T",
+    "IRT",
+    "SVC",
+    "PHENOMATE",
+    "TEMS",
+    "PTEMS",
+    "MPROBES",
+    "LITERAL",
+    "FIELDOBS",
+    "FIELDCAMS",
+    "ITRES"
+  ]
+}

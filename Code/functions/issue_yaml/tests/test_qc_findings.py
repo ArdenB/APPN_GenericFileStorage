@@ -376,6 +376,20 @@ def test_accepted_rung(tmp_path):
     assert "graw_present" in detail
 
 
+def test_accepted_checks_collects_only_accepted_members(tmp_path):
+    write_overview(tmp_path)
+    iy.ensure_finding_tickets(
+        tmp_path, "run_00",
+        make_report({"gsd_vnir_fieldbook": fail(), "gsd_vnir_calculator": fail(),
+                     "graw_present": fail()}))
+    set_state(tmp_path, "run_00", "QC01_FlightCheck",
+              "flight_spec_vnir", "accepted", note="known config")
+    data, _ = iy.load_issue_yaml(tmp_path, "run_00")
+    assert iy.accepted_checks(data) == {
+        "QC01_FlightCheck": {"gsd_vnir_fieldbook", "gsd_vnir_calculator"}}
+    assert iy.accepted_checks(None) == {}
+
+
 def test_fixed_finding_is_clean(tmp_path):
     write_overview(tmp_path)
     iy.ensure_finding_tickets(

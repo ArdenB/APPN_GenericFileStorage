@@ -1,0 +1,188 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Sensor platform entry",
+  "description": "Schema for a single sensor platform definition file. The pipeline block is the entire per-sensor spec (tier_structures was retired 2026-07-28; its file-detail knowledge lives in per-stage artifacts and pipeline.optional_extras).",
+  "type": "object",
+  "required": ["description"],
+  "anyOf": [
+    { "required": ["pipeline"] },
+    { "required": ["tier_structures"] }
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "description": {
+      "type": "string",
+      "description": "Short human-readable description of the sensor platform."
+    },
+    "pipeline": { "$ref": "#/$defs/pipeline" },
+    "tier_structures": {
+      "type": "object",
+      "description": "DEPRECATED (2026-07-28) — per-tier expected/optional folder layouts. Superseded by the pipeline block (per-stage done_when + artifacts); retained for sensors that have not yet been given a pipeline. Remove when the sensor gains one.",
+      "additionalProperties": false,
+      "properties": {
+        "T0_raw":    { "$ref": "#/$defs/tier" },
+        "T1_proc":   { "$ref": "#/$defs/tier" },
+        "T2_traits": { "$ref": "#/$defs/tier" }
+      }
+    }
+  },
+  "$defs": {
+    "tier": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "expected_folders": { "$ref": "#/$defs/folderMap" },
+        "optional_folders": { "$ref": "#/$defs/folderMap" }
+      }
+    },
+    "folderMap": {
+      "type": "object",
+      "description": "Map of folder glob (relative to the run folder) to list of expected file entries. Use \"\" for the folder itself.",
+      "additionalProperties": {
+        "type": "array",
+        "items": { "$ref": "#/$defs/fileEntry" }
+      }
+    },
+    "fileEntry": {
+      "oneOf": [
+        { "type": "string", "description": "Glob pattern for an expected file." },
+        {
+          "type": "object",
+          "required": ["name"],
+          "additionalProperties": false,
+          "properties": {
+            "name":     { "type": "string" },
+            "alt_name": { "type": "string" },
+            "size":     { "type": "string" },
+            "payload":  { "type": "string", "description": "Payload this file belongs to (subset of pipeline.payloads); its absence only matters if the payload was intended/captured." }
+          }
+        }
+      ]
+    },
+    "pipeline": {
+      "type": "object",
+      "description": "Ordered processing pipeline for P9 status tracking. Steps are named stages (not 1:1 with tier folders). Sensors without this block are reported as 'no pipeline defined' (never guessed). Readers infer a step done from later steps ONLY when it is marked ephemeral (its evidence is destroyed by a later step); for persistent steps a failed rule is real signal (e.g. raw_cleanup done while qc_report missing = QC was skipped). Optional per-project extras (plot extraction, spectral indices) are deliberately NOT pipeline steps.",
+      "required": ["steps"],
+      "additionalProperties": false,
+      "properties": {
+        "payloads": {
+          "type": "array",
+          "description": "Sub-sensor payloads carried by this platform (multi-payload sensors only). Operator-facing names used in issue-YAML intended_payloads/failed_payloads.",
+          "items": { "type": "string" },
+          "minItems": 2
+        },
+        "deployables": {
+          "type": "array",
+          "description": "Physical field equipment placed per run (e.g. gcps, elm_panels, val_panels). Unlike payloads these are not data streams: if a deployable was not placed (recorded as a deviation / in the issue YAML), rules gated on it via 'requires' become N/A — skipped, never failed. Deployables are assumed placed unless the run records otherwise.",
+          "items": { "type": "string" },
+          "minItems": 1
+        },
+        "steps": {
+          "type": "array",
+          "description": "Ordered pipeline stages.",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/pipelineStep" }
+        },
+        "optional_extras": {
+          "$ref": "#/$defs/folderMap",
+          "description": "Per-project optional products (e.g. Plot_Extraction, SpectralIndices). NOT pipeline stages: absence is never a stall."
+        }
+      }
+    },
+    "pipelineStep": {
+      "type": "object",
+      "required": ["name", "done_when"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "description": "Machine key for the stage (e.g. download, bundle, process, qc_testing, qc_report, raw_cleanup)." },
+        "description": { "type": "string", "description": "Human-readable summary of the stage." },
+        "ephemeral": { "type": "boolean", "default": false, "description": "True if this step's evidence is destroyed by a later step (e.g. download folders deleted by raw_cleanup). Readers may infer an ephemeral step done when any later step is done; never for persistent steps." },
+        "done_when": {
+          "description": "One rule, or a list of rules that must ALL hold.",
+          "oneOf": [
+            { "$ref": "#/$defs/doneRule" },
+            { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/doneRule" } }
+          ]
+        },
+        "payload_artefacts": {
+          "type": "object",
+          "description": "Optional per-payload artefact glob (relative to the run folder). Keys must be a subset of pipeline.payloads. Only list payloads that produce a distinguishable artefact at this stage — payloads without an entry are not assessed here (e.g. spectral QC exists only for hyperspectral payloads).",
+          "additionalProperties": { "type": "string" }
+        },
+        "artifacts": {
+          "$ref": "#/$defs/folderMap",
+          "description": "Full expected-file detail for this stage (deep validation, P9 M5). Not used by the cheap done_when probe."
+        }
+      }
+    },
+    "doneRule": {
+      "type": "object",
+      "description": "Composable folder-state rule. Either 'any_of' (alternative sub-rules, ANY passing suffices) or 'folder' plus at least one predicate (all given predicates must hold).",
+      "additionalProperties": false,
+      "oneOf": [
+        { "required": ["any_of"] },
+        {
+          "required": ["folder"],
+          "anyOf": [
+            { "required": ["contains"] },
+            { "required": ["only"] },
+            { "required": ["extras_beyond"] }
+          ]
+        }
+      ],
+      "dependentRequired": {
+        "json_path": ["json_equals", "contains"],
+        "json_equals": ["json_path"],
+        "max_count": ["contains"]
+      },
+      "properties": {
+        "any_of": {
+          "type": "array",
+          "minItems": 2,
+          "items": { "$ref": "#/$defs/doneRule" },
+          "description": "Alternative sub-rules — the rule passes when ANY sub-rule passes (dual-rule transitions, e.g. legacy vs contract QC report filenames). 'requires' / 'primary_only' gates stay on the outer rule; other predicates are ignored when any_of is present."
+        },
+        "folder": { "type": "string", "description": "Base folder glob, relative to the run folder (e.g. T0_raw, T1_proc/QC_data)." },
+        "primary_only": { "type": "boolean", "default": false, "description": "Rule applies only to primary captures. For duplicate runs (RunOverview DuplicateRun=True — reprocessings of another run's raw, which lives with the primary run) the rule is N/A — skipped, never failed. Mark the raw-side rules (download, bundle, in-.graw checks, raw_cleanup); product/QC rules still apply to duplicates." },
+        "requires": {
+          "description": "Gate for this rule: names drawn from pipeline.payloads and/or pipeline.deployables that must have been intended/deployed for the rule to apply. A string, or a list whose items are ANDed; an inner list of strings is satisfied by ANY member (e.g. [\"panels\", [\"vnir\", \"swir\"]] = panels AND (vnir OR swir)). When the gate is not met (per the run's issue-YAML intended_payloads / deviations), the rule is N/A — skipped, not failed.",
+          "oneOf": [
+            { "type": "string" },
+            {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "oneOf": [
+                  { "type": "string" },
+                  { "type": "array", "minItems": 1, "items": { "type": "string" } }
+                ]
+              }
+            }
+          ]
+        },
+        "contains": {
+          "description": "Glob (relative to folder), or a list of alternative globs (matches are pooled), that must match at least min_count entries. Alternatives cover format transitions, e.g. GeoJSON preferred / shapefile accepted.",
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "minItems": 1, "items": { "type": "string" } }
+          ]
+        },
+        "min_count": { "type": "integer", "minimum": 1, "default": 1, "description": "Minimum matches for 'contains'." },
+        "max_count": { "type": "integer", "minimum": 1, "description": "Maximum matches for 'contains'. Exceeding it is failed_check (run blocked), never done — e.g. two *.graw bundles or two *.gpro products in one run is an ambiguous/duplicated state needing curation. Requires 'contains'." },
+        "min_size": { "type": "string", "description": "Minimum size (e.g. '10 KB') each 'contains' match must reach — guards against truncated/empty marker files (a ~1 KB elm_coefficients.json means the products are garbage)." },
+        "json_path": { "type": "string", "description": "Dotted path (e.g. 'status.result') into each 'contains' match, which must parse as JSON. Used with json_equals to assert the file's machine-readable verdict — a report that exists but fails its own check is failed_check, never done. Requires 'contains'." },
+        "json_equals": { "description": "Value the json_path lookup must equal in EVERY match, or a list of acceptable values (case-insensitive string compare, e.g. 'pass' or ['pass', 'warn']). Missing path or unparseable JSON also fails.", "oneOf": [ { "type": ["string", "number", "boolean"] }, { "type": "array", "minItems": 1, "items": { "type": ["string", "number", "boolean"] } } ] },
+        "only": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Folder must contain NOTHING except entries matching these globs (e.g. cleanup done)."
+        },
+        "extras_beyond": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Folder must contain at least one entry NOT matching these globs (e.g. raw download present)."
+        }
+      }
+    }
+  }
+}

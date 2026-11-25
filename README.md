@@ -329,6 +329,7 @@ git diff
 
 - **ProjectBuilder.py:** Main script for automating folder and metadata creation.
 - **Code/DS00_DataManagement/DM01_StructureAdopter.py:** Audits an existing APPN-format tree and reconstructs the ProjectBuilder metadata files so the tree can be adopted (see *Adopting an Existing Data Store*).
+- **Code/DS01_StorageReporting/PS00_ProcessingStatus.py:** Scans every run and reports how far it has got (graw/gpro present, QC data, QC report, ...) per project, sensor and node; see [its README](Code/DS01_StorageReporting/README.md).
 - **NodeSummary.yaml:** YAML file listing nodes and their sensor platforms.
 - **{NodeName}_ProjectsSummary.csv:** CSV file summarizing projects and their associated sensors (auto-created in the node folder).
 - **ProjectSummary.yaml:** YAML file containing detailed project, researcher, and site information (auto-created in each project folder).

@@ -1,0 +1,11 @@
+{
+  "description": "Temperature and environmental monitoring system",
+  "tier_structures": {
+    "T0_raw": {
+      "expected_folders": {}
+    },
+    "T1_proc": {
+      "expected_folders": {}
+    }
+  }
+}

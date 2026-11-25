@@ -1,0 +1,10 @@
+{
+  "description": "Field observations and measurements",
+  "pipeline": {
+    "steps": [
+      {"name": "download",
+       "description": "Field observation files (photos/notes/measurements) copied into T0_raw. No processing; the pipeline for this sensor is the download itself.",
+       "done_when": {"folder": "T0_raw", "extras_beyond": []}}
+    ]
+  }
+}

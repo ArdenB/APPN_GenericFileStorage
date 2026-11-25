@@ -236,6 +236,7 @@ for its outputs — read it before touching a script in that folder.
 
 | Folder | Does | Writes under `<run>/T1_proc/` |
 |---|---|---|
+| `Code/DS01_StorageReporting` | PS00 read-only processing-status scan of every run against `reference/sensor_pipelines/` | nothing per-run; `<project>/Documentation/ProcessingStatus/` + node `Documents/StorageReports/ProcessingStatus/` |
 | `Code/DS02_DatasetQA` | QA00/QA01 per-run panel spectra + GCP distances; QA02/QA03 cross-run comparison | `QC_data/`, reports routed to `QCReports/` |
 | `Code/DS05_SpectralIndices` | SI00 raster-in/raster-out spyndex index maps | `SpectralIndices/` |
 | `Code/DS03_PlotExtractionCode` | PE00 LiDAR, PE01 hyperspec, PE02 index maps → per-plot values | `PlotExtracts/{PixelLevel,PlotLevel,Reports}/` |

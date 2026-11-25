@@ -516,6 +516,40 @@ def _live_findings(yaml_data: Dict[str, Any],
 
 
 # ==================================================================================
+def accepted_checks(yaml_data: Optional[Dict[str, Any]],
+                    ) -> Dict[str, set]:
+    """Collect the check names covered by live ``accepted`` findings.
+
+    The completion-side reading of an acceptance (QC findings plan
+    §3.5 "accept" exit): a QC report that fails only on checks the
+    operator has closed ``accepted`` is documented-tolerated, so PS00
+    can waive that report's ``qc_report`` gate without softening the
+    measured status. Check-scoped by construction — the waiver never
+    reaches a failing check that has no accepted finding.
+
+    Parameters
+    ----------
+    yaml_data : dict or None
+        Parsed issue-YAML mapping (None = nothing accepted).
+
+    Returns
+    -------
+    dict of str -> set of str
+        ``script name -> {check names}`` for every live finding in state
+        ``accepted``. Scripts with no accepted finding are absent.
+    """
+    out: Dict[str, set] = {}
+    if not yaml_data:
+        return out
+    for (fscript, _fkey), entry in _live_findings(yaml_data).items():
+        if str(entry.get("state", "TODO")).strip() != "accepted":
+            continue
+        out.setdefault(fscript, set()).update(
+            str(m) for m in (entry.get("checks") or []))
+    return out
+
+
+# ==================================================================================
 def ensure_finding_tickets(date_dir: pathlib.Path, run_name: str,
                            report: Dict[str, Any],
                            groups: Optional[Dict[str, List[str]]] = None,

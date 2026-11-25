@@ -1,0 +1,19 @@
+{
+  "description": "Jilin satellite imagery",
+  "tier_structures": {
+    "T0_raw": {
+      "expected_folders": {
+        "01_Raw": []
+      }
+    },
+    "T1_proc": {
+      "expected_folders": {
+        "02_Orthorectified": [],
+        "04_Pansharpened": [],
+        "05_Mosaic": [],
+        "SpectralIndices": ["*TOA_SpectralIndices_NativeBand.nc"]
+      },
+      "optional_folders": {}
+    }
+  }
+}

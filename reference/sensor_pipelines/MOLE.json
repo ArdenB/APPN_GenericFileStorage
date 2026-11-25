@@ -1,0 +1,13 @@
+{
+  "description": "Ground-based electromagnetic mapping",
+  "pipeline": {
+    "steps": [
+      {"name": "download",
+       "description": "POLRA/EM/RSI survey captures copied into T0_raw.",
+       "done_when": {"folder": "T0_raw", "extras_beyond": []}},
+      {"name": "process",
+       "description": "Processed traces (merged xlsx / *_processed.csv / gamma+QC plots) written to T1_proc.",
+       "done_when": {"folder": "T1_proc", "extras_beyond": []}}
+    ]
+  }
+}

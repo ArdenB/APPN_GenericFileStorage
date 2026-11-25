@@ -1,0 +1,20 @@
+{
+  "description": "Multispectral drone imaging system",
+  "pipeline": {
+    "deployables": ["gcps"],
+    "steps": [
+      {"name": "download",
+       "description": "Raw M3M capture folders (multispectral .tif + RGB .jpg flights) downloaded into T0_raw. Processing happens off-node; the pipeline for this sensor is the download itself. When GCPs were placed, the ground-control reference (*gcp.csv or *.kml) must land with the download.",
+       "done_when": [
+         {"folder": "T0_raw", "extras_beyond": []},
+         {"folder": "T0_raw", "contains": ["*gcp.csv", "*.kml"], "requires": "gcps"}
+       ]}
+    ],
+    "optional_extras": {
+      "T1_proc/SpectralIndices": [
+        {"name": "*_SpectralIndices_RGBBand.nc", "alt_name": "*_SpectralIndices_RGBBand_complete.txt"},
+        {"name": "*_SpectralIndices_MSSBand.nc", "alt_name": "*_SpectralIndices_MSSBand_complete.txt"}
+      ]
+    }
+  }
+}

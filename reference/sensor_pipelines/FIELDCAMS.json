@@ -1,0 +1,11 @@
+{
+  "description": "Field cameras (handheld / ground-based imagery)",
+  "tier_structures": {
+    "T0_raw": {
+      "expected_folders": {}
+    },
+    "T1_proc": {
+      "expected_folders": {}
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "description": "High resolution imaging system",
+  "pipeline": {
+    "steps": [
+      {"name": "download",
+       "description": "Raw Phase One frames (*.IIQ) downloaded into T0_raw.",
+       "done_when": {"folder": "T0_raw", "extras_beyond": []}},
+      {"name": "process",
+       "description": "Developed JPEGs (and orthos where produced) written to T1_proc.",
+       "done_when": {"folder": "T1_proc", "extras_beyond": []}}
+    ]
+  }
+}

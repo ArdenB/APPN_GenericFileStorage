@@ -1,0 +1,13 @@
+{
+  "description": "Multispectral thermal system",
+  "tier_structures": {
+    "T0_raw": {
+      "expected_folders": {
+        "": [{"name": "*gcp.csv", "alt_name": "*.kml"}]
+      }
+    },
+    "T1_proc": {
+      "expected_folders": {}
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "description": "Spectroradiometer measurements",
+  "pipeline": {
+    "steps": [
+      {"name": "download",
+       "description": "SVC .sig spectra copied into T0_raw (flat or in capture subfolders). Processing is ad hoc/off-node; the pipeline for this sensor is the download itself.",
+       "done_when": {"folder": "T0_raw", "extras_beyond": []}}
+    ]
+  }
+}

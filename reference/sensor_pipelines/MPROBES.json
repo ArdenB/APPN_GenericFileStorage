@@ -1,0 +1,10 @@
+{
+  "description": "Moisture probe sensors",
+  "pipeline": {
+    "steps": [
+      {"name": "download",
+       "description": "Probe exports (csv/xlsx/pdf) copied into T0_raw. No on-node processing; the pipeline for this sensor is the download itself.",
+       "done_when": {"folder": "T0_raw", "extras_beyond": []}}
+    ]
+  }
+}

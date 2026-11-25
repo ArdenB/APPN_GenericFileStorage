@@ -1,0 +1,69 @@
+{
+  "description": "RGB drone imaging system",
+  "pipeline": {
+    "payloads": ["vnir", "rgb", "lidar"],
+    "deployables": ["gcps", "elm_panels", "val_panels"],
+    "steps": [
+      {"name": "download",
+       "description": "Raw capture folders downloaded into T0_raw (sensor dirs e.g. nHP-809, OS1-128, ILX-LR1, SBG, gnss, logs).",
+       "ephemeral": true,
+       "done_when": {"folder": "T0_raw", "extras_beyond": ["*.graw", "Vault", "RGB"], "primary_only": true, "requires": [["vnir", "rgb", "lidar"]]}},
+      {"name": "bundle",
+       "description": "Raw data bundled into exactly one .graw in T0_raw (two .graw bundles is a blocked state needing curation).",
+       "done_when": {"folder": "T0_raw", "contains": "*.graw", "max_count": 1, "primary_only": true, "requires": [["vnir", "rgb", "lidar"]]}},
+      {"name": "process",
+       "description": "GRYFN processing produces the .gpro products and, when ELM panels and the vnir payload were flown, a valid ELM coefficients file inside the .graw (a ~1 KB elm_coefficients.json means processing failed).",
+       "done_when": [
+         {"folder": "T1_proc", "contains": "*.gpro", "max_count": 1, "requires": [["vnir", "rgb", "lidar"]]},
+         {"folder": "T*/*.graw", "contains": "elm_coefficients.json", "min_size": "10 KB", "primary_only": true, "requires": ["elm_panels", "vnir"]}
+       ],
+       "payload_artefacts": {
+         "vnir":  "T1_proc/*.gpro/products/*VNIR_Orthomosaic*.bin",
+         "rgb":   "T1_proc/*.gpro/products/*RGB_Orthomosaic_*.tif",
+         "lidar": "T1_proc/*.gpro/products/*_LiDAR_DSM_*.tif"
+       },
+       "artifacts": {
+         "*.gpro/products": [
+           {"name": "*VNIR_Orthomosaic*.bin", "payload": "vnir"},
+           {"name": "*RGB_Orthomosaic_*.tif", "payload": "rgb"},
+           {"name": "*_LiDAR_DSM_*.tif", "payload": "lidar"}
+         ]
+       }},
+      {"name": "qc_testing",
+       "description": "QC testing artefacts all produced: vector data (GeoJSON per the QA Process SOP; GOBI has only the VNIR orthomosaic) and extracted spectral tables in T1_proc/QC_data. Panel polygons follow QC_{ELM|VAL}[_{TargetIdentifier}]_Panels naming; spectra tables follow the QA00 v2.2 QC_{ELM|VAL}[_{id}]_spectra_VNIR naming (legacy VNIR[0-9]_*Panel* tables still count).",
+       "done_when": [
+         {"folder": "T1_proc/QC_data", "contains": ["QC_ELM*_Panels*.geojson", "QC_ELM*_Panels*.shp"], "requires": ["elm_panels", "vnir"]},
+         {"folder": "T1_proc/QC_data", "contains": ["QC_VAL*_Panels*.geojson", "QC_VAL*_Panels*.shp"], "requires": ["val_panels", "vnir"]},
+         {"folder": "T1_proc/QC_data", "contains": ["QC_GCP_points*.geojson", "QC_GCP_points*.shp", "QC_GCP_[!g]*_points*.geojson", "QC_GCP_[!g]*_points*.shp"], "requires": "gcps"},
+         {"folder": "T1_proc/QC_data/QC_Spectral_Tables", "contains": ["QC_*spectra_VNIR*.*", "VNIR[0-9]_*Panel*.*"], "requires": ["elm_panels", "vnir"]}
+       ],
+       "artifacts": {
+         "": ["QC_ELM*_Panels*.geojson", "QC_VAL*_Panels*.geojson", "QC_GCP*_points*.geojson", "QC_GCP_groundtruth_points.geojson"],
+         "QC_Spectral_Tables": [
+           {"name": "QC_*spectra_VNIR*.parquet", "alt_name": "QC_*spectra_VNIR*.csv", "payload": "vnir"}
+         ]
+       }},
+      {"name": "qc_report",
+       "description": "All four DS02 contract QC reports generated AND not failing (list = AND; per-rule requires gates skip inapplicable payloads). QC00: legacy loose QC_GCP*distances*_report.json (every status.result == 'pass'; the glob keeps QC_GCP_groundtruth_* from counting as QC evidence) OR the contract QC00_GCPCheck detail (status pass|warn) — legacy alternative retires once the store is migrated. QC01 grades real verdicts (pass|warn counts, fail blocks; gated on vnir because QC01 skips gpros with no hyperspec flight lines; a fail whose gating checks are all covered by closed 'accepted' qc_findings is waived by PS00). QC02/QC03 are presence-tracked: their checks are advisory (status not_evaluated by design), so any status except fail counts — this makes the run-the-new-QC migration work visible on the dashboard without pretending advisory scripts have verdicts. A report that exists but fails is failed_check, not done.",
+       "done_when": [
+         {"requires": "gcps", "any_of": [
+           {"folder": "T1_proc/QC_data", "contains": "QC_GCP*distances*_report.json", "json_path": "status.result", "json_equals": "pass"},
+           {"folder": "T1_proc/QC_data/QC00_GCPCheck", "contains": "QC00_GCPCheck_detail.json", "json_path": "status", "json_equals": ["pass", "warn"]}
+         ]},
+         {"folder": "T1_proc/QC_data/QC01_FlightCheck", "contains": "QC01_FlightCheck_detail.json", "json_path": "status", "json_equals": ["pass", "warn"], "requires": "vnir"},
+         {"folder": "T1_proc/QC_data/QC02_SpectralCheck", "contains": "QC02_SpectralCheck_detail.json", "json_path": "status", "json_equals": ["pass", "warn", "not_evaluated"], "requires": [["elm_panels", "val_panels"], "vnir"]},
+         {"folder": "T1_proc/QC_data/QC03_RasterCheck", "contains": "QC03_RasterCheck_detail.json", "json_path": "status", "json_equals": ["pass", "warn", "not_evaluated"], "requires": "vnir"}
+       ]},
+      {"name": "raw_cleanup",
+       "description": "Loose download folders removed from T0_raw; only the .graw (+ Vault + RGB) remains (DM00_GPTRawCleanup).",
+       "done_when": {"folder": "T0_raw", "contains": "*.graw", "max_count": 1, "only": ["*.graw", "Vault", "RGB"], "primary_only": true, "requires": [["vnir", "rgb", "lidar"]]}}
+    ],
+    "optional_extras": {
+      "T1_proc/Plot_Extraction": [],
+      "T1_proc/SpectralIndices": [
+        "*[0-9]_SpectralIndices_MeanBand.nc",
+        "*[0-9]_SpectralIndices_PeakBand.nc"
+      ]
+    }
+  }
+}

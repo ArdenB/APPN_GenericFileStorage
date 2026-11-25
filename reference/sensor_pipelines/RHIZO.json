@@ -1,0 +1,13 @@
+{
+  "description": "Root imaging and analysis system",
+  "pipeline": {
+    "steps": [
+      {"name": "download",
+       "description": "Per-tube minirhizotron images (Tube*_Image*.png) copied into T0_raw.",
+       "done_when": {"folder": "T0_raw", "extras_beyond": []}},
+      {"name": "process",
+       "description": "Stitched per-tube composites written to T1_proc.",
+       "done_when": {"folder": "T1_proc", "extras_beyond": []}}
+    ]
+  }
+}
