@@ -14,6 +14,7 @@ Run with:
 """
 
 import importlib.util
+import argparse
 import json
 import pathlib
 import sys
@@ -229,13 +230,24 @@ def test_qc01_line_spacing_reads_the_median(qc03, tmp_path):
 # ==================================================================================
 def test_scan_paths_agree_on_the_all_zero_mask(qc03, product):
     """Both scan paths feed the classifier, so both must build one mask."""
+    masks = qc03.compute_zone_masks(product["bin"], product["extent"],
+                                    None, "10%-rule", ZONES_SPEC)
     raw = qc03._scan_bands_raw(product["bin"], BANDS, HEIGHT, WIDTH, 0,
-                               10000, 3, False)
+                               10000, 3, False, masks=masks)
     gdal = qc03._scan_bands_gdal(product["bin"], 10000, 1, False, False,
-                                 False)
+                                 False, masks=masks)
     assert raw["footprint_px"] == gdal["footprint_px"]
     assert np.array_equal(raw["all_zero"], gdal["all_zero"])
     assert raw["all_zero"].shape == (HEIGHT, WIDTH)
+    # per-zone accumulators must agree too: both now feed _per_band_stats
+    for zone in ("roi", "edge_band"):
+        assert raw["zones"][zone]["px"] == gdal["zones"][zone]["px"]
+        assert np.array_equal(raw["zones"][zone]["hist"],
+                              gdal["zones"][zone]["hist"])
+        assert np.array_equal(raw["zones"][zone]["n_over"],
+                              gdal["zones"][zone]["n_over"])
+        assert np.allclose(raw["zones"][zone]["sum"],
+                           gdal["zones"][zone]["sum"])
 
 
 # ==================================================================================
@@ -267,14 +279,104 @@ def test_zone_split_finds_the_planted_dropout(qc03, product):
 # ==================================================================================
 def test_connectivity_fallback_without_an_extent(qc03, product):
     """No usable polygon: border connectivity stands in and the run warns."""
-    zones = qc03.scan_product({**product, "extent": product["bin"]
-                               .with_name("absent.geojson")},
-                              "CALVIS", 10000,
-                              zones_spec=ZONES_SPEC)["zero_zones"]
+    scan = qc03.scan_product({**product, "extent": product["bin"]
+                              .with_name("absent.geojson")},
+                             "CALVIS", 10000, zones_spec=ZONES_SPEC)
+    zones = scan["zero_zones"]
     assert zones["classifier"] == "connectivity-fallback"
     assert zones["dropout_roi_px"] == HOLE_PX + STREAK_PX
     assert zones["zero_edge_band_pct"] is None
     assert zones["data_outside_bbox_px"] is None
+    # no geometry-derived masks: zone stats are null, footprint stays
+    assert all(b["roi"] is None and b["edge_band"] is None
+               for b in scan["bands"])
+    assert scan["bands"][0]["footprint"] is not None
+
+
+# ==================================================================================
+def test_per_band_domain_stats(qc03, product):
+    """Per-band ROI/edge/footprint stats match the planted geometry.
+
+    Band 1 zeros only where every band is zero (hole + streak, inside
+    the ROI); band 2 adds a partial-band patch (100 px, also in the
+    ROI). The scene value is a uniform 5000, so any percentile polluted
+    by background zeros is immediately visible.
+    """
+    scan = qc03.scan_product(product, "CALVIS", 10000, zones_spec=ZONES_SPEC)
+    zones = scan["zero_zones"]
+    b1, b2 = scan["bands"][0], scan["bands"][1]
+
+    # ROI: geometric domain, so all-band dropout counts as zeros here
+    assert b1["roi"]["n_zero"] == HOLE_PX + STREAK_PX
+    assert b2["roi"]["n_zero"] == HOLE_PX + STREAK_PX + 100
+    assert b1["roi"]["zero_pct"] == pytest.approx(
+        100.0 * (HOLE_PX + STREAK_PX) / zones["roi_px"])
+    # value stats are zero-exclusive: dropout must not drag them
+    assert b1["roi"]["p50"] == 5000
+    assert b1["roi"]["min"] == 5000
+    assert b1["roi"]["max"] == 5000
+    assert b1["roi"]["mean"] == pytest.approx(5000.0)
+
+    # edge band: fully imaged capture area, so clean and uniform
+    assert b1["edge_band"]["n_zero"] == 0
+    assert b1["edge_band"]["p50"] == 5000
+
+    # footprint: background gone - the v1.8 percentile defect is fixed
+    assert b1["footprint"]["n_zero"] == 0        # dropout is all-band-zero
+    assert b2["footprint"]["n_zero"] == 100      # partial-band patch only
+    assert b1["footprint"]["min"] == 5000
+    assert b1["footprint"]["p50"] == 5000
+    assert b1["footprint"]["p01"] == 5000
+    # the legacy flat percentiles keep their full-grid semantics
+    assert b1["p01"] == 0
+
+
+# ==================================================================================
+def test_dead_band_check_records_then_grades(qc03):
+    """Uncalibrated spec records candidates; fail_above_pct grades them."""
+    import Code.functions.qc_report as qr
+
+    bands = [
+        {"band": 1, "wavelength_nm": 1000.0, "bad_band": False,
+         "zeros_in_footprint_pct": 0.0, "roi": {"zero_pct": 99.95}},
+        {"band": 2, "wavelength_nm": 1400.0, "bad_band": True,
+         "zeros_in_footprint_pct": 100.0, "roi": {"zero_pct": 100.0}},
+        {"band": 3, "wavelength_nm": 1600.0, "bad_band": False,
+         "zeros_in_footprint_pct": 0.0, "roi": {"zero_pct": 0.05}},
+    ]
+    run = {"node": "n", "project": "p", "site": "s", "sensor": "CALVIS",
+           "run": 1, "date": None}
+
+    # +++++ recording mode: not_checked + advisory, bad band excluded +++++
+    report = qr.new_report("QC03_RasterCheck", "test", run=run)
+    qc03._add_dead_band_check(report, "swir", bands,
+                              {"dead_band": {"candidate_above_pct": 99.0}})
+    chk = report["checks"]["dead_bands_swir"]
+    assert chk["status"] == "not_checked"
+    assert chk["advisory"] is True
+    assert chk["domain"] == "roi"
+    assert [c["band"] for c in chk["candidates"]] == [1]
+    assert qr.derive_status(report["checks"]) == "not_evaluated"
+
+    # +++++ calibrated spec: the same recorded rates now grade +++++
+    graded = qr.new_report("QC03_RasterCheck", "test", run=run)
+    qc03._add_dead_band_check(
+        graded, "swir", bands,
+        {"dead_band": {"candidate_above_pct": 99.0,
+                       "fail_above_pct": 99.5}})
+    chk = graded["checks"]["dead_bands_swir"]
+    assert chk["status"] == "fail"
+    assert [c["band"] for c in chk["dead_bands"]] == [1]
+
+    # +++++ no ROI stats (no capture polygon): footprint stands in +++++
+    fallback = qr.new_report("QC03_RasterCheck", "test", run=run)
+    qc03._add_dead_band_check(
+        fallback, "swir",
+        [{**b, "roi": None} for b in bands],
+        {"dead_band": {"candidate_above_pct": 99.0}})
+    chk = fallback["checks"]["dead_bands_swir"]
+    assert chk["domain"] == "footprint"
+    assert [c["band"] for c in chk["candidates"]] == []
 
 
 # ==================================================================================
@@ -413,3 +515,40 @@ def test_load_capture_extent_drops_duplicate_vertices(qc03, tmp_path):
     verts = np.asarray(extent["ring"], dtype=float)
     edges = np.roll(verts, -1, axis=0) - verts
     assert (np.hypot(edges[:, 0], edges[:, 1]) > 0).all()
+
+
+# ==================================================================================
+def test_process_run_records_gpro_identity(qc03, product, tmp_path):
+    """v2.5: staleness carries the gpro identity used by QC_report Freshness."""
+    run_dir = (tmp_path / "USYD_Narrabri" / "2026_Test" / "2026TestSite" / "GOBI"
+               / "20260101" / "run_00")
+    products_dir = run_dir / "T1_proc" / "only.gpro" / "products"
+    products_dir.mkdir(parents=True)
+    for f in (product["bin"], product["hdr"]):
+        (products_dir / f.name).write_bytes(f.read_bytes())
+    args = argparse.Namespace(force=True, allow_multi_gpro=False,
+                              verbose=False, chunk_mb=16, threads=1,
+                              pdf=False)
+    row = qc03.process_run(run_dir, {}, None, args)
+    assert row["reason"] is None, row
+    detail = json.loads((run_dir / "T1_proc" / "QC_data" / "QC03_RasterCheck"
+                         / "QC03_RasterCheck_detail.json").read_text())
+    assert detail["staleness"]["gpro_path"].endswith("only.gpro")
+    assert detail["staleness"]["gpro_mtime_utc"]
+    assert detail["staleness"]["swir"]["path"].endswith(product["bin"].name)
+    assert (run_dir / "T1_proc" / "QC_data" / "QC_report.md").is_file()
+
+
+# ==================================================================================
+def test_render_quicklooks_writes_cir_and_records_stretch(qc03, product,
+                                                          tmp_path):
+    """v2.6: a VNIR product yields a CIR quicklook + its stretch record."""
+    run_dir = tmp_path / "run_00"
+    (run_dir / "T1_proc" / "only.gpro" / "products").mkdir(parents=True)
+    qc_data = run_dir / "T1_proc" / "QC_data"
+    vnir = {**product, "region": "VNIR", "label": "vnir"}
+    arts, record = qc03.render_quicklooks(run_dir, qc_data, [vnir, product])
+    assert arts == ["QC03_RasterCheck/QC_plots/quicklook_cir_vnir.png"]
+    assert (qc_data / arts[0]).is_file()
+    assert len(record["cir_vnir"]["stretch"]) == 3
+    assert "dsm" not in record                     # bundle ships no DSM

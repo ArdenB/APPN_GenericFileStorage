@@ -19,6 +19,7 @@ Hard constraints (plan §1):
 import json
 import os
 import pathlib
+import re
 import warnings as warn
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -27,6 +28,7 @@ import pandas as pd
 import yaml
 
 import Code.functions.core_functions as cf
+from Code.functions.qc_report.quicklook import is_quicklook
 from Code.functions.qc_report.reader import read_report
 from Code.functions.qc_report.report import report_paths
 
@@ -35,6 +37,7 @@ from Code.functions.qc_report.report import report_paths
 def update_qc_report(
         qc_data_dir: pathlib.Path,
         report: Dict[str, Any],
+        force_pdf: bool = False,
     ) -> Optional[pathlib.Path]:
     """Render the calling script's section fragment, then reassemble
     ``QC_data/QC_report.md``.
@@ -45,6 +48,9 @@ def update_qc_report(
     ``QC_data/<script>/<script>_section.md``.
     Step 2 — assemble ``QC_report.md``: header + overview table + the four
     fragments in QC00→QC03 order (stubs where absent) + footer.
+    Step 3 — PDF (plan v1.4 §3.1): ``QC_report.pdf`` is written when all
+    four scripts have run and none is stale, or when ``force_pdf``; an
+    older PDF is deleted when the run is no longer complete and current.
 
     Never raises: the contract report is already on disk and the markdown
     is never load-bearing, so any failure is reported as a warning and
@@ -57,6 +63,9 @@ def update_qc_report(
     report : dict
         The contract detail-report dict the caller just wrote via
         ``write_report`` (post-derive, so ``status`` is final).
+    force_pdf : bool
+        Write the PDF even when the run is incomplete or stale (the QC
+        scripts' ``--pdf`` flag).
 
     Returns
     -------
@@ -76,13 +85,148 @@ def update_qc_report(
         frag_path = _fragment_path(qc_data_dir, script_name)
         frag_path.parent.mkdir(parents=True, exist_ok=True)
         _write_text_atomic(frag_path, fragment)
+        _write_text_atomic(
+            _fragment_path(qc_data_dir, script_name, "provenance"),
+            "\n".join(_provenance(report, qc_data_dir)) + "\n")
         report_path = qc_data_dir / "QC_report.md"
         _write_text_atomic(report_path, _assemble(qc_data_dir, report))
-        return report_path
     except Exception as err:  # never gate the calling QC script
         warn.warn(f"QC_report.md render failed ({err!r}); the contract "
                   "report is unaffected.")
         return None
+    if force_pdf or _run_complete(qc_data_dir):
+        export_qc_pdf(qc_data_dir)
+    else:
+        (qc_data_dir / "QC_report.pdf").unlink(missing_ok=True)
+    return report_path
+
+
+# ==================================================================================
+def export_qc_pdf(qc_data_dir: pathlib.Path) -> Optional[pathlib.Path]:
+    """Convert the run's ``QC_report.md`` to ``QC_report.pdf``.
+
+    Markdown → HTML (python-markdown) → PDF (weasyprint) with a print
+    stylesheet. Status emoji become coloured symbols (no emoji font
+    needed) and local file links become plain text (they cannot resolve
+    on a client's machine). Used by :func:`update_qc_report` and by the
+    QC scripts' ``--pdf`` flag on cached runs. Never raises.
+
+    Parameters
+    ----------
+    qc_data_dir : pathlib.Path
+        The run's ``T1_proc/QC_data/`` folder.
+
+    Returns
+    -------
+    pathlib.Path or None
+        The PDF path, or None when there is no report or conversion failed.
+    """
+    qc_data_dir = pathlib.Path(qc_data_dir)
+    md_path = qc_data_dir / "QC_report.md"
+    pdf_path = qc_data_dir / "QC_report.pdf"
+    try:
+        import markdown
+        import weasyprint
+
+        body = markdown.markdown(md_path.read_text(encoding="utf-8"),
+                                 extensions=["tables"])
+        html = f"<html><head><meta charset='utf-8'><style>{_pdf_css()}" \
+               f"</style></head><body>{_pdf_body(body)}</body></html>"
+        tmp = pdf_path.with_suffix(".pdf.tmp")
+        weasyprint.HTML(string=html, base_url=str(qc_data_dir)).write_pdf(
+            str(tmp))
+        os.replace(tmp, pdf_path)
+        return pdf_path
+    except Exception as err:  # never gate the calling QC script
+        warn.warn(f"QC_report.pdf export failed ({err!r}); QC_report.md is "
+                  "unaffected.")
+        return None
+
+
+# ==================================================================================
+def _run_complete(qc_data_dir: pathlib.Path) -> bool:
+    """Return True when all four scripts have run and none is stale.
+
+    ponytail: QC00/QC02 record no gpro identity, so their Freshness is
+    "—" and counts as current here; only a detected ``stale?`` blocks.
+    Upgrade path: record ``staleness.gpro_*`` in QC00/QC02 too.
+
+    Parameters
+    ----------
+    qc_data_dir : pathlib.Path
+        The run's ``QC_data/`` folder.
+
+    Returns
+    -------
+    bool
+        Whether the automatic PDF should be written.
+    """
+    summaries = {name: _load_summary(qc_data_dir, name)
+                 for name, _ in _contract_sections()}
+    if any(summary is None for summary in summaries.values()):
+        return False
+    return "stale?" not in _freshness(qc_data_dir, summaries).values()
+
+
+# ==================================================================================
+def _pdf_body(body: str) -> str:
+    """Adapt the report HTML for print (status symbols, local links).
+
+    Parameters
+    ----------
+    body : str
+        HTML converted from ``QC_report.md``.
+
+    Returns
+    -------
+    str
+        Print-ready HTML body.
+    """
+    symbols = {
+        "✅": '<span class="st pass">●</span>',
+        "⚠️": '<span class="st warn">▲</span>',
+        "⚠": '<span class="st warn">▲</span>',
+        "❌": '<span class="st fail">✖</span>',
+        "➖": '<span class="st na">–</span>',
+    }
+    for emoji, span in symbols.items():
+        body = body.replace(emoji, span)
+    return re.sub(r'<a href="(?!https?:)[^"]*">(.*?)</a>', r"\1", body)
+
+
+# ==================================================================================
+def _pdf_css() -> str:
+    """Return the print stylesheet for ``QC_report.pdf``.
+
+    Returns
+    -------
+    str
+        CSS text (A4, compact tables, two-up At-a-glance grid).
+    """
+    return """
+    @page { size: A4; margin: 14mm 12mm;
+            @bottom-right { content: counter(page) " / " counter(pages);
+                            font-size: 8pt; color: #666; } }
+    body { font-family: 'DejaVu Sans', sans-serif; font-size: 9.5pt;
+           line-height: 1.35; }
+    h1 { font-size: 15pt; margin: 0 0 4pt; }
+    h2 { font-size: 12.5pt; border-bottom: 1px solid #bbb;
+         margin-top: 16pt; break-after: avoid; }
+    h3 { font-size: 10.5pt; break-after: avoid; }
+    table { border-collapse: collapse; width: 100%; font-size: 8pt;
+            margin: 4pt 0 8pt; break-inside: auto; }
+    th, td { border: 1px solid #ccc; padding: 2pt 4pt; text-align: left;
+             vertical-align: top; word-break: break-word; }
+    th { background: #f0f0f0; }
+    tr { break-inside: avoid; }
+    img { max-width: 100%; max-height: 120mm; break-inside: avoid; }
+    p.glance img { width: 49%; height: 62mm; object-fit: contain;
+                   margin: 0 0.5% 2mm 0; vertical-align: top; }
+    .st { font-weight: bold; }
+    .pass { color: #2e7d32; } .warn { color: #e69500; }
+    .fail { color: #c62828; } .na { color: #777; }
+    em { color: #444; }
+    """
 
 
 # ==================================================================================
@@ -111,6 +255,33 @@ def status_glyph(status: Optional[str]) -> str:
 
 
 # ==================================================================================
+def status_label(status: Optional[str]) -> str:
+    """Return the display label (glyph + one word) for any status.
+
+    Both vocabulary levels collapse to one client word, so a status
+    never renders twice ("✅ pass") or in second-level jargon
+    ("✅ acceptable") — QC report plan v1.4 §5.0 item 1.
+
+    Parameters
+    ----------
+    status : str or None
+        Any status from the shared vocabulary (both levels accepted).
+
+    Returns
+    -------
+    str
+        e.g. ``"✅ Pass"``, ``"⚠️ Warn"``, ``"➖ Not checked"``.
+    """
+    words = {
+        "pass": "Pass", "good": "Pass", "acceptable": "Pass",
+        "warn": "Warn", "warning": "Warn",
+        "fail": "Fail",
+        "not_evaluated": "Not evaluated", "not_checked": "Not checked",
+    }
+    return f"{status_glyph(status)} {words.get(str(status), 'Not evaluated')}"
+
+
+# ==================================================================================
 def _wording() -> Dict[str, str]:
     """Return every client-facing context string in the report.
 
@@ -135,8 +306,19 @@ def _wording() -> Dict[str, str]:
             "before use. ➖ Not evaluated. Advisory checks do not affect "
             "the overall result."),
         "freshness_note": (
-            "\"Stale?\" means the check used an older sensor bundle. "
-            "Re-run it for current results."),
+            "Freshness: \"stale?\" means the check used an older sensor "
+            "bundle. Re-run it for current results."),
+        "glance_heading": "At a glance",
+        "caption_quicklook_cir": (
+            "false-colour image (healthy vegetation shows red)"),
+        "caption_quicklook_dsm": (
+            "surface height from LiDAR (blue low, yellow high; white is "
+            "no data)"),
+        "caption_quicklook_trajectory": (
+            "flight lines coloured by height"),
+        "appendix_intro": (
+            "Operator detail: script versions, the data each check read, "
+            "threshold files and output files."),
         "blurb_QC00_GCPCheck": (
             "Compares surveyed ground control points (GCPs) with their "
             "image positions. Distances are in metres. If this check "
@@ -178,6 +360,37 @@ def _wording() -> Dict[str, str]:
             "Percentage of zero or no-data pixels by band."),
         "caption_band_over_range": (
             "Percentage of saturated pixels by band."),
+        # +++++ check-family labels for the headline (DRAFT 2026-11-26,
+        # +++++ awaiting operator wording pass) +++++
+        "check_gcp_2d": "GCP position error",
+        "check_height_bias": "GCP height bias",
+        "check_planar_bias": "GCP planar bias",
+        "check_graw_present": "Raw data bundle",
+        "check_dark_reference": "Dark reference",
+        "check_panels_present": "Reference panels",
+        "check_reflectance_product": "Reflectance product",
+        "check_flightcal_spec": "Flight spec file",
+        "check_gsd": "Pixel size (GSD)",
+        "check_frame_rate": "Frame rate",
+        "check_sidelap": "Image overlap",
+        "check_oversampling": "Oversampling",
+        "check_time_to_solar_noon": "Time from solar noon",
+        "check_appn_compliant": "APPN spec compliance",
+        "check_reference_equivalence": "Panel reference match",
+        "check_nodata_zero": "Panel no-data",
+        "check_homogeneity": "Panel uniformity",
+        "check_panel_set_pinned": "Panel set",
+        "check_dhr_bias": "Panel reflectance bias",
+        "check_header_bin_integrity": "File integrity",
+        "check_zeros_in_footprint": "Zero pixels in footprint",
+        "check_over_range": "Saturated pixels",
+        "check_negative": "Negative values",
+        "check_nan_inf": "NaN/Inf values",
+        "check_dead_bands": "Dead bands",
+        "check_capture_extent": "Capture extent",
+        "check_zero_edge_band": "Zero edge band",
+        "check_dropout_in_roi": "Data dropout in capture area",
+        "check_data_outside_bbox": "Data outside capture area",
     }
 
 
@@ -203,7 +416,7 @@ def checks_table(checks: Dict[str, Dict[str, Any]]) -> List[str]:
     rows = []
     for name, chk in checks.items():
         status = chk.get("status", "not_checked")
-        label = f"{status_glyph(status)} {status}"
+        label = status_label(status)
         if chk.get("advisory"):
             label += " (advisory)"
         if chk.get("waived"):
@@ -243,7 +456,7 @@ def figure_embeds(
     """
     lines: List[str] = []
     for art in artifacts:
-        if not str(art).lower().endswith(".png"):
+        if not str(art).lower().endswith(".png") or is_quicklook(art):
             continue
         rel = str(art).replace(os.sep, "/")
         title = pathlib.Path(rel).stem
@@ -281,7 +494,7 @@ def artifact_links(
              if not str(a).lower().endswith(".png")]
     if not files:
         return []
-    lines = ["**Artifacts:**", ""]
+    lines = ["**Output files:**", ""]
     for rel in files:
         name = pathlib.Path(rel).name
         if (qc_data_dir / rel).is_file():
@@ -314,9 +527,11 @@ def _contract_sections() -> Tuple[Tuple[str, str], ...]:
 def _assemble(qc_data_dir: pathlib.Path, report: Dict[str, Any]) -> str:
     """Assemble the full ``QC_report.md`` text.
 
-    Header + overview table from the four summary YAMLs, then the four
-    section fragments (stubs where absent — plan §6), then the footer.
-    Fragments embed as raw bytes; nothing is parsed or re-rendered.
+    Header, descriptive headline + overview table from the four summary
+    YAMLs, the four section fragments (stubs where absent — plan §6),
+    the provenance appendix from the ``*_provenance.md`` fragments, then
+    the footer. Fragments embed as raw bytes; nothing is parsed or
+    re-rendered.
 
     Parameters
     ----------
@@ -345,12 +560,17 @@ def _assemble(qc_data_dir: pathlib.Path, report: Dict[str, Any]) -> str:
         f"rendered {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
 
     wording = _wording()
+    summaries = {name: _load_summary(qc_data_dir, name)
+                 for name, _ in _contract_sections()}
+    freshness = _freshness(qc_data_dir, summaries)
     lines: List[str] = [f"# QC report — {identity}", "",
                         "_" + " · ".join(meta_bits) + "_", "",
                         wording["report_intro"], ""]
-    lines += _overview_table(qc_data_dir)
+    lines += _headline(summaries, freshness)
+    lines += _overview_table(summaries, freshness)
     lines += [f"_{wording['legend']}_", "",
               f"_{wording['freshness_note']}_", ""]
+    lines += _at_a_glance(qc_data_dir, summaries)
     for script_name, subject in _contract_sections():
         frag_path = _fragment_path(qc_data_dir, script_name)
         lines.append("")
@@ -363,6 +583,17 @@ def _assemble(qc_data_dir: pathlib.Path, report: Dict[str, Any]) -> str:
                 warn.warn(f"Could not read fragment {frag_path}: {err}")
         else:
             lines += _stub_section(qc_data_dir, script_name, subject)
+    appendix = [frag for name, _ in _contract_sections()
+                if (frag := _fragment_path(
+                    qc_data_dir, name, "provenance")).is_file()]
+    if appendix:
+        lines += ["", "---", "", "## Appendix — provenance", "",
+                  f"_{wording['appendix_intro']}_"]
+        for frag in appendix:
+            try:
+                lines += ["", frag.read_text(encoding="utf-8").rstrip()]
+            except OSError as err:
+                warn.warn(f"Could not read fragment {frag}: {err}")
     trigger = report.get("script", {})
     lines += ["", "---", "",
               f"_Assembled by qc_report (schema "
@@ -374,50 +605,89 @@ def _assemble(qc_data_dir: pathlib.Path, report: Dict[str, Any]) -> str:
 
 
 # ==================================================================================
-def _overview_table(qc_data_dir: pathlib.Path) -> List[str]:
-    """Render the header overview table from the four summary YAMLs.
+def _at_a_glance(
+        qc_data_dir: pathlib.Path,
+        summaries: Dict[str, Optional[Dict[str, Any]]],
+    ) -> List[str]:
+    """Render the At-a-glance quicklook grid (plan v1.4 §4.2).
 
-    One row per contract script in run order: glyph + script status,
-    script version, ``generated_utc`` and a freshness flag (plan §4:
-    JSON-vs-JSON gpro-mtime comparison only, never a filesystem stat).
+    Places the ``quicklook_*.png`` artifacts listed in the summaries (CIR,
+    then DSM, then trajectory) side by side as raw HTML so both the
+    markdown preview and the PDF show them two per row. Missing files are
+    left out; no quicklooks means no section.
 
     Parameters
     ----------
     qc_data_dir : pathlib.Path
-        The run's ``QC_data/`` folder.
+        The run's ``QC_data/`` folder (existence checks only).
+    summaries : dict
+        Script name → summary dict (None when not yet run).
+
+    Returns
+    -------
+    list of str
+        Markdown lines (empty when there is nothing to show).
+    """
+    order = ("quicklook_cir", "quicklook_dsm", "quicklook_trajectory")
+    found = [str(a).replace(os.sep, "/")
+             for summary in summaries.values() if summary
+             for a in summary.get("artifacts") or []
+             if is_quicklook(a) and (qc_data_dir / str(a)).is_file()]
+    found.sort(key=lambda a: next(
+        (i for i, k in enumerate(order)
+         if pathlib.PurePosixPath(a).stem.startswith(k)), len(order)))
+    if not found:
+        return []
+    wording = _wording()
+    captions = []
+    for art in found:
+        stem = pathlib.PurePosixPath(art).stem
+        key = next((k for k in order if stem.startswith(k)), None)
+        text = wording.get(f"caption_{key}", stem) if key else stem
+        label = stem[len("quicklook_cir_"):] if key == "quicklook_cir" else ""
+        captions.append(f"{text} ({label})" if label else text)
+    imgs = "".join(f'<img src="{art}" alt="{pathlib.PurePosixPath(art).stem}"'
+                   f' width="49%">' for art in found)
+    return [f"## {wording['glance_heading']}", "",
+            f'<p class="glance">{imgs}</p>', "",
+            "_In order: " + "; ".join(captions) + "._", ""]
+
+
+# ==================================================================================
+def _overview_table(
+        summaries: Dict[str, Optional[Dict[str, Any]]],
+        freshness: Dict[str, str],
+    ) -> List[str]:
+    """Render the header overview table from the four summary YAMLs.
+
+    One row per contract script in run order: status label, script
+    version, ``generated_utc`` and the Freshness flag.
+
+    Parameters
+    ----------
+    summaries : dict
+        Script name → summary dict (None when not yet run), run order.
+    freshness : dict
+        Script name → Freshness flag from :func:`_freshness`.
 
     Returns
     -------
     list of str
         Markdown lines for the overview table.
     """
-    summaries = {name: _load_summary(qc_data_dir, name)
-                 for name, _ in _contract_sections()}
-    gpro_mtimes = {name: _recorded_gpro_mtime(qc_data_dir, name)
-                   for name, _ in _contract_sections()}
-    known = [m for m in gpro_mtimes.values() if m]
-    newest = max(known) if known else None
-
     rows = []
-    for name, _ in _contract_sections():
-        summary = summaries[name]
+    for name, summary in summaries.items():
         if summary is None:
             rows.append({"Script": name, "Status": "— not yet run",
-                         "Version": "—", "Generated (UTC)": "—",
+                         "Version": "—", "Generated": "—",
                          "Freshness": "—"})
             continue
-        status = summary.get("status", "not_evaluated")
-        mtime = gpro_mtimes[name]
-        if mtime is None or newest is None:
-            fresh = "—"
-        else:
-            fresh = "ok" if mtime == newest else "stale?"
         rows.append({
             "Script": name,
-            "Status": f"{status_glyph(status)} {status}",
+            "Status": status_label(summary.get("status", "not_evaluated")),
             "Version": summary.get("script", {}).get("version", "—"),
-            "Generated (UTC)": _cell(summary.get("generated_utc"))[:19],
-            "Freshness": fresh,
+            "Generated": _fmt_utc(summary.get("generated_utc")),
+            "Freshness": freshness[name],
         })
     return [cf.markdown_table(pd.DataFrame(rows)), ""]
 
@@ -464,8 +734,9 @@ def _stub_section(
 def _fragment_path(
         qc_data_dir: pathlib.Path,
         script_name: str,
+        kind: str = "section",
     ) -> pathlib.Path:
-    """Return a script's section-fragment path.
+    """Return a script's fragment path.
 
     Parameters
     ----------
@@ -473,13 +744,15 @@ def _fragment_path(
         The run's ``QC_data/`` folder.
     script_name : str
         Contract script name.
+    kind : str
+        ``"section"`` (report body) or ``"provenance"`` (appendix block).
 
     Returns
     -------
     pathlib.Path
-        ``QC_data/<script>/<script>_section.md``.
+        ``QC_data/<script>/<script>_<kind>.md``.
     """
-    return qc_data_dir / script_name / f"{script_name}_section.md"
+    return qc_data_dir / script_name / f"{script_name}_{kind}.md"
 
 
 # ==================================================================================
@@ -554,8 +827,6 @@ def _section_qc00(
     lines += figure_embeds(
         report.get("artifacts", []), qc_data_dir,
         captions={"_displacements": _wording()["caption_displacements"]})
-    lines += artifact_links(report.get("artifacts", []), qc_data_dir)
-    lines += _config_line(report.get("config"))
     return lines
 
 
@@ -589,7 +860,8 @@ def _section_qc01(
                        "reflectance_product_vnir",
                        "reflectance_product_swir", "flightcal_spec")
     integrity = {k: v for k, v in checks.items() if k in integrity_names}
-    spec = {k: v for k, v in checks.items() if k not in integrity_names}
+    spec = _merge_sidelap_rows(
+        {k: v for k, v in checks.items() if k not in integrity_names})
     if integrity:
         lines += ["**Bundle integrity:**", ""] + checks_table(integrity)
     if spec:
@@ -602,8 +874,8 @@ def _section_qc01(
         bullets.append(
             f"- Flight lines: {acquisition.get('n_flight_lines', '?')} "
             f"({acquisition.get('n_rogue_lines', 0)} rogue), "
-            f"{acquisition.get('first_line_start_utc', '?')} → "
-            f"{acquisition.get('last_line_end_utc', '?')}")
+            + _fmt_time_range(acquisition.get("first_line_start_utc"),
+                              acquisition.get("last_line_end_utc")))
     geometry = acq.get("geometry", {})
     if geometry.get("mean_agl_m") is not None:
         bullets.append(f"- Mean AGL: {geometry['mean_agl_m']:.1f} m")
@@ -624,13 +896,45 @@ def _section_qc01(
         report.get("artifacts", []), qc_data_dir,
         captions={"_sun_geometry": wording["caption_sun_geometry"],
                   "_agl_profiles": wording["caption_agl_profiles"]})
-    lines += artifact_links(report.get("artifacts", []), qc_data_dir)
-    stale = report.get("staleness", {})
-    if stale.get("gpro_path"):
-        lines += [f"_Computed against {pathlib.Path(stale['gpro_path']).name} "
-                  f"(mtime {_cell(stale.get('gpro_mtime_utc'))[:19]})_", ""]
-    lines += _config_line(report.get("config"))
     return lines
+
+
+# ==================================================================================
+def _merge_sidelap_rows(
+        checks: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+    """Collapse agreeing calculator/fieldbook sidelap rows into one.
+
+    QC01 grades one sidelap range against two thresholds; when both give
+    the same status and value the pair renders as a single ``sidelap_{tag}``
+    row (plan v1.4 §5.2 item 5). Disagreeing pairs stay as two rows.
+
+    Parameters
+    ----------
+    checks : dict
+        QC01 spec checks, in report order.
+
+    Returns
+    -------
+    dict
+        Checks with agreeing pairs merged at the calculator row's position.
+    """
+    merged: Dict[str, Dict[str, Any]] = {}
+    for name, chk in checks.items():
+        if name.startswith("sidelap_") and name.endswith("_calculator"):
+            stem = name[:-len("_calculator")]
+            twin = checks.get(f"{stem}_fieldbook")
+            if twin is not None and all(
+                    twin.get(k) == chk.get(k) for k in ("status", "value")):
+                note = "; ".join(filter(None, (
+                    "calculator and fieldbook agree", chk.get("note"))))
+                merged[stem] = {**chk, "note": note}
+                continue
+        if name.startswith("sidelap_") and name.endswith("_fieldbook") \
+                and name[:-len("_fieldbook")] in merged:
+            continue
+        merged[name] = chk
+    return merged
 
 
 # ==================================================================================
@@ -711,14 +1015,6 @@ def _section_qc02(
                   cf.markdown_table(df, "{:.2f}"), ""]
 
     lines += _qc02_figure_blocks(report, qc_data_dir)
-    tables = [a for a in report.get("artifacts", [])
-              if not str(a).lower().endswith(".png")]
-    if tables:
-        lines += [f"_Spectra tables: {len(tables)} file(s) under "
-                  "`QC_Spectral_Tables/` (see the summary YAML artifact "
-                  "list)._", ""]
-    config = report.get("config", {})
-    lines += _config_line(config.get("spectral_limits"))
     return lines
 
 
@@ -866,9 +1162,13 @@ def _section_qc03(
                 chk = checks.get(f"{family}_{label}")
                 if chk is None:
                     row[label] = "—"
+                elif _cell(chk.get("value")):
+                    row[label] = (f"{status_glyph(chk.get('status'))} "
+                                  f"{chk['value']}")
+                elif chk.get("status") == "not_checked" and chk.get("note"):
+                    row[label] = f"➖ n/a — {chk['note']}"
                 else:
-                    value = _cell(chk.get("value")) or chk.get("status")
-                    row[label] = f"{status_glyph(chk.get('status'))} {value}"
+                    row[label] = status_label(chk.get("status"))
             rows.append(row)
         lines += [cf.markdown_table(pd.DataFrame(rows)), ""]
     else:
@@ -900,7 +1200,7 @@ def _section_qc03(
                   f"{'ok' if integrity.get('ok') else 'MISMATCH'}"]
         zones = product.get("zero_zones", {})
         if zones:
-            inset = zones.get("inset", {})
+            inset = zones.get("inset") or {}
             lines.append(
                 f"- Zone split ({zones.get('classifier', '?')} classifier): "
                 f"edge band {_pct(zones.get('zero_edge_band_pct'))} zero, "
@@ -924,13 +1224,6 @@ def _section_qc03(
 
     lines += figure_embeds(figures_by_label.get(None, []), qc_data_dir,
                            captions=captions)
-    stale = report.get("staleness", {})
-    for label, entry in stale.items():
-        if isinstance(entry, dict) and entry.get("path"):
-            lines += [
-                f"_Computed against {pathlib.Path(entry['path']).name} "
-                f"(mtime {_cell(entry.get('mtime_utc'))[:19]})_", ""]
-    lines += _config_line(report.get("config"))
     return lines
 
 
@@ -938,7 +1231,10 @@ def _section_qc03(
 # ========== Small shared internals ==========
 # ==================================================================================
 def _section_header(report: Dict[str, Any], subject: str) -> List[str]:
-    """Render a section's heading + provenance line (plan §5 skeleton).
+    """Render a section's heading + status line (plan §5 skeleton).
+
+    Script version / generated time live in the provenance appendix
+    (plan v1.4 §4.4).
 
     Parameters
     ----------
@@ -952,36 +1248,184 @@ def _section_header(report: Dict[str, Any], subject: str) -> List[str]:
     list of str
         Markdown lines.
     """
-    script = report.get("script", {})
-    prefix = str(script.get("name", "QC?")).split("_")[0]
+    prefix = str(report.get("script", {}).get("name", "QC?")).split("_")[0]
     status = report.get("status", "not_evaluated")
-    return [
-        f"## {prefix} — {subject}", "",
-        f"**Status: {status_glyph(status)} {status}** · "
-        f"{script.get('name', '?')} {script.get('version', '?')} · "
-        f"generated {_cell(report.get('generated_utc'))[:19]}", "",
-    ]
+    return [f"## {prefix} — {subject}", "",
+            f"**Status: {status_label(status)}**", ""]
 
 
 # ==================================================================================
-def _config_line(config: Optional[Dict[str, Any]]) -> List[str]:
-    """Render the thresholds-config provenance line.
+def _provenance(
+        report: Dict[str, Any],
+        qc_data_dir: pathlib.Path,
+    ) -> List[str]:
+    """Render one script's provenance-appendix block (plan v1.4 §4.4).
+
+    Script version + generated time, the gpro / product identities from
+    ``staleness``, threshold config(s) with hash, and the output files —
+    operator detail kept out of the client-facing section body.
 
     Parameters
     ----------
-    config : dict or None
-        A ``{path, sha256}`` config snapshot (or None / other shapes).
+    report : dict
+        The contract detail-report dict.
+    qc_data_dir : pathlib.Path
+        The run's ``QC_data/`` folder (artifact existence checks).
 
     Returns
     -------
     list of str
-        Markdown lines (empty when no usable snapshot).
+        Markdown lines for the ``<script>_provenance.md`` fragment.
     """
-    if not isinstance(config, dict) or not config.get("path"):
-        return []
-    sha = str(config.get("sha256") or "")[:12]
-    return [f"_Thresholds: {config['path']}"
-            + (f" (sha256 {sha})" if sha else "") + "_", ""]
+    script = report.get("script", {})
+    name = str(script.get("name", "QC?"))
+    lines = [f"### {name}", "",
+             f"- Script: {name} {script.get('version', '?')}, generated "
+             f"{_fmt_utc(report.get('generated_utc'))}"]
+    stale = report.get("staleness") or {}
+    if stale.get("gpro_path"):
+        lines.append(
+            f"- Computed against: `{pathlib.Path(stale['gpro_path']).name}` "
+            f"(modified {_fmt_utc(stale.get('gpro_mtime_utc'))})")
+    for label, entry in stale.items():
+        if isinstance(entry, dict) and entry.get("path"):
+            lines.append(
+                f"- Product {label}: `{pathlib.Path(entry['path']).name}` "
+                f"(modified {_fmt_utc(entry.get('mtime_utc'))})")
+    config = report.get("config") or {}
+    for cfg in (config, config.get("spectral_limits")):
+        if isinstance(cfg, dict) and cfg.get("path"):
+            sha = str(cfg.get("sha256") or "")[:12]
+            lines.append(f"- Thresholds: {cfg['path']}"
+                         + (f" (sha256 {sha})" if sha else ""))
+    if config.get("table_schema_version") is not None:
+        lines.append(
+            f"- Spectra table schema: {config['table_schema_version']}")
+    lines.append("")
+    return lines + artifact_links(report.get("artifacts", []), qc_data_dir)
+
+
+# ==================================================================================
+def _freshness(
+        qc_data_dir: pathlib.Path,
+        summaries: Dict[str, Optional[Dict[str, Any]]],
+    ) -> Dict[str, str]:
+    """Return each contract script's Freshness flag (plan §4).
+
+    JSON-vs-JSON only: a script's recorded gpro mtime is compared with
+    the newest gpro mtime recorded by any sibling; the bundle itself is
+    never stat-ed.
+
+    Parameters
+    ----------
+    qc_data_dir : pathlib.Path
+        The run's ``QC_data/`` folder.
+    summaries : dict
+        Script name → summary dict (None when not yet run).
+
+    Returns
+    -------
+    dict
+        Script name → ``"ok"``, ``"stale?"`` or ``"—"`` (not run / no
+        recorded gpro identity).
+    """
+    mtimes = {name: _recorded_gpro_mtime(qc_data_dir, name)
+              if summaries.get(name) is not None else None
+              for name in summaries}
+    known = [m for m in mtimes.values() if m]
+    newest = max(known) if known else None
+    return {name: "—" if mtime is None or newest is None
+            else ("ok" if mtime == newest else "stale?")
+            for name, mtime in mtimes.items()}
+
+
+# ==================================================================================
+def _headline(
+        summaries: Dict[str, Optional[Dict[str, Any]]],
+        freshness: Dict[str, str],
+    ) -> List[str]:
+    """Render the page-1 descriptive summary (plan v1.4 §4.1).
+
+    One bullet per script that ran, naming its warning/failing checks
+    (worst first, at most three plus a count) — advisory checks are left
+    out, matching how they are left out of the run status. Not-run
+    scripts are listed together. Deliberately **no** overall PASS/FAIL
+    verdict until thresholds are calibrated.
+
+    Parameters
+    ----------
+    summaries : dict
+        Script name → summary dict (None when not yet run), run order.
+    freshness : dict
+        Script name → Freshness flag from :func:`_freshness`.
+
+    Returns
+    -------
+    list of str
+        Markdown lines.
+    """
+    subjects = dict(_contract_sections())
+    ran = [name for name, summary in summaries.items() if summary]
+    lines = [f"**Summary:** {len(ran)} of {len(summaries)} checks run.", ""]
+    severity = {"fail": 0, "warn": 1, "warning": 1}
+    for name in ran:
+        summary = summaries[name] or {}
+        prefix = name.split("_")[0]
+        checks = _merge_sidelap_rows(summary.get("checks") or {})
+        flagged = sorted(
+            ((chk.get("status"), check) for check, chk in checks.items()
+             if not chk.get("advisory") and chk.get("status") in severity),
+            key=lambda pair: severity[pair[0]])
+        issues = [f"{status_glyph(status)} {_check_label(check)} "
+                  f"{_cell(checks[check].get('value'))}".rstrip()
+                  for status, check in flagged]
+        if issues:
+            text = "; ".join(issues[:3])
+            if len(issues) > 3:
+                text += f"; and {len(issues) - 3} more"
+        elif summary.get("status") == "pass":
+            text = "all checks passed"
+        else:
+            text = "nothing graded"
+        if freshness.get(name) == "stale?":
+            text += " — **stale?** re-run for current results"
+        lines.append(f"- {status_label(summary.get('status'))} — "
+                     f"{prefix} {subjects[name]}: {text}")
+    missing = [f"{name.split('_')[0]} {subjects[name]}"
+               for name, summary in summaries.items() if not summary]
+    if missing:
+        lines.append(f"- ➖ Not yet run: {', '.join(missing)}")
+    return lines + [""]
+
+
+# ==================================================================================
+def _check_label(check: str) -> str:
+    """Return a client-facing label for a contract check name.
+
+    The longest matching ``check_<family>`` key in :func:`_wording` gives
+    the label; any remaining name parts (sensor/product/source) follow in
+    brackets, e.g. ``sidelap_vnir_calculator`` →
+    ``"Image overlap (vnir, calculator)"``.
+
+    Parameters
+    ----------
+    check : str
+        Contract check name.
+
+    Returns
+    -------
+    str
+        Display label (the raw name with spaces when no family matches).
+    """
+    families = sorted((key[len("check_"):] for key in _wording()
+                       if key.startswith("check_")), key=len, reverse=True)
+    family = next((fam for fam in families
+                   if check == fam or check.startswith(f"{fam}_")), None)
+    if family is None:
+        return check.replace("_", " ")
+    label = _wording()[f"check_{family}"]
+    rest = [part for part in check[len(family):].split("_") if part]
+    return f"{label} ({', '.join(rest)})" if rest else label
 
 
 # ==================================================================================
@@ -1034,7 +1478,8 @@ def _recorded_gpro_mtime(
     Returns
     -------
     str or None
-        The recorded ``staleness.gpro_mtime_utc`` (QC01 today), else None.
+        The recorded ``staleness.gpro_mtime_utc`` (QC01; QC03 v2.5+),
+        else None.
     """
     _, detail_path = report_paths(qc_data_dir, script_name)
     if not detail_path.is_file():
@@ -1049,6 +1494,79 @@ def _recorded_gpro_mtime(
         value = stale.get("gpro_mtime_utc")
         return str(value) if value else None
     return None
+
+
+# ==================================================================================
+def _fmt_utc(value: Any) -> str:
+    """Format a recorded timestamp as ``YYYY-MM-DD HH:MM UTC``.
+
+    Plan v1.4 §5.0 item 3 (seconds/microseconds/offset dropped).
+    ponytail: UTC only — site-local time waits on open question 5
+    (timezone source); swap the ``tz_convert`` target when it lands.
+
+    Parameters
+    ----------
+    value : Any
+        ISO string / timestamp (naive values are taken as UTC) or None.
+
+    Returns
+    -------
+    str
+        Display string, ``"—"`` when None, the raw text if unparseable.
+    """
+    if value is None or value == "":
+        return "—"
+    stamp = _as_utc(value)
+    return str(value) if stamp is None else stamp.strftime("%Y-%m-%d %H:%M UTC")
+
+
+# ==================================================================================
+def _as_utc(value: Any) -> Optional[pd.Timestamp]:
+    """Parse a recorded timestamp to a UTC ``pd.Timestamp``.
+
+    Parameters
+    ----------
+    value : Any
+        ISO string / timestamp; naive values are taken as UTC.
+
+    Returns
+    -------
+    pd.Timestamp or None
+        None when missing or unparseable.
+    """
+    try:
+        stamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(stamp):
+        return None
+    return (stamp.tz_localize("UTC") if stamp.tzinfo is None
+            else stamp.tz_convert("UTC"))
+
+
+# ==================================================================================
+def _fmt_time_range(start: Any, end: Any) -> str:
+    """Format a start/end pair as ``YYYY-MM-DD HH:MM–HH:MM UTC (N min)``.
+
+    Parameters
+    ----------
+    start, end : Any
+        Recorded timestamps (see :func:`_fmt_utc`).
+
+    Returns
+    -------
+    str
+        Compact range with duration; falls back to ``"{start} → {end}"``
+        when either end is missing/unparseable or the range spans days.
+    """
+    t0, t1 = _as_utc(start), _as_utc(end)
+    if t0 is None or t1 is None:
+        return f"{_fmt_utc(start)} → {_fmt_utc(end)}"
+    minutes = round((t1 - t0).total_seconds() / 60)
+    first, last = _fmt_utc(t0), _fmt_utc(t1)
+    if first[:10] != last[:10]:
+        return f"{first} → {last} ({minutes} min)"
+    return f"{first[:16]}–{last[11:16]} UTC ({minutes} min)"
 
 
 # ==================================================================================

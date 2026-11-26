@@ -199,7 +199,7 @@ def main(
                                    verbose=args.verbose)
         # figures first: the contract artifact list globs them
         _write_contract_report(qc_dir, meta, report, cfg, dhr=dhr,
-                               verbose=args.verbose)
+                               verbose=args.verbose, force_pdf=args.pdf)
         summary_rows.extend(_summary_rows(meta, report))
 
     # ========== Print the end-of-run summary ==========
@@ -567,6 +567,7 @@ def _write_contract_report(
         cfg: QAConfig,
         dhr: Optional[Dict[str, Any]] = None,
         verbose: bool = False,
+        force_pdf: bool = False,
     ) -> None:
     """Write the §2 contract report wrapping the spectral-stats payload.
 
@@ -593,6 +594,9 @@ def _write_contract_report(
         (advisory checks, delta stats, artifacts, config snapshot).
     verbose : bool, optional
         Print the write. Default False.
+    force_pdf : bool, optional
+        Write ``QC_report.pdf`` even for an incomplete/stale run.
+        Default False.
 
     Returns
     -------
@@ -628,7 +632,7 @@ def _write_contract_report(
     run_dir = qc_dir.parent.parent
     iy.ensure_finding_tickets(run_dir.parent, run_dir.name, contract)
     summary_path, _ = qr.write_report(qc_dir, contract)
-    qr.update_qc_report(qc_dir, contract)
+    qr.update_qc_report(qc_dir, contract, force_pdf=force_pdf)
     if verbose:
         tqdm.write(f"Saved contract report: {summary_path}")
 
@@ -2004,6 +2008,10 @@ if __name__ == '__main__':
     parser.add_argument("--path", type=str, default=None, help="The path of the folder to look for QA panel files. By default it will search from the root dir of the git repo")
     parser.add_argument("-f","--force", default=False, action="store_true", help="Force the re-creation of output files even if they are up to date. Default is to skip files that are newer than their inputs (panel file and orthomosaic).")
     parser.add_argument("--type", type=str, default="parquet", choices=["parquet", "csv"], help="The file type for the output files. Default is parquet for more efficient storage and faster read/write times, but can be set to csv. Note that .parquet files will require additional dependencies to read and write.")
+    parser.add_argument("--pdf", default=False, action="store_true",
+                        help=("Also write QC_data/QC_report.pdf even when the run is "
+                             "incomplete or stale (it is written automatically once "
+                             "all four QC scripts are current)."))
     parser.add_argument("-s","--skipplot", default=False, action="store_true", help="Skip the per-run figure generation. Reports and extracted tables are still produced.")
     parser.add_argument("--skip-processing", default=False, action="store_true", help="Never process rasters, only load existing output files for reporting. Useful for report-only re-runs.")
     parser.add_argument("-v", "--verbose", default=False, action="store_true", help="Enable verbose output for debugging and additional information during processing.")

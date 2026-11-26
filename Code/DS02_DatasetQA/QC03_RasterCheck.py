@@ -4,8 +4,8 @@ Crawls the APPN dataset tree for processed runs (``<run>/T1_proc/*.gpro``)
 and scans the **ortho reflectance products only** (VNIR + SWIR ENVI
 ``.bin``/``.hdr`` pairs under ``gpro/products/``) — radiance and
 intermediates are out of scope. Values are reflectance x 10^4, so the
-physical range is 0-10000 (design record: the retired QC pipeline plan
-§5c, in this repo's git history).
+physical range is 0-10000 (design record: the retired QC pipeline
+plan §5c).
 
 Check set (per product, per band + whole-cube):
 
@@ -46,6 +46,22 @@ masked before the whole-cube roll-ups so known-bad SWIR bands don't
 dominate the fractions; per-band statistics are still reported for every
 band with a ``bad_band`` flag.
 
+**Per-band domain split (v2.0, plan items 5+6):** the capture-polygon
+zone masks are geometry-derived, so they are built *before* the band
+scan and every band records separate statistics per spatial domain —
+``footprint`` (any-band-nonzero pixels), ``roi`` and ``edge_band`` sub-
+dicts with zero counts/fractions, min/max/mean and exact percentiles.
+The legacy flat keys (full-grid histograms polluted by background
+zeros) are kept for continuity with the pre-v2.0 baseline but no
+longer drive figures or grading. Runs without a usable capture polygon
+record null ``roi``/``edge_band`` stats (no second read pass) and fall
+back to the footprint domain. The ``dead_bands`` check records
+per-band ROI zero rates and candidate bands at a provisional cutoff
+but grades ``not_checked`` until ``raster_validity.yml`` gains a
+calibrated ``dead_band.fail_above_pct`` — rates first, thresholds
+later (operator, 2026-09-04). Threshold-only spec changes re-grade
+cached runs **from the detail JSON** (no raster re-scan).
+
 **Advisory:** thresholds ship as uncalibrated defaults
 (``reference/thresholds/raster_validity.yml``) and grade
 ``warning``/``fail``, but nothing downstream is voided — QC03 becomes a
@@ -58,8 +74,21 @@ Outputs (per run, §4 layout):
 
 - ``QC_data/QC03_RasterCheck_summary.yaml`` — contract summary.
 - ``QC_data/QC03_RasterCheck/QC03_RasterCheck_detail.json`` — contract
-  detail with per-band statistics (min/max/mean/percentiles, bad-pixel
-  fractions) so QA03 can aggregate later.
+  detail with per-band, per-domain statistics (min/max/mean/percentiles,
+  bad-pixel fractions for footprint/ROI/edge band) so QA03 can aggregate
+  and thresholds can be calibrated later without re-scanning. Its
+  ``staleness`` block records each product's ``{path, mtime_utc}`` plus
+  (v2.5) the run's ``gpro_path``/``gpro_mtime_utc``, which QC_report.md
+  uses for its Freshness column.
+- ``QC_data/QC03_RasterCheck/QC_plots/{label}_band_*.png`` — per-band
+  figures (zero fraction, over-range fraction, percentile envelope),
+  rendered from the detail JSON. Render-only: cached runs missing them
+  are backfilled from their existing report without a raster re-scan.
+- ``QC_data/QC03_RasterCheck/QC_plots/quicklook_{cir_<label>,dsm}.png``
+  (v2.6) — downsampled false-colour image per VNIR product and a
+  hillshaded DSM, for the QC report's At-a-glance grid. Stretch limits
+  are recorded under ``quicklooks`` in the detail JSON; cached runs
+  without them get them through a small decimated read, not a re-scan.
 
 Command-line Arguments
 ----------------------
@@ -84,6 +113,9 @@ Command-line Arguments
     only: the product set is ambiguous.
 --force : flag
     Regenerate reports even when they are newer than every input.
+--pdf : flag
+    Also write ``QC_data/QC_report.pdf`` for an incomplete/stale run (it
+    is written automatically once all four QC scripts are current).
 --verbose : flag
     Print extra diagnostic information.
 """
@@ -92,7 +124,7 @@ Command-line Arguments
 
 __title__ = "Raster check"
 __author__ = "Arden Burrell"
-__version__ = "v1.7(04.09.2026)"
+__version__ = "v2.6(27.11.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -109,6 +141,10 @@ from typing import Any, Dict, List, Optional, Tuple
 # ========== Import other packages ==========
 import git
 from git import exc as git_exc
+import matplotlib
+matplotlib.use("Agg")  # headless; avoids GUI-backend freetype clash (mpl #32208)
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 import rasterio
@@ -116,6 +152,7 @@ from rasterio.crs import CRS
 from rasterio.errors import RasterioIOError
 from rasterio.warp import transform as rio_transform
 from scipy import ndimage
+import seaborn as sns
 from tqdm import tqdm
 import warnings as warn
 
@@ -135,6 +172,7 @@ if _git_root not in sys.path:
 import Code.functions.core_functions as cf
 import Code.functions.spectral_qc as sq
 import Code.functions.qc_report as qr
+import Code.functions.qc_report.quicklook as ql
 import Code.functions.issue_yaml as iy
 
 
@@ -194,6 +232,7 @@ def load_validity_spec(
             "nan_inf_count": {"warn_above": 0},
             "dropout_in_roi_pct": {"warn_above": 0.1},
             "data_outside_bbox_pct": {"warn_above": 0.01},
+            "dead_band": {"candidate_above_pct": 99.0},
             "zero_zones": {"short_axis_fraction": 0.10,
                            "inset_factor": 0.5},
             "reflectance_max": 10000,
@@ -317,14 +356,35 @@ def process_run(
                     / "flight_lines.csv")
     if flight_lines.is_file():
         inputs.append(flight_lines)
-    if spec_snapshot is not None:
-        inputs.append(pathlib.Path(spec_snapshot["path"]))
+    # Spec staleness is content-defined (sha256 recorded in the detail
+    # JSON, checked below) - the yml's mtime moves on syncs/copies that
+    # change nothing, which must not invalidate a node-wide crawl.
     if not args.force and cf.outputs_up_to_date(
             [summary_path, detail_path], inputs):
+        # min_version: per-zone per-band stats landed in v2.0, domain
+        # quartiles in v2.1, zero-exclusive value stats in v2.3 (results
+        # floor). Version-current runs never re-scan: a spec change
+        # re-grades from the recorded JSON, missing figures backfill.
         version_ok, version_reason = qr.report_is_current(
-            qc_data, "QC03_RasterCheck", __version__)
+            qc_data, "QC03_RasterCheck", __version__,
+            min_version="v2.3")
         if version_ok:
-            row.update({"status": "cached", "reason": "outputs up to date"})
+            config_ok, _ = qr.report_is_current(
+                qc_data, "QC03_RasterCheck", __version__,
+                min_version="v2.3",
+                config_sha256=(spec_snapshot or {}).get("sha256"))
+            if config_ok:
+                backfilled = backfill_figures(qc_data, spec, run_dir,
+                                              products)
+                row.update({"status": "cached",
+                            "reason": backfilled or "outputs up to date"})
+            else:
+                status = regrade_from_json(qc_data, spec, spec_snapshot)
+                row.update({"status": status,
+                            "reason": "re-graded from cached scan "
+                                      "(spec change, no re-scan)"})
+            if args.pdf:
+                qr.export_qc_pdf(qc_data)
             return row
         if args.verbose:
             tqdm.write(f"{run_dir}: {version_reason}; re-running")
@@ -346,6 +406,10 @@ def process_run(
         add_product_checks(report, product["label"], scan, spec)
         report["products"][product["label"]] = scan
 
+    report["artifacts"] += render_product_figures(report, qc_data, spec)
+    quicklook_arts, report["quicklooks"] = render_quicklooks(
+        run_dir, qc_data, products)
+    report["artifacts"] += quicklook_arts
     report["config"] = spec_snapshot or {"path": None, "sha256": None}
     report["staleness"] = {
         p["label"]: {"path": str(p["bin"]),
@@ -353,9 +417,16 @@ def process_run(
                          p["bin"].stat().st_mtime, unit="s",
                          tz="UTC").isoformat()}
         for p in products}
+    # gpro identity (same keys as QC01) so the QC_report Freshness column
+    # can compare QC03 with its siblings; ambiguous multi-gpro runs skip it.
+    if len(gpros) == 1:
+        report["staleness"].update({
+            "gpro_path": str(gpros[0]),
+            "gpro_mtime_utc": pd.Timestamp(
+                gpros[0].stat().st_mtime, unit="s", tz="UTC").isoformat()})
     iy.ensure_finding_tickets(run_dir.parent, run_dir.name, report)
     qr.write_report(qc_data, report)
-    qr.update_qc_report(qc_data, report)
+    qr.update_qc_report(qc_data, report, force_pdf=args.pdf)
     row.update({"status": report["status"], "reason": None})
     if args.verbose:
         tqdm.write(f"{run_dir}: {report['status']}")
@@ -724,38 +795,84 @@ def _interior_zero_mask(all_zero: np.ndarray) -> np.ndarray:
 
 
 # ==================================================================================
-def classify_zero_zones(
+def compute_zone_masks(
     bin_path: pathlib.Path,
     extent_path: pathlib.Path,
-    all_zero: np.ndarray,
     line_spacing_m: Optional[float],
     spacing_source: str,
     zones_spec: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Split the all-bands-zero pixels of one product into zones.
+) -> Optional[Dict[str, Any]]:
+    """Build the capture-polygon zone masks ahead of the band scan.
 
-    With a usable capture polygon the bbox is the analysis domain:
-    everything outside it is discarded (background by construction —
-    only the ``data_outside_bbox`` guard looks there), the bbox eroded by
-    :func:`zone_inset` is the graded ROI, and the ring between them is
-    the advisory edge band. Without one, border connectivity stands in:
-    border-connected all-zero components are out-of-capture, interior
-    components are dropout.
+    The bbox/ROI masks are geometry-derived (extent polygon + inset), so
+    they exist before any pixel is read — which is what lets the scan
+    accumulate per-zone per-band statistics in its single pass (plan
+    items 5+6). Only the header of the raster is touched.
 
     Parameters
     ----------
     bin_path : pathlib.Path
-        The orthomosaic (reopened for its CRS/transform/resolution).
+        The orthomosaic (opened for its CRS/transform/resolution only).
     extent_path : pathlib.Path
         The bundle's ``extents/hyper_extent.geojson``.
-    all_zero : np.ndarray
-        Boolean ``(height, width)`` all-bands-zero mask.
     line_spacing_m : float or None
         Median flight-line spacing from QC01.
     spacing_source : str
         ``"qc01"`` or ``"10%-rule"``.
     zones_spec : dict
         ``zero_zones`` block of the validity spec.
+
+    Returns
+    -------
+    dict or None
+        ``{"extent", "inset", "verts_px", "bbox", "roi"}`` — provenance
+        plus boolean ``(height, width)`` masks — or None when there is
+        no usable capture polygon (the caller falls back to the
+        border-connectivity classifier and null zone stats).
+    """
+    extent = load_capture_extent(extent_path)
+    if extent is None:
+        return None
+    with rasterio.open(bin_path) as src:
+        height, width = src.height, src.width
+        verts_m, verts_px = extent_verts_px(extent["ring"], src)
+        pixel_size_m = float(np.mean(np.abs(src.res)))
+    inset = zone_inset(_min_rect_short_axis(verts_m), line_spacing_m,
+                       spacing_source, zones_spec)
+    inset["pixel_size_m"] = pixel_size_m
+    inset["pixels"] = float(inset["metres"] / max(pixel_size_m, 1e-12))
+    return {
+        "extent": {"path": extent["path"], "n_verts": extent["n_verts"]},
+        "inset": inset,
+        "verts_px": verts_px,
+        "bbox": inside_mask_px(verts_px, height, width),
+        "roi": inside_mask_px(verts_px, height, width,
+                              inset=inset["pixels"]),
+    }
+
+
+# ==================================================================================
+def classify_zero_zones(
+    all_zero: np.ndarray,
+    masks: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Split the all-bands-zero pixels of one product into zones.
+
+    With a usable capture polygon (*masks* from
+    :func:`compute_zone_masks`) the bbox is the analysis domain:
+    everything outside it is discarded (background by construction —
+    only the ``data_outside_bbox`` guard looks there), the eroded ROI is
+    graded, and the ring between them is the advisory edge band.
+    Without one, border connectivity stands in: border-connected
+    all-zero components are out-of-capture, interior components are
+    dropout.
+
+    Parameters
+    ----------
+    all_zero : np.ndarray
+        Boolean ``(height, width)`` all-bands-zero mask.
+    masks : dict or None
+        Precomputed zone masks, or None for the fallback classifier.
 
     Returns
     -------
@@ -781,9 +898,8 @@ def classify_zero_zones(
         "data_outside_bbox_pct": None,
     }
     interior = _interior_zero_mask(all_zero)
-    extent = load_capture_extent(extent_path)
 
-    if extent is None:
+    if masks is None:
         # ===== no usable polygon: border connectivity decides the ROI =====
         dropout_px = int(np.count_nonzero(interior))
         roi_px = grid_px - (zones["all_zero_px"] - dropout_px)
@@ -796,25 +912,15 @@ def classify_zero_zones(
         })
         return zones
 
-    with rasterio.open(bin_path) as src:
-        verts_m, verts_px = extent_verts_px(extent["ring"], src)
-        pixel_size_m = float(np.mean(np.abs(src.res)))
-    inset = zone_inset(_min_rect_short_axis(verts_m), line_spacing_m,
-                       spacing_source, zones_spec)
-    inset["pixel_size_m"] = pixel_size_m
-    inset["pixels"] = float(inset["metres"] / max(pixel_size_m, 1e-12))
-
     # ===== bbox: the analysis domain, plus the extent sanity guard =====
-    bbox = inside_mask_px(verts_px, height, width)
+    bbox, roi = masks["bbox"], masks["roi"]
     bbox_px = int(np.count_nonzero(bbox))
     zero_in_bbox_px = int(np.count_nonzero(all_zero & bbox))
-    del bbox
-    tolerated = inside_mask_px(verts_px, height, width, inset=-0.5)
+    tolerated = inside_mask_px(masks["verts_px"], height, width, inset=-0.5)
     outside_data_px = int(np.count_nonzero(~tolerated & ~all_zero))
     del tolerated
 
     # ===== ROI: the graded zone; the edge band is the rest of the bbox =====
-    roi = inside_mask_px(verts_px, height, width, inset=inset["pixels"])
     roi_px = int(np.count_nonzero(roi))
     dropout_px = int(np.count_nonzero(all_zero & roi))
     interior_roi_px = int(np.count_nonzero(interior & roi))
@@ -823,8 +929,8 @@ def classify_zero_zones(
 
     zones.update({
         "classifier": "bbox",
-        "extent": {"path": extent["path"], "n_verts": extent["n_verts"]},
-        "inset": inset,
+        "extent": dict(masks["extent"]),
+        "inset": masks["inset"],
         "outside_bbox_px": grid_px - bbox_px,
         "bbox_px": bbox_px,
         "zero_in_bbox_px": zero_in_bbox_px,
@@ -917,13 +1023,18 @@ def scan_product(
         is_float = np.issubdtype(dtype, np.floating)
         is_signed = is_float or np.issubdtype(dtype, np.signedinteger)
 
+        # zone masks are geometry-derived: built before the scan so the
+        # single pass can accumulate per-zone per-band statistics
+        masks = compute_zone_masks(bin_path, product["extent"],
+                                   line_spacing_m, spacing_source,
+                                   zones_spec or {})
         offset = _raw_bsq_offset(product["hdr"], integrity, dtype)
         if offset is not None:
             acc = _scan_bands_raw(bin_path, n_bands, height, width, offset,
-                                  vmax, threads, verbose)
+                                  vmax, threads, verbose, masks=masks)
         else:
             acc = _scan_bands_gdal(bin_path, vmax, chunk_mb, is_float,
-                                   is_signed, verbose)
+                                   is_signed, verbose, masks=masks)
     except RasterioIOError as err:
         # a broken/missing .hdr must fail the check, not abort the crawl
         integrity["ok"] = False
@@ -938,14 +1049,13 @@ def scan_product(
 
     n_px = height * width
     footprint_px = acc["footprint_px"]
-    zones = classify_zero_zones(
-        bin_path, product["extent"], acc.pop("all_zero"), line_spacing_m,
-        spacing_source, zones_spec or {})
+    zones = classify_zero_zones(acc.pop("all_zero"), masks)
+    del masks
     bands = _per_band_stats(
         n_bands, wavelengths, bad_ranges, footprint_px, acc["n_zero_fp"],
         acc["n_over"], acc["n_neg"], acc["n_naninf"], acc["n_valid"],
         acc["band_min"], acc["band_max"], acc["band_sum"], acc["hist"],
-        n_px)
+        n_px, zone_acc=acc.get("zones"))
     good = [b for b in bands if not b["bad_band"]]
     denom_fp = max(footprint_px * max(len(good), 1), 1)
     denom_all = max(n_px * max(len(good), 1), 1)
@@ -1040,12 +1150,16 @@ def _scan_bands_raw(
     vmax: int,
     threads: int,
     verbose: bool,
+    masks: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Threaded raw band-major scan of an uncompressed uint16 BSQ.
 
     Each worker owns a file handle and a private per-pixel zero-count
     partial; per-band outputs are written to disjoint slots, so no
-    locking is needed and the merged result is order-independent.
+    locking is needed and the merged result is order-independent. With
+    zone *masks* the same pass also bincounts each band over the ROI and
+    edge-band pixels (precomputed gather indices), so per-domain
+    statistics cost no extra IO.
 
     Parameters
     ----------
@@ -1061,14 +1175,18 @@ def _scan_bands_raw(
         Reader-thread count.
     verbose : bool
         Show a per-band progress bar.
+    masks : dict, optional
+        Zone masks from :func:`compute_zone_masks`; None skips the
+        per-zone accumulators (no capture polygon).
 
     Returns
     -------
     dict
         Accumulators: ``footprint_px``, the full-grid ``all_zero`` mask,
         per-band ``n_zero_fp``, ``n_over``, ``n_neg``, ``n_naninf``,
-        ``band_min``, ``band_max``, ``band_sum`` and the clipped ``hist``
-        ``(n_bands, vmax + 1)``.
+        ``band_min``, ``band_max``, ``band_sum``, the clipped ``hist``
+        ``(n_bands, vmax + 1)`` and ``zones`` (per-zone accumulator
+        dicts, or None without masks).
     """
     band_px = height * width
     n_zero = np.zeros(n_bands, dtype=np.int64)
@@ -1078,6 +1196,15 @@ def _scan_bands_raw(
     band_sum = np.zeros(n_bands, dtype=np.float64)
     hist = np.zeros((n_bands, vmax + 1), dtype=np.int64)
     values = np.arange(65536, dtype=np.int64)
+    zone_idx: Dict[str, np.ndarray] = {}
+    zone_acc: Optional[Dict[str, Dict[str, Any]]] = None
+    if masks is not None:
+        flat_roi = masks["roi"].ravel()
+        zone_idx = {"roi": np.flatnonzero(flat_roi),
+                    "edge_band": np.flatnonzero(masks["bbox"].ravel()
+                                                & ~flat_roi)}
+        zone_acc = {z: _new_zone_acc(n_bands, vmax, int(idx.size))
+                    for z, idx in zone_idx.items()}
     zero_parts: List[Optional[np.ndarray]] = [None] * threads
     pbar = tqdm(total=n_bands, desc=f"  {bin_path.name}", unit="band",
                 leave=False, disable=not verbose)
@@ -1098,6 +1225,9 @@ def _scan_bands_raw(
                 # fold over-range counts into the top bin (== old clip)
                 hist[b, :vmax] = h[:vmax]
                 hist[b, vmax] = int(h[vmax:].sum())
+                for zname, idx in zone_idx.items():
+                    zh = np.bincount(band[idx], minlength=65536)
+                    _fold_zone_band(zone_acc[zname], b, zh, vmax, values)
                 local_zero += band == 0
                 pbar.update(1)
         zero_parts[w] = local_zero
@@ -1129,7 +1259,76 @@ def _scan_bands_raw(
         "band_max": band_max,
         "band_sum": band_sum,
         "hist": hist,
+        "zones": zone_acc,
     }
+
+
+# ==================================================================================
+def _new_zone_acc(n_bands: int, vmax: int, zone_px: int) -> Dict[str, Any]:
+    """Allocate the per-zone per-band accumulator set for one zone.
+
+    Parameters
+    ----------
+    n_bands : int
+        Number of bands.
+    vmax : int
+        Physical reflectance ceiling (histogram width).
+    zone_px : int
+        Zone pixel count (the fixed per-band denominator).
+
+    Returns
+    -------
+    dict
+        ``{"px", "hist", "n_over", "min", "max", "sum"}`` accumulators.
+    """
+    return {"px": zone_px,
+            "hist": np.zeros((n_bands, vmax + 1), dtype=np.int64),
+            "n_over": np.zeros(n_bands, dtype=np.int64),
+            "min": np.full(n_bands, np.nan),
+            "max": np.full(n_bands, np.nan),
+            "sum": np.zeros(n_bands, dtype=np.float64)}
+
+
+# ==================================================================================
+def _fold_zone_band(
+    zone: Dict[str, Any],
+    b: int,
+    zh: np.ndarray,
+    vmax: int,
+    values: np.ndarray,
+) -> None:
+    """Fold one band's full zone bincount into the zone accumulators.
+
+    Mirrors the full-grid treatment: over-range counts fold into the top
+    histogram bin, extrema/sums come from the unfolded bincount.
+
+    Parameters
+    ----------
+    zone : dict
+        Zone accumulator set from :func:`_new_zone_acc` (mutated).
+    b : int
+        0-based band index.
+    zh : np.ndarray
+        Full ``bincount(minlength=65536)`` of the zone's pixels.
+    vmax : int
+        Physical reflectance ceiling.
+    values : np.ndarray
+        ``arange(65536)`` weights for the sum.
+
+    Returns
+    -------
+    None
+    """
+    zone["n_over"][b] = int(zh[vmax + 1:].sum())
+    zone["hist"][b, :vmax] = zh[:vmax]
+    zone["hist"][b, vmax] = int(zh[vmax:].sum())
+    # extrema over NONZERO samples: zeros are absence-of-data, reported
+    # via the zero counts, and must not pin every domain min at 0
+    nz = np.nonzero(zh[1:])[0]
+    if nz.size:
+        zone["min"][b] = float(nz[0] + 1)
+        zone["max"][b] = float(nz[-1] + 1)
+    zone["sum"][b] = float(np.dot(zh, values))
 
 
 # ==================================================================================
@@ -1140,12 +1339,15 @@ def _scan_bands_gdal(
     is_float: bool,
     is_signed: bool,
     verbose: bool,
+    masks: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Original GDAL row-window chunk scan (non-uint16/BSQ fallback).
 
     Non-finite samples (NaN/Inf) are excluded from every ordinary
     statistic — background, zeros, extrema, sums, histogram — and only
-    counted in ``n_naninf``.
+    counted in ``n_naninf``. With zone *masks* the same pass accumulates
+    per-zone per-band statistics from the chunk slices; negative zone
+    values clip into the zone histogram's zero bin (extrema stay exact).
 
     Parameters
     ----------
@@ -1159,12 +1361,15 @@ def _scan_bands_gdal(
         Dtype traits (enable NaN/negative counting).
     verbose : bool
         Show a per-chunk progress bar.
+    masks : dict, optional
+        Zone masks from :func:`compute_zone_masks`; None skips the
+        per-zone accumulators.
 
     Returns
     -------
     dict
         Same accumulator set as :func:`_scan_bands_raw`, including the
-        full-grid ``all_zero`` mask.
+        full-grid ``all_zero`` mask and ``zones``.
     """
     with rasterio.open(bin_path) as src:
         n_bands, height, width = src.count, src.height, src.width
@@ -1182,6 +1387,15 @@ def _scan_bands_gdal(
         hist = np.zeros((n_bands, vmax + 1), dtype=np.int64)
         all_zero = np.zeros((height, width), dtype=bool)
         footprint_px = 0
+        zone_masks: Dict[str, np.ndarray] = {}
+        zone_acc: Optional[Dict[str, Dict[str, Any]]] = None
+        if masks is not None:
+            zone_masks = {"roi": masks["roi"],
+                          "edge_band": masks["bbox"] & ~masks["roi"]}
+            zone_acc = {
+                z: _new_zone_acc(n_bands, vmax,
+                                 int(np.count_nonzero(zm)))
+                for z, zm in zone_masks.items()}
 
         offsets = range(0, height, rows_per_chunk)
         iterator = tqdm(offsets, desc=f"  {bin_path.name}", unit="chunk",
@@ -1199,13 +1413,18 @@ def _scan_bands_gdal(
             fp = ~background
             footprint_px += int(fp.sum())
             flat_fp = fp.ravel()
+            zone_chunks = {z: zm[row_off:row_off + h].ravel()
+                           for z, zm in zone_masks.items()}
             for b in range(n_bands):
                 vals = data[b].ravel()
                 fp_b = flat_fp
+                zones_b = zone_chunks
                 if is_float:
                     fin = finite[b].ravel()
                     vals = vals[fin]        # finite samples only
                     fp_b = flat_fp[fin]
+                    zones_b = {z: zc[fin]
+                               for z, zc in zone_chunks.items()}
                 n_zero_fp[b] += int(((vals == 0) & fp_b).sum())
                 n_over[b] += int((vals > vmax).sum())
                 if is_signed:
@@ -1217,6 +1436,22 @@ def _scan_bands_gdal(
                     band_sum[b] += float(vals.sum())
                     clipped = np.clip(vals, 0, vmax).astype(np.int64)
                     hist[b] += np.bincount(clipped, minlength=vmax + 1)
+                for zname, zc in zones_b.items():
+                    zv = vals[zc]
+                    if not zv.size:
+                        continue
+                    zone = zone_acc[zname]
+                    zone["n_over"][b] += int((zv > vmax).sum())
+                    zvnz = zv[zv != 0]   # extrema over nonzero samples
+                    if zvnz.size:
+                        zone["min"][b] = np.fmin(zone["min"][b],
+                                                 float(zvnz.min()))
+                        zone["max"][b] = np.fmax(zone["max"][b],
+                                                 float(zvnz.max()))
+                    zone["sum"][b] += float(zv.sum())
+                    zone["hist"][b] += np.bincount(
+                        np.clip(zv, 0, vmax).astype(np.int64),
+                        minlength=vmax + 1)
 
     return {
         "footprint_px": footprint_px,
@@ -1230,6 +1465,7 @@ def _scan_bands_gdal(
         "band_max": band_max,
         "band_sum": band_sum,
         "hist": hist,
+        "zones": zone_acc,
     }
 
 
@@ -1249,11 +1485,18 @@ def _per_band_stats(
     band_sum: np.ndarray,
     hist: np.ndarray,
     n_px: int,
+    zone_acc: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Assemble the per-band statistics list from the scan accumulators.
 
     Percentiles are exact for in-range integer data (computed from the
     clipped histogram); out-of-range values are clipped to the ends.
+    The flat keys keep their pre-v2.0 full-grid semantics (baseline
+    continuity); the per-domain truth lives in the ``footprint`` /
+    ``roi`` / ``edge_band`` sub-dicts. The footprint histogram is
+    derived algebraically — background pixels are zero in every band, so
+    replacing the zero bin with the footprint zero count removes them
+    exactly, no extra pass.
 
     Parameters
     ----------
@@ -1276,11 +1519,16 @@ def _per_band_stats(
         Per-band clipped histograms ``(n_bands, vmax + 1)``.
     n_px : int
         Total pixels per band.
+    zone_acc : dict, optional
+        Per-zone accumulators from the scanners (``roi``/``edge_band``),
+        or None when there is no capture polygon — the sub-dicts are
+        then null.
 
     Returns
     -------
     list of dict
-        One statistics dict per band (1-based ``band`` index).
+        One statistics dict per band (1-based ``band`` index) with
+        ``footprint``/``roi``/``edge_band`` domain sub-dicts.
     """
     stats: List[Dict[str, Any]] = []
     pcts = (1, 5, 50, 95, 99)
@@ -1294,6 +1542,31 @@ def _per_band_stats(
         for p in pcts:
             rank = max(int(np.ceil(p / 100.0 * total)), 1)
             pct_vals[f"p{p:02d}"] = int(np.searchsorted(cum, rank))
+
+        # ===== footprint domain: zero bin swapped for the exact count =====
+        hist_fp = hist[b].copy()
+        hist_fp[0] = max(int(n_zero_fp[b]), 0)
+        footprint = _domain_band_stats(
+            hist_fp, int(n_zero_fp[b]), footprint_px,
+            sum_val=float(band_sum[b]), n_over_range=int(n_over[b]),
+            max_val=float(band_max[b]))
+
+        # ===== ROI / edge band: from the per-zone accumulators =====
+        domains: Dict[str, Optional[Dict[str, Any]]] = {
+            "roi": None, "edge_band": None}
+        for zname in domains:
+            zone = (zone_acc or {}).get(zname)
+            if zone is None:
+                continue
+            domains[zname] = _domain_band_stats(
+                zone["hist"][b], int(zone["hist"][b][0]), int(zone["px"]),
+                sum_val=float(zone["sum"][b]),
+                n_over_range=int(zone["n_over"][b]),
+                min_val=(None if np.isnan(zone["min"][b])
+                         else float(zone["min"][b])),
+                max_val=(None if np.isnan(zone["max"][b])
+                         else float(zone["max"][b])))
+
         stats.append({
             "band": b + 1,
             "wavelength_nm": None if not np.isfinite(wl) else float(wl),
@@ -1309,8 +1582,74 @@ def _per_band_stats(
             "over_range_pct": float(100.0 * n_over[b] / max(n_px, 1)),
             "n_negative": int(n_neg[b]),
             "n_nan_inf": int(n_naninf[b]),
+            "footprint": footprint,
+            "roi": domains["roi"],
+            "edge_band": domains["edge_band"],
         })
     return stats
+
+
+# ==================================================================================
+def _domain_band_stats(
+    hist_row: np.ndarray,
+    n_zero: int,
+    domain_px: int,
+    sum_val: float,
+    n_over_range: int,
+    min_val: Optional[float] = None,
+    max_val: Optional[float] = None,
+) -> Dict[str, Any]:
+    """One band's statistics over one spatial domain from its histogram.
+
+    Parameters
+    ----------
+    hist_row : np.ndarray
+        The domain's clipped histogram ``(vmax + 1,)`` for this band.
+    n_zero : int
+        Zero-pixel count in the domain.
+    domain_px : int
+        Domain pixel count (the zero/over-range denominator).
+    sum_val : float
+        Sum of the domain's (finite) sample values.
+    n_over_range : int
+        Count of samples above the reflectance ceiling.
+    min_val, max_val : float, optional
+        Exact extrema when the scanner tracked them; None derives them
+        from the (clipped) histogram.
+
+    Returns
+    -------
+    dict
+        ``n_zero``/``zero_pct``, ``min``/``max``/``mean``, the exact
+        percentiles and the over-range count/fraction. Value statistics
+        (min/max/mean/percentiles) are computed over the **nonzero**
+        samples — zeros are absence-of-data with their own counts and
+        figure, and must not drag the distribution (operator,
+        2026-09-04). None when the domain holds no nonzero samples.
+    """
+    hist_nz = hist_row.copy()
+    hist_nz[0] = 0                       # zeros excluded from value stats
+    total = int(hist_nz.sum())
+    out: Dict[str, Any] = {
+        "n_zero": int(n_zero),
+        "zero_pct": float(100.0 * n_zero / max(domain_px, 1)),
+        "n_over_range": int(n_over_range),
+        "over_range_pct": float(100.0 * n_over_range / max(domain_px, 1)),
+    }
+    if total <= 0:
+        out.update({"min": None, "max": None, "mean": None,
+                    **{f"p{p:02d}": None
+                       for p in (1, 5, 25, 50, 75, 95, 99)}})
+        return out
+    nz = np.nonzero(hist_nz)[0]
+    out["min"] = float(nz[0]) if min_val is None else float(min_val)
+    out["max"] = float(nz[-1]) if max_val is None else float(max_val)
+    out["mean"] = float(sum_val / total)
+    cum = np.cumsum(hist_nz)
+    for p in (1, 5, 25, 50, 75, 95, 99):
+        rank = max(int(np.ceil(p / 100.0 * total)), 1)
+        out[f"p{p:02d}"] = int(np.searchsorted(cum, rank))
+    return out
 
 
 # ==================================================================================
@@ -1418,7 +1757,7 @@ def add_product_checks(
     cube = scan["cube"]
     if cube is None:
         for name in ("zeros_in_footprint", "over_range", "negative",
-                     "nan_inf", "dropout_in_roi"):
+                     "nan_inf", "dead_bands", "dropout_in_roi"):
             qr.add_check(report, f"{name}_{label}", "not_checked",
                          note="raster unreadable - scan skipped")
         return
@@ -1453,7 +1792,79 @@ def add_product_checks(
         qr.add_check(report, f"nan_inf_{label}", "not_checked",
                      note="integer dtype cannot hold NaN/Inf")
 
+    _add_dead_band_check(report, label, scan.get("bands") or [], spec)
     _add_zone_checks(report, label, scan.get("zero_zones") or {}, spec)
+
+
+# ==================================================================================
+def _add_dead_band_check(
+    report: Dict[str, Any],
+    label: str,
+    bands: List[Dict[str, Any]],
+    spec: Dict[str, Any],
+) -> None:
+    """Record dead-band candidates; grade only once the spec is calibrated.
+
+    A dead band is a non-approved band whose ROI zero fraction reaches
+    the cutoff — an entire wavelength silently missing (plan item 5).
+    Normal background rates are unknown, so candidates at the
+    provisional ``dead_band.candidate_above_pct`` are recorded as
+    evidence and the check stays ``not_checked`` until the spec yml
+    declares ``dead_band.fail_above_pct`` (operator calibration from the
+    recorded distributions — a JSON re-grade, never a re-scan). Without
+    ROI stats (no capture polygon) the footprint zero fraction stands
+    in, flagged in the note.
+
+    Parameters
+    ----------
+    report : dict
+        Contract report dict (mutated in place).
+    label : str
+        Product label (``vnir``, ``swir``, ...).
+    bands : list of dict
+        Per-band statistics rows (v2.0 schema with domain sub-dicts).
+    spec : dict
+        Parsed validity thresholds (``dead_band`` block).
+
+    Returns
+    -------
+    None
+    """
+    thr = spec.get("dead_band", {}) or {}
+    candidate_pct = float(thr.get("candidate_above_pct", 99.0))
+    fail_pct = thr.get("fail_above_pct")
+    has_roi = any(b.get("roi") for b in bands)
+
+    def _zero_pct(b: Dict[str, Any]) -> float:
+        if b.get("roi"):
+            return float(b["roi"]["zero_pct"])
+        return float(b.get("zeros_in_footprint_pct", 0.0))
+
+    candidates = [
+        {"band": b["band"], "wavelength_nm": b["wavelength_nm"],
+         "zero_pct": round(_zero_pct(b), 3)}
+        for b in bands if not b["bad_band"]
+        and _zero_pct(b) >= candidate_pct]
+    domain = "roi" if has_roi else "footprint"
+    if fail_pct is not None:
+        dead = [c for c in candidates if c["zero_pct"] >= float(fail_pct)]
+        qr.add_check(
+            report, f"dead_bands_{label}",
+            "fail" if dead else "good",
+            value=f"{len(dead)} dead band(s)",
+            note=(f"bands \u2265 {fail_pct} % zeros ({domain} domain), "
+                  "approved bad bands excluded"),
+            domain=domain, cutoff_pct=float(fail_pct),
+            dead_bands=dead, candidates=candidates)
+        return
+    qr.add_check(
+        report, f"dead_bands_{label}", "not_checked",
+        value=f"{len(candidates)} candidate(s)",
+        note=(f"rates recorded ({domain} domain, provisional cutoff "
+              f"{candidate_pct} %) - ungraded until "
+              "dead_band.fail_above_pct is calibrated"),
+        advisory=True, domain=domain,
+        candidate_above_pct=candidate_pct, candidates=candidates)
 
 
 # ==================================================================================
@@ -1577,6 +1988,463 @@ def _add_zone_checks(
 
 
 # ==================================================================================
+def regrade_from_json(
+    qc_data: pathlib.Path,
+    spec: Dict[str, Any],
+    spec_snapshot: Optional[Dict[str, Any]],
+) -> str:
+    """Re-grade a cached run from its detail JSON after a spec change.
+
+    Grading (:func:`add_product_checks`) consumes only the recorded scan
+    dicts, so a threshold-only ``raster_validity.yml`` change never
+    costs a raster re-scan (plan items 5+6 calibration loop): checks are
+    rebuilt against the new spec, figures re-render (threshold lines may
+    have moved), the config snapshot updates and both contract files are
+    rewritten. The recorded ``script.version`` is kept — it identifies
+    the scan, not the grading pass.
+
+    Parameters
+    ----------
+    qc_data : pathlib.Path
+        The run's ``T1_proc/QC_data/`` folder.
+    spec : dict
+        Parsed validity thresholds (the new spec).
+    spec_snapshot : dict or None
+        ``{"path", "sha256"}`` snapshot of the new spec.
+
+    Returns
+    -------
+    str
+        The re-derived run status.
+    """
+    _, detail_path = qr.report_paths(qc_data, "QC03_RasterCheck")
+    with open(detail_path, encoding="utf-8") as fh:
+        report = json.load(fh)
+    report["checks"] = {}
+    for label, scan in report.get("products", {}).items():
+        add_product_checks(report, label, scan, spec)
+    report["config"] = spec_snapshot or {"path": None, "sha256": None}
+    report["artifacts"] = [a for a in report.get("artifacts", [])
+                           if not _is_band_figure(a)] \
+        + render_product_figures(report, qc_data, spec)
+    run_dir = qc_data.parent.parent
+    iy.ensure_finding_tickets(run_dir.parent, run_dir.name, report)
+    qr.write_report(qc_data, report)
+    qr.update_qc_report(qc_data, report)
+    return report["status"]
+
+
+# ==================================================================================
+def backfill_figures(
+    qc_data: pathlib.Path,
+    spec: Dict[str, Any],
+    run_dir: pathlib.Path,
+    products: List[Dict[str, Any]],
+) -> Optional[str]:
+    """Render missing figures and quicklooks for a cached run.
+
+    Per-band figures are render-only projections of the recorded per-band
+    statistics; quicklooks (v2.6) need a small decimated raster read, not
+    a re-scan. Either way a cached run (report at/above the
+    ``min_version`` floor) gains them without re-scanning. The report is
+    rewritten only when something was actually (re)rendered, so untouched
+    cache hits stay write-free.
+
+    Parameters
+    ----------
+    qc_data : pathlib.Path
+        The run's ``T1_proc/QC_data/`` folder.
+    spec : dict
+        Parsed validity thresholds (figure threshold lines).
+    run_dir : pathlib.Path
+        The ``<run>`` directory (DSM lookup).
+    products : list of dict
+        :func:`find_ortho_products` entries (CIR sources).
+
+    Returns
+    -------
+    str or None
+        A summary-row reason when figures were backfilled, else None.
+    """
+    _, detail_path = qr.report_paths(qc_data, "QC03_RasterCheck")
+    with open(detail_path, encoding="utf-8") as fh:
+        report = json.load(fh)
+    changed = False
+    band_pngs = [a for a in report.get("artifacts", []) if _is_band_figure(a)]
+    has_bands = any(prod.get("bands")
+                    for prod in report.get("products", {}).values())
+    if has_bands and not (band_pngs and all((qc_data / p).is_file()
+                                            for p in band_pngs)):
+        report["artifacts"] = [a for a in report.get("artifacts", [])
+                               if not _is_band_figure(a)] \
+            + render_product_figures(report, qc_data, spec)
+        changed = True
+    quicklooks = [a for a in report.get("artifacts", []) if ql.is_quicklook(a)]
+    if "quicklooks" not in report or not all(
+            (qc_data / a).is_file() for a in quicklooks):
+        arts, report["quicklooks"] = render_quicklooks(
+            run_dir, qc_data, products)
+        report["artifacts"] = [a for a in report.get("artifacts", [])
+                               if not ql.is_quicklook(a)] + arts
+        changed = True
+    if not changed:
+        return None
+    qr.write_report(qc_data, report)
+    qr.update_qc_report(qc_data, report)
+    return "outputs up to date (figures backfilled)"
+
+
+# ==================================================================================
+def _is_band_figure(artifact: Any) -> bool:
+    """Return True for a per-band figure artifact (a non-quicklook PNG).
+
+    Parameters
+    ----------
+    artifact : Any
+        A ``QC_data``-relative artifact path.
+
+    Returns
+    -------
+    bool
+        Whether the artifact is a per-band figure.
+    """
+    return str(artifact).lower().endswith(".png") \
+        and not ql.is_quicklook(artifact)
+
+
+# ==================================================================================
+def render_quicklooks(
+    run_dir: pathlib.Path,
+    qc_data: pathlib.Path,
+    products: List[Dict[str, Any]],
+) -> Tuple[List[str], Dict[str, Any]]:
+    """Write the At-a-glance quicklooks QC03 owns (QC report plan §4.2).
+
+    A false-colour (CIR) image per VNIR product and a hillshaded DSM when
+    the single bundle ships one, written to ``QC03_RasterCheck/QC_plots/
+    quicklook_*.png``. A product that cannot be read is warned about and
+    skipped — quicklooks never affect the QC verdict.
+
+    Parameters
+    ----------
+    run_dir : pathlib.Path
+        The ``<run>`` directory.
+    qc_data : pathlib.Path
+        The run's ``T1_proc/QC_data/`` folder.
+    products : list of dict
+        :func:`find_ortho_products` entries.
+
+    Returns
+    -------
+    list of str
+        ``QC_data``-relative artifact paths of the written quicklooks.
+    dict
+        Quicklook name → ``{"source", ...stretch record}`` for the
+        detail JSON (reproducibility).
+    """
+    jobs = [(f"cir_{p['label']}", ql.render_cir, p["bin"])
+            for p in products if p["region"] == "VNIR"]
+    gpros = sorted((run_dir / "T1_proc").glob("*.gpro"))
+    dsm = ql.find_dsm(gpros[0] / "products") if len(gpros) == 1 else None
+    if dsm is not None:
+        jobs.append(("dsm", ql.render_dsm, dsm))
+    plots_dir = qc_data / "QC03_RasterCheck" / "QC_plots"
+    artifacts: List[str] = []
+    record: Dict[str, Any] = {}
+    for name, render, source in jobs:
+        out_png = plots_dir / f"quicklook_{name}.png"
+        try:
+            record[name] = {"source": source.name, **render(source, out_png)}
+        except (RasterioIOError, ValueError) as err:
+            warn.warn(f"Quicklook {name} skipped for {source}: {err}")
+            continue
+        artifacts.append(f"QC03_RasterCheck/QC_plots/{out_png.name}")
+    return artifacts, record
+
+
+# ==================================================================================
+def render_product_figures(
+    report: Dict[str, Any],
+    qc_data: pathlib.Path,
+    spec: Dict[str, Any],
+) -> List[str]:
+    """Render the three per-band figures for every product in a report.
+
+    Per product: zero fraction (ROI primary, edge band secondary),
+    over-range fraction, and percentile envelope (ROI domain), each
+    against wavelength (band index when wavelengths are missing),
+    written to ``QC03_RasterCheck/QC_plots/``. Pure render from the
+    report dict — no raster access — so it serves fresh scans,
+    :func:`backfill_figures` and :func:`regrade_from_json` alike.
+
+    Parameters
+    ----------
+    report : dict
+        The QC03 contract detail-report dict.
+    qc_data : pathlib.Path
+        The run's ``T1_proc/QC_data/`` folder.
+    spec : dict
+        Parsed validity thresholds (dead-band cutoff line).
+
+    Returns
+    -------
+    list of str
+        ``QC_data``-relative artifact paths of the saved figures.
+    """
+    plots_dir = qc_data / "QC03_RasterCheck" / "QC_plots"
+    run = report.get("run", {})
+    parts = []
+    if run.get("sensor"):
+        parts.append(str(run["sensor"]))
+    if run.get("date"):
+        parts.append(str(run["date"])[:10])
+    if run.get("run") is not None:
+        parts.append(f"run_{int(run['run']):02d}")
+    meta = " ".join(parts)
+    artifacts: List[str] = []
+    for label, product in report.get("products", {}).items():
+        bands = product.get("bands") or []
+        if not bands:
+            continue
+        artifacts += _plot_band_figures(
+            pd.DataFrame(bands), label, product, plots_dir, spec,
+            title_meta=f"{meta} — {label}" if meta else label)
+    return artifacts
+
+
+# ==================================================================================
+def _plot_band_figures(
+    df: pd.DataFrame,
+    label: str,
+    product: Dict[str, Any],
+    plots_dir: pathlib.Path,
+    spec: Dict[str, Any],
+    title_meta: str = "",
+) -> List[str]:
+    """Save the three per-band figures for one product.
+
+    Styled to match the QC02/QA02 figures: bold titles/labels, dashed
+    major gridlines, frameless legends, tight bounding box. Approved
+    bad-band ranges are shaded on every figure; the fraction figures use
+    a symlog y-axis so trace-level fractions stay readable next to
+    spikes. Zero fraction and percentile envelope render the ROI domain
+    (edge band secondary on the zero figure); runs without a capture
+    polygon fall back to the footprint domain, stated in the title.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The report's per-band statistics table (one row per band, v2.0
+        schema with ``footprint``/``roi``/``edge_band`` dict columns).
+    label : str
+        Product label (vnir/swir), used in filenames and titles.
+    product : dict
+        The product's scan dict (worst-band callout, constant bands).
+    plots_dir : pathlib.Path
+        Figure folder (created if missing).
+    spec : dict
+        Parsed validity thresholds (dead-band cutoff line).
+    title_meta : str, optional
+        Run/product context for the figure titles.
+
+    Returns
+    -------
+    list of str
+        ``QC_data``-relative artifact paths of the saved figures.
+    """
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    sns.set_style("whitegrid")
+    plt.rcParams.update({
+        "font.size": 11,
+        "axes.titleweight": "bold",
+        "axes.labelweight": "bold",
+        "figure.titleweight": "bold",
+    })
+    stem = cf.safe_filename_component(label)
+    if df["wavelength_nm"].notna().all():
+        xcol, xlabel = "wavelength_nm", "Wavelength (nm)"
+    else:
+        xcol, xlabel = "band", "Band index"
+    df = df.sort_values(xcol)
+    roi = _domain_frame(df, "roi")
+    edge = _domain_frame(df, "edge_band")
+    fp = _domain_frame(df, "footprint")
+    domain_label = "ROI" if roi is not None else "footprint"
+    paths: List[pathlib.Path] = []
+
+    def _finish(fig, ax, fname: str, title: str, ylabel: str) -> None:
+        _shade_bad_bands(ax, df, xcol)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"{title_meta} — {title}" if title_meta else title)
+        ax.grid(True, which="major", linestyle="--", linewidth=0.5,
+                color="0.4")
+        ax.legend(fontsize=8, frameon=False)
+        fig.tight_layout()
+        fpath = plots_dir / fname
+        fig.savefig(fpath, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        paths.append(fpath)
+
+    # +++++ Zero fraction per band: ROI primary, edge band secondary +++++
+    fig, ax = plt.subplots(figsize=(8.5, 4.2))
+    if roi is not None:
+        ax.plot(df[xcol], roi["zero_pct"], lw=1.4, color="#7F3C8D",
+                label="ROI")
+        if edge is not None:
+            ax.plot(df[xcol], edge["zero_pct"], lw=1.0, color="#E68310",
+                    alpha=0.8, label="edge band (advisory)")
+    elif fp is not None:
+        ax.plot(df[xcol], fp["zero_pct"], lw=1.4, color="#7F3C8D",
+                label="footprint (no capture polygon)")
+    else:  # pre-v2.0 rows: flat footprint fraction
+        ax.plot(df[xcol], df["zeros_in_footprint_pct"], lw=1.4,
+                color="#7F3C8D", label="footprint")
+    thr = spec.get("dead_band", {}) or {}
+    fail_pct = thr.get("fail_above_pct")
+    cutoff = float(fail_pct if fail_pct is not None
+                   else thr.get("candidate_above_pct", 99.0))
+    cutoff_label = (f"dead-band fail ({cutoff:g} %)" if fail_pct is not None
+                    else f"dead-band candidate ({cutoff:g} %, provisional)")
+    ax.axhline(cutoff, color="crimson", lw=0.8, linestyle=":",
+               label=cutoff_label)
+    _symlog_pct(ax)
+    _finish(fig, ax, f"{stem}_band_zero_fraction.png",
+            f"per-band zero fraction ({domain_label})",
+            "Zero pixels (%)")
+
+    # +++++ Over-range fraction per band +++++
+    fig, ax = plt.subplots(figsize=(8.5, 4.2))
+    ax.plot(df[xcol], df["over_range_pct"], lw=1.2, color="#11A579",
+            label="over range (> ceiling)")
+    worst = (product.get("cube") or {}).get("worst_over_range_band")
+    if worst and worst.get("over_range_pct", 0) > 0:
+        wx = worst.get("wavelength_nm") if xcol == "wavelength_nm" \
+            else worst.get("band")
+        if wx is not None:
+            ax.annotate(
+                f"worst: band {worst.get('band')} "
+                f"({worst.get('wavelength_nm')} nm)\n"
+                f"{worst.get('over_range_pct'):.3g} %",
+                xy=(wx, worst.get("over_range_pct")),
+                xytext=(0.98, 0.95), textcoords="axes fraction",
+                ha="right", va="top", fontsize=8,
+                arrowprops={"arrowstyle": "->", "color": "0.3", "lw": 0.8})
+    _symlog_pct(ax)
+    _finish(fig, ax, f"{stem}_band_over_range.png",
+            "per-band over-range fraction", "Pixels over ceiling (%)")
+
+    # +++++ Percentile envelope (spectral health strip, data domain) +++++
+    env = roi if roi is not None else fp
+    fig, ax = plt.subplots(figsize=(8.5, 4.2))
+    if env is not None:
+        ax.fill_between(df[xcol], env["p01"], env["p99"], color="#3969AC",
+                        alpha=0.15, linewidth=0, label="p01–p99")
+        ax.fill_between(df[xcol], env["p05"], env["p95"], color="#3969AC",
+                        alpha=0.3, linewidth=0, label="p05–p95")
+        if "p25" in env.columns and env["p25"].notna().any():
+            ax.fill_between(df[xcol], env["p25"], env["p75"],
+                            color="#3969AC", alpha=0.45, linewidth=0,
+                            label="p25–p75")
+        ax.plot(df[xcol], env["p50"], color="#3969AC", lw=1.5,
+                label="median")
+        ax.plot(df[xcol], env["min"], color="0.5", lw=0.7, linestyle="--",
+                label="min/max")
+        ax.plot(df[xcol], env["max"], color="0.5", lw=0.7, linestyle="--")
+    else:  # pre-v2.0 rows: flat full-grid percentiles
+        ax.fill_between(df[xcol], df["p01"], df["p99"], color="#3969AC",
+                        alpha=0.2, linewidth=0, label="p01–p99")
+        ax.plot(df[xcol], df["p50"], color="#3969AC", lw=1.5,
+                label="median")
+    # Reflectance ceiling: products are reflectance x 10^4 (docstring)
+    ax.axhline(10000, color="crimson", lw=0.8, linestyle=":",
+               label="reflectance ceiling (10000)")
+    _finish(fig, ax, f"{stem}_band_percentiles.png",
+            f"per-band percentile envelope ({domain_label})",
+            "Reflectance × 10⁴")
+
+    return [str(p.relative_to(plots_dir.parent.parent)) for p in paths]
+
+
+# ==================================================================================
+def _domain_frame(df: pd.DataFrame, domain: str) -> Optional[pd.DataFrame]:
+    """Expand one per-band domain sub-dict column into a DataFrame.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Per-band statistics table with dict-valued domain columns.
+    domain : str
+        Column name (``footprint``/``roi``/``edge_band``).
+
+    Returns
+    -------
+    pd.DataFrame or None
+        The expanded domain statistics aligned to *df*'s index, or None
+        when the column is absent or entirely null (pre-v2.0 rows or no
+        capture polygon).
+    """
+    if domain not in df.columns:
+        return None
+    rows = df[domain].tolist()
+    if all(r is None for r in rows):
+        return None
+    return pd.DataFrame([r or {} for r in rows], index=df.index)
+
+
+# ==================================================================================
+def _shade_bad_bands(ax: plt.Axes, df: pd.DataFrame, xcol: str) -> None:
+    """Shade the approved bad-band ranges of a per-band figure.
+
+    Parameters
+    ----------
+    ax : plt.Axes
+        Target axes.
+    df : pd.DataFrame
+        Per-band statistics table sorted on *xcol*, with ``bad_band``.
+    xcol : str
+        The x column (``wavelength_nm`` or ``band``).
+
+    Returns
+    -------
+    None
+    """
+    if not df["bad_band"].any():
+        return
+    bad = df["bad_band"].to_numpy()
+    x = df[xcol].to_numpy()
+    starts = np.flatnonzero(bad & ~np.r_[False, bad[:-1]])
+    ends = np.flatnonzero(bad & ~np.r_[bad[1:], False])
+    for i, (s, e) in enumerate(zip(starts, ends)):
+        ax.axvspan(x[s], x[e], color="0.75", alpha=0.4, linewidth=0,
+                   label="approved bad bands" if i == 0 else None)
+
+
+# ==================================================================================
+def _symlog_pct(ax: plt.Axes) -> None:
+    """Set a fixed 0–100 % symlog y-axis with plain-number tick labels.
+
+    The fraction figures communicate the *scale* of an issue, so the
+    axis always spans the full 0–100 % range (operator, 2026-09-04 —
+    autoscaling to the data defeats cross-run comparison); the symlog
+    transform (linear below 0.01 %) keeps trace-level fractions visible
+    on that fixed canvas.
+
+    Parameters
+    ----------
+    ax : plt.Axes
+        Target axes.
+
+    Returns
+    -------
+    None
+    """
+    ax.set_yscale("symlog", linthresh=0.01)
+    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%g"))
+    ax.set_ylim(0, 100)
+
+
+# ==================================================================================
 def _print_run_summary(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     """Print the end-of-run REPORTED/SKIPPED summary and return it.
 
@@ -1640,6 +2508,10 @@ if __name__ == "__main__":
     parser.add_argument("-f", "--force", default=False, action="store_true",
                         help="Regenerate reports even when they are newer "
                              "than every input.")
+    parser.add_argument("--pdf", default=False, action="store_true",
+                        help=("Also write QC_data/QC_report.pdf even when the run is "
+                             "incomplete or stale (it is written automatically once "
+                             "all four QC scripts are current)."))
     parser.add_argument("-v", "--verbose", default=False,
                         action="store_true",
                         help="Enable verbose output.")

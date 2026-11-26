@@ -167,6 +167,20 @@ RunOverview bools.
   (exposure mismatch, no-panels, solar window, AGL drift, sun-abeam)
   over QC01 outputs; `--start-date`/`--end-date` window, `--no-save`.
 
+## Per-run QC report (`QC_data/QC_report.md` / `.pdf`)
+
+Every QC script ends by re-assembling `T1_proc/QC_data/QC_report.md`: a
+page-1 summary of failing/warning checks, the status table (with a
+Freshness flag), an **At a glance** grid of product quicklooks (QC03:
+false-colour image + LiDAR DSM; QC01: flight-line map), one section per
+script, and a provenance appendix. Each script only re-renders its own
+section, so the report is always as current as the scripts that ran.
+`QC_report.pdf` is written automatically once all four scripts have run
+and none is stale; pass `--pdf` to any QC script to force one for a
+partial run (needs `markdown` + `weasyprint` from `environment.yml`).
+Rendering lives in `Code/functions/qc_report/` (`markdown.py`,
+`quicklook.py`); client-facing wording is in `_wording()` there.
+
 The rest of this README documents QC02/QA02 in detail, then QA00.
 
 ---

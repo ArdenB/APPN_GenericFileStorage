@@ -22,7 +22,9 @@ from .report import (schema_version, new_report, add_check, report_paths,
 from .reader import (legacy_report_globs, read_report, report_is_current,
                      version_key)
 from .thresholds import default_thresholds_dir, load_thresholds
-from .markdown import (update_qc_report, status_glyph, checks_table,
+from .markdown import (update_qc_report, export_qc_pdf, status_glyph,
+                       status_label,
+                       checks_table,
                        figure_embeds, artifact_links)
 
 __all__ = ['check_levels', 'script_levels', 'collapse', 'worst',
@@ -32,5 +34,5 @@ __all__ = ['check_levels', 'script_levels', 'collapse', 'worst',
            'legacy_report_globs', 'read_report', 'report_is_current',
            'version_key',
            'default_thresholds_dir', 'load_thresholds',
-           'update_qc_report', 'status_glyph', 'checks_table',
+           'update_qc_report', 'export_qc_pdf', 'status_glyph', 'status_label', 'checks_table',
            'figure_embeds', 'artifact_links']

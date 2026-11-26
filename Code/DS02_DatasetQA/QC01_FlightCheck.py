@@ -33,6 +33,9 @@ Outputs (per run, §4 layout):
 - ``QC_data/QC01_FlightCheck/exposure_segments.csv`` - per raw capture
   segment VNIR/SWIR exposure.
 - ``QC_data/QC01_FlightCheck/run_summary.csv`` - one row per run.
+- ``QC_data/QC01_FlightCheck/quicklook_trajectory.png`` - flight-line
+  map coloured by trajectory height (v3.2), for the QC report's
+  At-a-glance grid.
 - ``QC_data/QC01_FlightCheck/QC01_sun_geometry.png`` - flight-axis vs
   solar-geometry polar figure (BRDF risk band).
 - ``QC_data/QC01_FlightCheck/QC01_agl_profiles.png`` - along-line AGL
@@ -99,6 +102,9 @@ Command-line Arguments
     Directory names to exclude from the crawl.
 --force : flag
     Regenerate reports even when they are newer than every input.
+--pdf : flag
+    Also write ``QC_data/QC_report.pdf`` for an incomplete/stale run (it
+    is written automatically once all four QC scripts are current).
 --verbose : flag
     Print extra diagnostic information.
 """
@@ -107,7 +113,7 @@ Command-line Arguments
 
 __title__ = "Flight check"
 __author__ = "Arden Burrell"
-__version__ = "v3.1(17.09.2026)"
+__version__ = "v3.2(27.11.2026)"
 __email__ = "arden.burrell@sydney.edu.au"
 
 # ==============================================================================
@@ -294,6 +300,8 @@ def process_run(
             qc_data, "QC01_FlightCheck", __version__)
         if version_ok:
             row.update({"status": "cached", "reason": "outputs up to date"})
+            if args.pdf:
+                qr.export_qc_pdf(qc_data)
             return row
         if args.verbose:
             tqdm.write(f"{run_dir}: {version_reason}; re-running")
@@ -330,6 +338,7 @@ def process_run(
                                exposure, run_id, trigger, lever, spec_report)
     make_sun_geometry_plot(df, out_dir, spec)
     make_agl_profile_plot(df, gpro, out_dir)
+    make_trajectory_quicklook(df, out_dir)
     report = build_contract_report(
         parsed, gpro, graw, mission, df, panels, exposure,
         spec_report, spec_snapshot, acq_report)
@@ -337,7 +346,7 @@ def process_run(
         report, iy.run_flight_deviations(run_dir.parent, run_dir.name))
     iy.ensure_finding_tickets(run_dir.parent, run_dir.name, report)
     qr.write_report(qc_data, report)
-    qr.update_qc_report(qc_data, report)
+    qr.update_qc_report(qc_data, report, force_pdf=args.pdf)
     row.update({"status": report["status"], "reason": None})
     if args.verbose:
         tqdm.write(f"{run_dir}: {report['status']}")
@@ -418,7 +427,8 @@ def build_contract_report(
     }
     report["artifacts"] = [
         f"QC01_FlightCheck/{name}" for name in
-        ("QC01_sun_geometry.png", "QC01_agl_profiles.png",
+        ("quicklook_trajectory.png",
+         "QC01_sun_geometry.png", "QC01_agl_profiles.png",
          "flight_lines.csv",
          "exposure_segments.csv", "run_summary.csv")
         if (pathlib.Path(gpro).parent.parent / "T1_proc" / "QC_data"
@@ -2691,6 +2701,81 @@ def make_agl_profile_plot(
 
 
 # ==================================================================================
+def make_trajectory_quicklook(
+    df: pd.DataFrame,
+    out_dir: pathlib.Path,
+) -> Optional[pathlib.Path]:
+    """Render the flight-line map quicklook for the QC report.
+
+    Plan view of every flight line in a local metric frame, coloured by
+    the trajectory height (the epoch-KML vertical frame, same as the AGL
+    profiles); rogue lines are grey dashed, line starts are marked and
+    numbered. Written as ``quicklook_trajectory.png`` for the report's
+    At-a-glance grid (QC report plan v1.4 §4.2).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Flight-line table carrying the ``_kml_coords`` object column
+        from :func:`extract_flight_lines`.
+    out_dir : pathlib.Path
+        ``QC_data/QC01_FlightCheck`` output folder.
+
+    Returns
+    -------
+    Optional[pathlib.Path]
+        Path of the written PNG, or None when no line geometry exists.
+    """
+    if "_kml_coords" not in df.columns:
+        return None
+    sub = df.loc[[c is not None and len(c) > 1 for c in df["_kml_coords"]]]
+    if sub.empty:
+        return None
+    local = pyproj.Transformer.from_crs(
+        "EPSG:4326",
+        f"+proj=aeqd +lat_0={sub['centroid_lat'].mean()} "
+        f"+lon_0={sub['centroid_lon'].mean()} +datum=WGS84 +units=m",
+        always_xy=True)
+    heights = np.concatenate([c[:, 2] for c, rogue in
+                              zip(sub["_kml_coords"], sub["rogue_line"])
+                              if not rogue] or [np.array([0.0, 1.0])])
+    norm = plt.Normalize(np.nanpercentile(heights, 2),
+                         np.nanpercentile(heights, 98))
+    fig, ax = plt.subplots(figsize=(7, 5))
+    mappable = None
+    # one entry per line; sensors share the trajectory, so draw it once
+    for _, r in sub.drop_duplicates("line").iterrows():
+        c = r["_kml_coords"]
+        x, y = local.transform(c[:, 0], c[:, 1])
+        if bool(r["rogue_line"]):
+            ax.plot(x, y, color="0.6", ls="--", lw=1)
+        else:
+            mappable = ax.scatter(x, y, c=c[:, 2], cmap="viridis", norm=norm,
+                                  s=3, lw=0)
+        ax.plot(x[0], y[0], "o", color="k", ms=3)
+        ax.annotate(str(int(r["line"])), (x[0], y[0]), fontsize=7,
+                    xytext=(3, 3), textcoords="offset points")
+    if mappable is not None:
+        cbar = fig.colorbar(mappable, ax=ax, orientation="horizontal",
+                            fraction=0.05, pad=0.12,
+                            label="trajectory height (m)")
+        cbar.set_ticks(plt.MaxNLocator(4).tick_values(norm.vmin, norm.vmax))
+        cbar.formatter.set_useOffset(False)
+    ax.set_aspect("equal")
+    ax.set_xlabel("easting (m)")
+    ax.set_ylabel("northing (m)")
+    ax.grid(alpha=0.3)
+    ax.set_title("Flight lines (grey dashed = rogue; dot = line start)",
+                 fontsize=10)
+    fig.tight_layout()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "quicklook_trajectory.png"
+    fig.savefig(out_path.as_posix(), dpi=120)
+    plt.close(fig)
+    return out_path
+
+
+# ==================================================================================
 def write_outputs(
     out_dir: pathlib.Path,
     gpro: pathlib.Path,
@@ -3049,6 +3134,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "-f", "--force", default=False, action="store_true",
         help="Regenerate reports even when they are newer than every input.",
+    )
+    parser.add_argument(
+        "--pdf", default=False, action="store_true",
+        help=("Also write QC_data/QC_report.pdf even when the run is "
+                             "incomplete or stale (it is written automatically once "
+                             "all four QC scripts are current)."),
     )
     parser.add_argument(
         "-v", "--verbose", default=False, action="store_true",

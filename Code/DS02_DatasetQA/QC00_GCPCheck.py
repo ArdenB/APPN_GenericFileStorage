@@ -139,11 +139,8 @@ except git_exc.InvalidGitRepositoryError:
 import Code.functions.core_functions as cf
 import Code.functions.gcp_qc as gq
 import Code.functions.qc_report as qr
+import Code.functions.qc_report.quicklook as ql
 import Code.functions.issue_yaml as iy
-
-
-# +++++ DSM filename pattern: <stem>_LiDAR_DSM_<cm>cm.tif +++++
-_DSM_RE = re.compile(r"_LiDAR_DSM_(\d+)cm\.tif$", re.IGNORECASE)
 
 
 # ==================================================================================
@@ -203,7 +200,7 @@ def main(args: argparse.Namespace, path: pathlib.Path) -> pd.DataFrame:
     for run_dir, reports in run_reports.items():
         write_contract_report(run_dir, reports, cfg, spec_snapshot,
                               args.type, force=args.force,
-                              verbose=args.verbose)
+                              verbose=args.verbose, force_pdf=args.pdf)
 
     summary = _summary_dataframe(rows)
     _print_summary_tables(summary)
@@ -601,6 +598,7 @@ def write_contract_report(
         file_type: str,
         force: bool = False,
         verbose: bool = False,
+        force_pdf: bool = False,
     ) -> None:
     """Write the run-level §2 contract report from the per-pair reports.
 
@@ -630,6 +628,9 @@ def write_contract_report(
         per-pair report. Default False.
     verbose : bool, optional
         Print the write. Default False.
+    force_pdf : bool, optional
+        Write ``QC_report.pdf`` even for an incomplete/stale run (also on
+        the cached path). Default False.
 
     Returns
     -------
@@ -644,6 +645,8 @@ def write_contract_report(
             [summary_path, detail_path], pair_jsons)
             and qr.report_is_current(
                 qc_data, "QC00_GCPCheck", __version__)[0]):
+        if force_pdf:
+            qr.export_qc_pdf(qc_data)
         return
 
     parsed = cf.parse_APPN_dataset_path(run_dir)
@@ -696,7 +699,7 @@ def write_contract_report(
     report["artifacts"] = artifacts
     iy.ensure_finding_tickets(run_dir.parent, run_dir.name, report)
     qr.write_report(qc_data, report)
-    qr.update_qc_report(qc_data, report)
+    qr.update_qc_report(qc_data, report, force_pdf=force_pdf)
     if verbose:
         print(f"  wrote contract report {summary_path.name} "
               f"({report['status']})")
@@ -873,7 +876,7 @@ def locate_point_pairs(
 
         # +++++ Locate the run's products folder and DSM TIF (if any) +++++
         products_dir, gpro_error = _resolve_products_dir(run_dir)
-        dsm = None if products_dir is None else _resolve_dsm(products_dir)
+        dsm = None if products_dir is None else ql.find_dsm(products_dir)
         if verbose:
             if gpro_error is not None:
                 print(
@@ -955,35 +958,6 @@ def _resolve_products_dir(
         "found_dirs": gpros,
         "reason": reason,
     }
-
-
-def _resolve_dsm(products_dir: pathlib.Path) -> Optional[pathlib.Path]:
-    """Pick the highest-resolution LiDAR DSM TIF from a products folder.
-
-    Looks for filenames matching ``*_LiDAR_DSM_<cm>cm.tif`` and returns
-    the one with the smallest ``<cm>`` value (highest resolution).
-
-    Parameters
-    ----------
-    products_dir : pathlib.Path
-        The ``<NAME>.gpro/products`` folder for a run.
-
-    Returns
-    -------
-    pathlib.Path or None
-        Selected DSM TIF, or ``None`` if no candidate is present.
-    """
-    if not products_dir.is_dir():
-        return None
-    candidates: List[Tuple[int, pathlib.Path]] = []
-    for tif in products_dir.glob("*_LiDAR_DSM_*cm.tif"):
-        match = _DSM_RE.search(tif.name)
-        if match:
-            candidates.append((int(match.group(1)), tif))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: item[0])
-    return candidates[0][1]
 
 
 def _sample_raster_at_points(
@@ -1743,6 +1717,10 @@ if __name__ == "__main__":
                               "displacement plot interactively. Plots are "
                               "always written to <QC_data>/QC_plots/ "
                               "whenever the JSON report is regenerated."))
+    parser.add_argument("--pdf", default=False, action="store_true",
+                        help=("Also write QC_data/QC_report.pdf even when the run is "
+                             "incomplete or stale (it is written automatically once "
+                             "all four QC scripts are current)."))
     parser.add_argument("-f", "--force", default=False, action="store_true",
                         help=("Recompute every pair even when the output "
                               "files already exist and are newer than the "

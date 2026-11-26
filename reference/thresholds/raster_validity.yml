@@ -14,6 +14,16 @@ negative_pct: {warn_above: 0.1, fail_above: 1.0}
 # NaN/Inf pixels (float products only): any occurrence warns.
 nan_inf_count: {warn_above: 0}
 
+# ===== Dead bands (plan item 5) =====
+# A non-approved band ~100 % zeros = a wavelength silently missing.
+# RECORDING ONLY until calibrated: candidates at/above candidate_above_pct
+# (ROI zero fraction) are listed as evidence and the check grades
+# not_checked. Normal per-band zero rates are unknown (operator,
+# 2026-09-04) - once the recorded distributions have been inspected, add
+# fail_above_pct here and the node re-grades from the detail JSONs
+# without a re-scan.
+dead_band: {candidate_above_pct: 99.0}
+
 # ===== All-bands-zero zone split (capture polygon + eroded ROI) =====
 # All-bands-zero share of the ROI: real dropout (scan-line skips, data holes)
 # that the footprint definition absorbs into "background".

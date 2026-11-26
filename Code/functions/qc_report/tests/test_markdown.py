@@ -191,12 +191,19 @@ def test_update_writes_fragment_and_report(tmp_path, qc01_report):
     assert frag.is_file()
     text = frag.read_text()
     assert "## QC01 — Flight / acquisition" in text
-    assert "⚠️ warn" in text                       # section status line
+    assert "**Status: ⚠️ Warn**" in text           # one label, no echo
+    assert "⚠️ warn" not in text
     assert "sidelap_swir_fieldbook" in text
-    assert "Flight lines: 14 (0 rogue)" in text
+    assert ("Flight lines: 14 (0 rogue), 2026-08-19 02:33–02:39 UTC "
+            "(6 min)") in text
     assert "Mean AGL: 31.6 m" in text
-    assert "flight_lines.csv" in text
-    assert "flightcal_spec.yml" in text
+    assert "flight_lines.csv" not in text           # provenance → appendix
+    prov = (tmp_path / "QC01_FlightCheck" /
+            "QC01_FlightCheck_provenance.md").read_text()
+    assert "flight_lines.csv" in prov
+    assert "flightcal_spec.yml (sha256 6084207da9c4)" in prov
+    assert "Computed against: `test.gpro` (modified 2026-07-14 07:04 UTC)" \
+        in prov
 
 
 def test_report_contains_overview_and_stubs(tmp_path, qc01_report):
@@ -209,7 +216,10 @@ def test_report_contains_overview_and_stubs(tmp_path, qc01_report):
     # client-context wording: intro before the table, legend + note after
     assert "summarises four checks for one sensor run" in text
     assert "Advisory checks do not affect" in text
-    assert '"Stale?" means the check used an older sensor bundle' in text
+    assert 'Freshness: "stale?" means the check used an older' in text
+    assert "## Appendix — provenance" in text
+    assert text.index("## QC03 —") < text.index("## Appendix") \
+        < text.index("- Script: QC01_FlightCheck")
     assert text.index("summarises four checks") \
         < text.index("| Script |") < text.index("Advisory checks")
     # overview row for the script that ran + not-yet-run rows for the rest
@@ -268,6 +278,140 @@ def test_reassembly_idempotent_modulo_timestamps(tmp_path, qc01_report):
     qr.update_qc_report(tmp_path, qc01_report)
     second = _strip_timestamps((tmp_path / "QC_report.md").read_text())
     assert first == second
+
+
+# ===========================================================================
+# 2b. Client-receipt rendering fixes (plan v1.4 §5.0)
+# ===========================================================================
+def test_status_label_collapses_both_levels():
+    assert qr.status_label("good") == qr.status_label("pass") == "✅ Pass"
+    assert qr.status_label("acceptable") == "✅ Pass"
+    assert qr.status_label("warning") == "⚠️ Warn"
+    assert qr.status_label("not_checked") == "➖ Not checked"
+
+
+def test_sidelap_pair_merges_only_when_agreeing(tmp_path, qc01_report):
+    same = {"status": "good", "value": "30.0-35.0 %"}
+    qc01_report["checks"] = {
+        "sidelap_vnir_calculator": dict(same),
+        "sidelap_vnir_fieldbook": dict(same),
+        "sidelap_swir_calculator": {"status": "good", "value": "26 %"},
+        "sidelap_swir_fieldbook": {"status": "warning", "value": "26 %"},
+    }
+    qr.update_qc_report(tmp_path, qc01_report)
+    frag = (tmp_path / "QC01_FlightCheck" /
+            "QC01_FlightCheck_section.md").read_text()
+    assert "| sidelap_vnir |" in frag
+    assert "calculator and fieldbook agree" in frag
+    assert "sidelap_vnir_fieldbook" not in frag
+    assert "sidelap_swir_calculator" in frag     # disagreeing pair kept
+    assert "sidelap_swir_fieldbook" in frag
+
+
+def test_qc03_not_checked_says_why(tmp_path, qc03_report):
+    qc03_report["checks"]["negative_vnir"] = {
+        "status": "not_checked",
+        "note": "unsigned dtype cannot hold negatives"}
+    qr.update_qc_report(tmp_path, qc03_report)
+    frag = (tmp_path / "QC03_RasterCheck" /
+            "QC03_RasterCheck_section.md").read_text()
+    assert "➖ n/a — unsigned dtype cannot hold negatives" in frag
+    assert "not_checked" not in frag
+
+
+def test_freshness_compares_qc03_gpro_identity(tmp_path, qc01_report,
+                                               qc03_report):
+    gpro = qc01_report["staleness"]
+    qc03_report["staleness"].update(gpro)
+    for report in (qc01_report, qc03_report):
+        qr.write_report(tmp_path, report, derive=False)
+        qr.update_qc_report(tmp_path, report)
+    rows = [ln for ln in (tmp_path / "QC_report.md").read_text().splitlines()
+            if ln.startswith("| QC0")]
+    assert rows[1].endswith("| ok |") and rows[3].endswith("| ok |")
+    # QC01 re-run against a newer bundle → QC03 becomes stale?
+    qc01_report["staleness"] = {**gpro,
+                                "gpro_mtime_utc": "2026-09-01T00:00:00+00:00"}
+    qr.write_report(tmp_path, qc01_report, derive=False)
+    qr.update_qc_report(tmp_path, qc01_report)
+    text = (tmp_path / "QC_report.md").read_text()
+    assert "| QC03_RasterCheck |" in text and "stale?" in text
+
+
+def test_headline_names_flagged_checks_and_missing(tmp_path, qc01_report,
+                                                  qc03_report):
+    qc03_report["checks"]["over_range_vnir"] = {"status": "warning",
+                                                "value": "0.4 %"}
+    qc03_report["checks"]["zero_edge_band_vnir"] = {
+        "status": "warning", "value": "11.5 %", "advisory": True}
+    for report in (qc01_report, qc03_report):
+        qr.write_report(tmp_path, report, derive=False)
+        qr.update_qc_report(tmp_path, report)
+    text = (tmp_path / "QC_report.md").read_text()
+    head = text[:text.index("| Script |")]
+    assert "**Summary:** 2 of 4 checks run." in head
+    assert ("- ❌ Fail — QC03 Raster data validity: ❌ Zero pixels in "
+            "footprint (vnir) 16.222 %; ⚠️ Saturated pixels (vnir) 0.4 %"
+            ) in head                                  # fail before warn
+    assert "Zero edge band" not in head                # advisory left out
+    assert "Image overlap (swir, fieldbook) 25.9-29.9 %" in head
+    assert "- ➖ Not yet run: QC00 GCP geometric accuracy, QC02 Panel " \
+        "spectra" in head
+
+
+def test_at_a_glance_grid_orders_quicklooks(tmp_path, qc01_report,
+                                            qc03_report):
+    for rel in ("QC03_RasterCheck/QC_plots/quicklook_dsm.png",
+                "QC03_RasterCheck/QC_plots/quicklook_cir_vnir.png",
+                "QC01_FlightCheck/quicklook_trajectory.png"):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_bytes(b"png")
+    qc03_report["artifacts"] = [
+        "QC03_RasterCheck/QC_plots/quicklook_dsm.png",
+        "QC03_RasterCheck/QC_plots/quicklook_cir_vnir.png"]
+    qc01_report["artifacts"] = ["QC01_FlightCheck/quicklook_trajectory.png",
+                                "QC01_FlightCheck/quicklook_missing.png"]
+    for report in (qc01_report, qc03_report):
+        qr.write_report(tmp_path, report, derive=False)
+        qr.update_qc_report(tmp_path, report)
+    text = (tmp_path / "QC_report.md").read_text()
+    glance = text[text.index("## At a glance"):text.index("## QC00")]
+    assert glance.index("quicklook_cir_vnir") < glance.index("quicklook_dsm") \
+        < glance.index("quicklook_trajectory")
+    assert "quicklook_missing" not in glance          # absent file left out
+    assert "false-colour image (healthy vegetation shows red) (vnir)" \
+        in glance
+    # quicklooks are not embedded again inside their sections
+    assert text.count("quicklook_dsm.png") == 1       # grid only
+    assert "![quicklook" not in text
+
+
+def test_pdf_body_symbols_and_local_links():
+    body = ('<td>✅ Pass</td><td>⚠️ Warn</td>'
+            '<a href="QC01_FlightCheck/flight_lines.csv">flight_lines.csv</a>'
+            '<a href="https://appn.org.au">APPN</a>')
+    out = qr.markdown._pdf_body(body)
+    assert "✅" not in out and "⚠" not in out
+    assert '<span class="st pass">●</span> Pass' in out
+    assert 'href="QC01' not in out and "flight_lines.csv" in out
+    assert '<a href="https://appn.org.au">APPN</a>' in out
+
+
+def test_pdf_auto_only_when_complete_and_forced_otherwise(
+        tmp_path, qc00_report, qc01_report, qc02_report, qc03_report):
+    pytest.importorskip("weasyprint")
+    pdf = tmp_path / "QC_report.pdf"
+    qr.write_report(tmp_path, qc01_report, derive=False)
+    qr.update_qc_report(tmp_path, qc01_report)
+    assert not pdf.exists()                           # 1 of 4 → no PDF
+    qr.update_qc_report(tmp_path, qc01_report, force_pdf=True)
+    assert pdf.read_bytes()[:4] == b"%PDF"            # --pdf forces it
+    qr.update_qc_report(tmp_path, qc01_report)
+    assert not pdf.exists()                           # stale partial removed
+    for report in (qc00_report, qc02_report, qc03_report):
+        qr.write_report(tmp_path, report, derive=False)
+        qr.update_qc_report(tmp_path, report)
+    assert pdf.is_file()                              # all four → auto PDF
 
 
 # ===========================================================================
@@ -376,8 +520,10 @@ def test_missing_and_present_figures(tmp_path, qc00_report):
     assert ("![QC_GCP_distances_displacements]"
             "(QC00_GCPCheck/QC_plots/QC_GCP_distances_displacements.png)"
             in frag)
-    # parquet artifact is linked but flagged missing (never written here)
-    assert "QC_GCP_distances.parquet (missing)" in frag
+    # parquet artifact is listed in the appendix, flagged missing
+    prov = (tmp_path / "QC00_GCPCheck" /
+            "QC00_GCPCheck_provenance.md").read_text()
+    assert "QC_GCP_distances.parquet (missing)" in prov
     assert "\\" not in frag                          # '/' separators only
 
 

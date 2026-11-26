@@ -40,6 +40,10 @@ dependencies:
   - palettable
   - colorcet    # glasbey_dark palette for >20-run QA02 figures
 
+  # ========== Reports ==========
+  - markdown    # QC_report.md -> HTML for the optional PDF
+  - weasyprint  # QC_report.pdf (HTML/CSS -> PDF)
+
   # ========== Config / metadata ==========
   - pyyaml
   - ruamel.yaml
